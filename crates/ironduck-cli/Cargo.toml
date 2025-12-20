@@ -1,0 +1,16 @@
+[package]
+name = "ironduck-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "ironduck"
+path = "src/main.rs"
+
+[dependencies]
+ironduck.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+anyhow.workspace = true

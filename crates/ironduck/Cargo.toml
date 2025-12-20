@@ -1,0 +1,21 @@
+[package]
+name = "ironduck"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "IronDuck - A pure Rust analytical database, DuckDB compatible"
+
+[dependencies]
+ironduck-common.workspace = true
+ironduck-parser.workspace = true
+ironduck-binder.workspace = true
+ironduck-catalog.workspace = true
+ironduck-planner.workspace = true
+ironduck-optimizer.workspace = true
+ironduck-execution.workspace = true
+ironduck-storage.workspace = true
+ironduck-transaction.workspace = true
+ironduck-functions.workspace = true
+tokio.workspace = true
+thiserror.workspace = true
+tracing.workspace = true

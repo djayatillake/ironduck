@@ -1,0 +1,11 @@
+[package]
+name = "ironduck-planner"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+ironduck-common.workspace = true
+ironduck-binder.workspace = true
+ironduck-catalog.workspace = true
+thiserror.workspace = true

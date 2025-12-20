@@ -1,0 +1,10 @@
+[package]
+name = "ironduck-parser"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+ironduck-common.workspace = true
+sqlparser.workspace = true
+thiserror.workspace = true

@@ -1,0 +1,12 @@
+[package]
+name = "ironduck-transaction"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+ironduck-common.workspace = true
+ironduck-storage.workspace = true
+parking_lot.workspace = true
+crossbeam.workspace = true
+thiserror.workspace = true

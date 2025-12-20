@@ -1,0 +1,21 @@
+[package]
+name = "ironduck-execution"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+ironduck-common.workspace = true
+ironduck-planner.workspace = true
+ironduck-catalog.workspace = true
+ironduck-storage.workspace = true
+arrow.workspace = true
+arrow-array.workspace = true
+arrow-buffer.workspace = true
+tokio.workspace = true
+crossbeam.workspace = true
+hashbrown.workspace = true
+regex.workspace = true
+rand.workspace = true
+thiserror.workspace = true
+chrono.workspace = true

@@ -1,0 +1,13 @@
+[package]
+name = "ironduck-functions"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+ironduck-common.workspace = true
+ironduck-execution.workspace = true
+arrow.workspace = true
+chrono.workspace = true
+rust_decimal.workspace = true
+thiserror.workspace = true

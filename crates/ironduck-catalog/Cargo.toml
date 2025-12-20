@@ -1,0 +1,11 @@
+[package]
+name = "ironduck-catalog"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+ironduck-common.workspace = true
+hashbrown.workspace = true
+parking_lot.workspace = true
+thiserror.workspace = true
