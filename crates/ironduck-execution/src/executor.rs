@@ -173,13 +173,24 @@ impl Executor {
                 Ok(rows)
             }
 
-            LogicalOperator::Distinct { input } => {
+            LogicalOperator::Distinct { input, on_exprs } => {
                 let input_rows = self.execute_operator(input)?;
                 let mut seen = std::collections::HashSet::new();
                 let mut output_rows = Vec::new();
 
                 for row in input_rows {
-                    let key = format!("{:?}", row);
+                    // For DISTINCT ON, compute key only from specified expressions
+                    // For plain DISTINCT, use all columns
+                    let key = match on_exprs {
+                        Some(exprs) => {
+                            let key_values: Vec<Value> = exprs
+                                .iter()
+                                .map(|expr| evaluate(expr, &row))
+                                .collect::<Result<Vec<_>>>()?;
+                            format!("{:?}", key_values)
+                        }
+                        None => format!("{:?}", row),
+                    };
                     if seen.insert(key) {
                         output_rows.push(row);
                     }

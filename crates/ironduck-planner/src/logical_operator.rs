@@ -61,9 +61,11 @@ pub enum LogicalOperator {
         offset: Option<u64>,
     },
 
-    /// Distinct
+    /// Distinct (all columns or DISTINCT ON specific expressions)
     Distinct {
         input: Box<LogicalOperator>,
+        /// For DISTINCT ON, the expressions to deduplicate by
+        on_exprs: Option<Vec<Expression>>,
     },
 
     /// Return constant values
@@ -183,7 +185,7 @@ impl LogicalOperator {
             }
             LogicalOperator::Sort { input, .. } => input.output_types(),
             LogicalOperator::Limit { input, .. } => input.output_types(),
-            LogicalOperator::Distinct { input } => input.output_types(),
+            LogicalOperator::Distinct { input, .. } => input.output_types(),
             LogicalOperator::Values { output_types, .. } => output_types.clone(),
             LogicalOperator::CreateTable { .. } => vec![LogicalType::Varchar],
             LogicalOperator::CreateSchema { .. } => vec![LogicalType::Varchar],

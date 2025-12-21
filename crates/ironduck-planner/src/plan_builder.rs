@@ -3,7 +3,7 @@
 use super::{LogicalOperator, LogicalPlan, SetOperationType};
 use ironduck_binder::{
     BoundDelete, BoundExpression, BoundExpressionKind, BoundSelect, BoundSetOperation,
-    BoundStatement, BoundTableRef, BoundUpdate,
+    BoundStatement, BoundTableRef, BoundUpdate, DistinctKind,
 };
 use ironduck_common::{Error, LogicalType, Result, Value};
 
@@ -169,23 +169,46 @@ fn build_select_plan(select: &BoundSelect) -> Result<LogicalPlan> {
     // Check if we have aggregates
     let has_aggregates = select.select_list.iter().any(has_aggregate);
     let has_group_by = !select.group_by.is_empty();
+    let has_having_aggregates = select.having.as_ref().map_or(false, has_aggregate);
 
-    if has_aggregates || has_group_by {
+    if has_aggregates || has_group_by || has_having_aggregates {
         // Build aggregate plan
         let group_by: Vec<_> = select.group_by.iter().map(convert_expression).collect();
         let num_group_by = group_by.len();
 
-        let aggregates: Vec<_> = select
+        // Collect aggregates from SELECT list
+        let mut aggregates: Vec<_> = select
             .select_list
             .iter()
             .filter_map(|expr| extract_aggregate(expr))
             .collect();
 
+        // Also collect aggregates from HAVING clause
+        let having_agg_start = aggregates.len();
+        if let Some(having) = &select.having {
+            collect_aggregates_from_expr(having, &mut aggregates);
+        }
+
         plan = LogicalOperator::Aggregate {
             input: Box::new(plan),
             group_by: group_by.clone(),
-            aggregates,
+            aggregates: aggregates.clone(),
         };
+
+        // Apply HAVING filter BEFORE projection (so we can reference aggregate outputs)
+        if let Some(having) = &select.having {
+            let having_predicate = convert_having_expression(
+                having,
+                &group_by,
+                num_group_by,
+                &select.select_list,
+                having_agg_start,
+            );
+            plan = LogicalOperator::Filter {
+                input: Box::new(plan),
+                predicate: having_predicate,
+            };
+        }
 
         // For aggregate queries, build projection with column references to aggregate output
         // The aggregate output is: [group_by_cols..., aggregate_cols...]
@@ -300,14 +323,6 @@ fn build_select_plan(select: &BoundSelect) -> Result<LogicalPlan> {
         }
     }
 
-    // Add HAVING filter (after aggregation)
-    if let Some(having) = &select.having {
-        plan = LogicalOperator::Filter {
-            input: Box::new(plan),
-            predicate: convert_expression(having),
-        };
-    }
-
     // Add ORDER BY
     if !select.order_by.is_empty() {
         let order_by: Vec<_> = select
@@ -335,11 +350,22 @@ fn build_select_plan(select: &BoundSelect) -> Result<LogicalPlan> {
         };
     }
 
-    // Add DISTINCT
-    if select.distinct {
-        plan = LogicalOperator::Distinct {
-            input: Box::new(plan),
-        };
+    // Add DISTINCT or DISTINCT ON
+    match &select.distinct {
+        DistinctKind::None => {}
+        DistinctKind::All => {
+            plan = LogicalOperator::Distinct {
+                input: Box::new(plan),
+                on_exprs: None,
+            };
+        }
+        DistinctKind::On(exprs) => {
+            let on_exprs: Vec<_> = exprs.iter().map(convert_expression).collect();
+            plan = LogicalOperator::Distinct {
+                input: Box::new(plan),
+                on_exprs: Some(on_exprs),
+            };
+        }
     }
 
     Ok(LogicalPlan::new(plan, output_names))
@@ -763,4 +789,164 @@ fn extract_window_expression(expr: &BoundExpression) -> Option<super::WindowExpr
         }
         _ => None,
     }
+}
+
+/// Convert bound binary operator to logical operator
+fn convert_binary_op(op: &ironduck_binder::BoundBinaryOperator) -> super::BinaryOperator {
+    match op {
+        ironduck_binder::BoundBinaryOperator::Add => super::BinaryOperator::Add,
+        ironduck_binder::BoundBinaryOperator::Subtract => super::BinaryOperator::Subtract,
+        ironduck_binder::BoundBinaryOperator::Multiply => super::BinaryOperator::Multiply,
+        ironduck_binder::BoundBinaryOperator::Divide => super::BinaryOperator::Divide,
+        ironduck_binder::BoundBinaryOperator::Modulo => super::BinaryOperator::Modulo,
+        ironduck_binder::BoundBinaryOperator::Equal => super::BinaryOperator::Equal,
+        ironduck_binder::BoundBinaryOperator::NotEqual => super::BinaryOperator::NotEqual,
+        ironduck_binder::BoundBinaryOperator::LessThan => super::BinaryOperator::LessThan,
+        ironduck_binder::BoundBinaryOperator::LessThanOrEqual => super::BinaryOperator::LessThanOrEqual,
+        ironduck_binder::BoundBinaryOperator::GreaterThan => super::BinaryOperator::GreaterThan,
+        ironduck_binder::BoundBinaryOperator::GreaterThanOrEqual => super::BinaryOperator::GreaterThanOrEqual,
+        ironduck_binder::BoundBinaryOperator::And => super::BinaryOperator::And,
+        ironduck_binder::BoundBinaryOperator::Or => super::BinaryOperator::Or,
+        ironduck_binder::BoundBinaryOperator::Concat => super::BinaryOperator::Concat,
+        ironduck_binder::BoundBinaryOperator::Like => super::BinaryOperator::Like,
+        ironduck_binder::BoundBinaryOperator::ILike => super::BinaryOperator::ILike,
+    }
+}
+
+/// Convert bound unary operator to logical operator
+fn convert_unary_op(op: &ironduck_binder::BoundUnaryOperator) -> super::UnaryOperator {
+    match op {
+        ironduck_binder::BoundUnaryOperator::Negate => super::UnaryOperator::Negate,
+        ironduck_binder::BoundUnaryOperator::Not => super::UnaryOperator::Not,
+        ironduck_binder::BoundUnaryOperator::IsNull => super::UnaryOperator::Not, // Handled separately
+        ironduck_binder::BoundUnaryOperator::IsNotNull => super::UnaryOperator::Not,
+    }
+}
+
+/// Collect aggregates from an expression (used for HAVING clause)
+fn collect_aggregates_from_expr(expr: &BoundExpression, aggregates: &mut Vec<super::AggregateExpression>) {
+    match &expr.expr {
+        BoundExpressionKind::Function { is_aggregate: true, .. } => {
+            if let Some(agg) = extract_aggregate(expr) {
+                // Only add if not already present
+                let agg_key = format!("{:?}", agg);
+                let exists = aggregates.iter().any(|a| format!("{:?}", a) == agg_key);
+                if !exists {
+                    aggregates.push(agg);
+                }
+            }
+        }
+        BoundExpressionKind::BinaryOp { left, right, .. } => {
+            collect_aggregates_from_expr(left, aggregates);
+            collect_aggregates_from_expr(right, aggregates);
+        }
+        BoundExpressionKind::UnaryOp { expr: inner, .. } => {
+            collect_aggregates_from_expr(inner, aggregates);
+        }
+        BoundExpressionKind::Case { operand, when_clauses, else_result } => {
+            if let Some(op) = operand {
+                collect_aggregates_from_expr(op, aggregates);
+            }
+            for (cond, result) in when_clauses {
+                collect_aggregates_from_expr(cond, aggregates);
+                collect_aggregates_from_expr(result, aggregates);
+            }
+            if let Some(els) = else_result {
+                collect_aggregates_from_expr(els, aggregates);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Convert HAVING expression with proper aggregate column references
+fn convert_having_expression(
+    expr: &BoundExpression,
+    group_by: &[super::Expression],
+    num_group_by: usize,
+    select_list: &[BoundExpression],
+    having_agg_start: usize,
+) -> super::Expression {
+    // Track which aggregate we're on in HAVING
+    let mut having_agg_idx = having_agg_start;
+
+    fn convert_inner(
+        expr: &BoundExpression,
+        group_by: &[super::Expression],
+        num_group_by: usize,
+        select_list: &[BoundExpression],
+        having_agg_idx: &mut usize,
+    ) -> super::Expression {
+        match &expr.expr {
+            BoundExpressionKind::Function { is_aggregate: true, name, args, .. } => {
+                // Try to find matching aggregate in SELECT list first
+                let mut select_agg_idx = 0;
+                for sel_expr in select_list {
+                    if let BoundExpressionKind::Function {
+                        is_aggregate: true,
+                        name: sel_name,
+                        args: sel_args,
+                        ..
+                    } = &sel_expr.expr
+                    {
+                        if name == sel_name && args.len() == sel_args.len() {
+                            // Check if args match (simple comparison)
+                            let args_match = args.iter().zip(sel_args.iter()).all(|(a, b)| {
+                                format!("{:?}", a.expr) == format!("{:?}", b.expr)
+                            });
+                            if args_match {
+                                // Reference the SELECT list aggregate
+                                return super::Expression::ColumnRef {
+                                    table_index: 0,
+                                    column_index: num_group_by + select_agg_idx,
+                                    name: name.clone(),
+                                };
+                            }
+                        }
+                        select_agg_idx += 1;
+                    }
+                }
+
+                // Not found in SELECT - reference the HAVING-specific aggregate
+                let idx = *having_agg_idx;
+                *having_agg_idx += 1;
+                super::Expression::ColumnRef {
+                    table_index: 0,
+                    column_index: num_group_by + idx,
+                    name: name.clone(),
+                }
+            }
+            BoundExpressionKind::ColumnRef { name, .. } => {
+                // Try to find in group by
+                let converted = convert_expression(expr);
+                if let Some(pos) = group_by.iter().position(|g| expressions_equal(g, &converted)) {
+                    super::Expression::ColumnRef {
+                        table_index: 0,
+                        column_index: pos,
+                        name: name.clone(),
+                    }
+                } else {
+                    converted
+                }
+            }
+            BoundExpressionKind::BinaryOp { left, op, right } => {
+                let logical_op = convert_binary_op(op);
+                super::Expression::BinaryOp {
+                    left: Box::new(convert_inner(left, group_by, num_group_by, select_list, having_agg_idx)),
+                    op: logical_op,
+                    right: Box::new(convert_inner(right, group_by, num_group_by, select_list, having_agg_idx)),
+                }
+            }
+            BoundExpressionKind::UnaryOp { op, expr: inner } => {
+                let logical_op = convert_unary_op(op);
+                super::Expression::UnaryOp {
+                    op: logical_op,
+                    expr: Box::new(convert_inner(inner, group_by, num_group_by, select_list, having_agg_idx)),
+                }
+            }
+            _ => convert_expression(expr),
+        }
+    }
+
+    convert_inner(expr, group_by, num_group_by, select_list, &mut having_agg_idx)
 }

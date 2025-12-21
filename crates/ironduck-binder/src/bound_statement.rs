@@ -62,8 +62,19 @@ pub struct BoundSelect {
     pub limit: Option<u64>,
     /// OFFSET
     pub offset: Option<u64>,
-    /// DISTINCT
-    pub distinct: bool,
+    /// DISTINCT or DISTINCT ON
+    pub distinct: DistinctKind,
+}
+
+/// DISTINCT mode
+#[derive(Debug, Clone)]
+pub enum DistinctKind {
+    /// No DISTINCT
+    None,
+    /// DISTINCT (all columns)
+    All,
+    /// DISTINCT ON (specific columns)
+    On(Vec<BoundExpression>),
 }
 
 impl BoundSelect {
@@ -77,7 +88,7 @@ impl BoundSelect {
             order_by: Vec::new(),
             limit: None,
             offset: None,
-            distinct: false,
+            distinct: DistinctKind::None,
         }
     }
 

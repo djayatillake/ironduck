@@ -1734,4 +1734,148 @@ SELECT EXP(1.0)
         assert_eq!(report.passed, 10);
         assert_eq!(report.failed, 0);
     }
+
+    #[test]
+    fn test_distinct_on() {
+        let mut runner = TestRunner::new();
+        let content = r#"
+statement ok
+CREATE TABLE products (category VARCHAR, name VARCHAR, price INT)
+
+statement ok
+INSERT INTO products VALUES
+    ('Electronics', 'Phone', 800),
+    ('Electronics', 'Laptop', 1200),
+    ('Electronics', 'Tablet', 500),
+    ('Clothing', 'Shirt', 50),
+    ('Clothing', 'Pants', 80),
+    ('Books', 'Novel', 15),
+    ('Books', 'Textbook', 100)
+
+# DISTINCT ON returns first row per category (based on insertion order)
+query TT
+SELECT DISTINCT ON (category) category, name FROM products
+----
+Electronics	Phone
+Clothing	Shirt
+Books	Novel
+
+# DISTINCT ON with ORDER BY to control which row is returned
+# ORDER BY category, price DESC - so we get the most expensive item per category
+query TTI
+SELECT DISTINCT ON (category) category, name, price FROM products ORDER BY category, price DESC
+----
+Books	Textbook	100
+Clothing	Pants	80
+Electronics	Laptop	1200
+
+# Plain DISTINCT still works
+query T
+SELECT DISTINCT category FROM products ORDER BY category
+----
+Books
+Clothing
+Electronics
+"#;
+        let report = runner.run_tests(content).unwrap();
+        assert_eq!(report.passed, 5);
+        assert_eq!(report.failed, 0);
+    }
+
+    #[test]
+    fn test_having() {
+        let mut runner = TestRunner::new();
+        let content = r#"
+statement ok
+CREATE TABLE sales (product VARCHAR, region VARCHAR, amount INT)
+
+statement ok
+INSERT INTO sales VALUES
+    ('Phone', 'East', 500),
+    ('Phone', 'West', 400),
+    ('Phone', 'East', 300),
+    ('Laptop', 'East', 1200),
+    ('Laptop', 'West', 900),
+    ('Tablet', 'East', 200)
+
+# HAVING with COUNT aggregate
+query TI
+SELECT product, COUNT(*) as cnt FROM sales GROUP BY product HAVING COUNT(*) > 1 ORDER BY product
+----
+Laptop	2
+Phone	3
+
+# HAVING with SUM aggregate
+query TI
+SELECT product, SUM(amount) as total FROM sales GROUP BY product HAVING SUM(amount) > 500 ORDER BY product
+----
+Laptop	2100
+Phone	1200
+
+# HAVING with AVG aggregate (Phone AVG=400, not > 400 so filtered out)
+query TR
+SELECT product, AVG(amount) as avg_amt FROM sales GROUP BY product HAVING AVG(amount) > 400.0 ORDER BY product
+----
+Laptop	1050
+
+# HAVING with multiple conditions
+query TI
+SELECT product, SUM(amount) as total FROM sales GROUP BY product HAVING SUM(amount) > 500 AND COUNT(*) >= 2 ORDER BY product
+----
+Laptop	2100
+Phone	1200
+
+# HAVING referencing GROUP BY column (less common but valid)
+query TI
+SELECT product, SUM(amount) as total FROM sales GROUP BY product HAVING product != 'Tablet' ORDER BY product
+----
+Laptop	2100
+Phone	1200
+"#;
+        let report = runner.run_tests(content).unwrap();
+        assert_eq!(report.passed, 7);
+        assert_eq!(report.failed, 0);
+    }
+
+    #[test]
+    fn test_exists() {
+        let mut runner = TestRunner::new();
+        let content = r#"
+statement ok
+CREATE TABLE departments (id INT, name VARCHAR)
+
+statement ok
+INSERT INTO departments VALUES (1, 'Engineering'), (2, 'Marketing'), (3, 'HR')
+
+statement ok
+CREATE TABLE employees (id INT, name VARCHAR, dept_id INT)
+
+statement ok
+INSERT INTO employees VALUES (1, 'Alice', 1), (2, 'Bob', 1), (3, 'Carol', 2)
+
+# EXISTS with always true subquery (has employees)
+query IT
+SELECT id, name FROM departments WHERE EXISTS (SELECT 1 FROM employees) ORDER BY id
+----
+1	Engineering
+2	Marketing
+3	HR
+
+# NOT EXISTS with always true subquery (has employees)
+query IT
+SELECT id, name FROM departments WHERE NOT EXISTS (SELECT 1 FROM employees) ORDER BY id
+----
+
+# EXISTS with simple subquery
+query IT
+SELECT id, name FROM departments WHERE EXISTS (SELECT 1) ORDER BY id
+----
+1	Engineering
+2	Marketing
+3	HR
+"#;
+        let report = runner.run_tests(content).unwrap();
+        assert_eq!(report.passed, 7);
+        assert_eq!(report.failed, 0);
+    }
 }

@@ -4,7 +4,7 @@ use super::expression_binder::{bind_data_type, bind_expression, ExpressionBinder
 use super::{
     BoundCTE, BoundColumnDef, BoundCreateSchema, BoundCreateTable, BoundDelete, BoundDrop,
     BoundExpression, BoundInsert, BoundJoinType, BoundOrderBy, BoundSelect, BoundSetOperation,
-    BoundStatement, BoundTableRef, BoundUpdate, Binder, DropObjectType, SetOperationType,
+    BoundStatement, BoundTableRef, BoundUpdate, Binder, DistinctKind, DropObjectType, SetOperationType,
 };
 use ironduck_common::{Error, Result};
 use sqlparser::ast as sql;
@@ -309,7 +309,20 @@ fn bind_select_with_ctes(
     }
 
     let mut result = BoundSelect::new(select_list);
-    result.distinct = select.distinct.is_some();
+
+    // Bind DISTINCT or DISTINCT ON
+    result.distinct = match &select.distinct {
+        None => DistinctKind::None,
+        Some(sql::Distinct::Distinct) => DistinctKind::All,
+        Some(sql::Distinct::On(exprs)) => {
+            let ctx = ExpressionBinderContext::new(&from);
+            let mut bound_exprs = Vec::new();
+            for expr in exprs {
+                bound_exprs.push(bind_expression(binder, expr, &ctx)?);
+            }
+            DistinctKind::On(bound_exprs)
+        }
+    };
 
     // Bind WHERE, GROUP BY, HAVING using a fresh context
     {
