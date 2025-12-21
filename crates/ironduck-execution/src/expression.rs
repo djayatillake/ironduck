@@ -2209,6 +2209,7 @@ fn cast_value(val: &Value, target: &LogicalType) -> Result<Value> {
                     from: "VARCHAR".to_string(),
                     to: "INTEGER".to_string(),
                 })?,
+                Value::Null => return Ok(Value::Null),
                 _ => return Err(Error::InvalidCast {
                     from: val.logical_type().to_string(),
                     to: target.to_string(),
@@ -2227,6 +2228,7 @@ fn cast_value(val: &Value, target: &LogicalType) -> Result<Value> {
                     from: "VARCHAR".to_string(),
                     to: "BIGINT".to_string(),
                 })?,
+                Value::Null => return Ok(Value::Null),
                 _ => return Err(Error::InvalidCast {
                     from: val.logical_type().to_string(),
                     to: target.to_string(),
@@ -2244,6 +2246,7 @@ fn cast_value(val: &Value, target: &LogicalType) -> Result<Value> {
                     from: "VARCHAR".to_string(),
                     to: "DOUBLE".to_string(),
                 })?,
+                Value::Null => return Ok(Value::Null),
                 _ => return Err(Error::InvalidCast {
                     from: val.logical_type().to_string(),
                     to: target.to_string(),
@@ -2253,6 +2256,65 @@ fn cast_value(val: &Value, target: &LogicalType) -> Result<Value> {
         }
         LogicalType::Varchar => {
             Ok(Value::Varchar(value_to_string(val)))
+        }
+        LogicalType::SmallInt => {
+            let i = match val {
+                Value::SmallInt(i) => *i,
+                Value::Integer(i) => *i as i16,
+                Value::BigInt(i) => *i as i16,
+                Value::Float(f) => *f as i16,
+                Value::Double(f) => *f as i16,
+                Value::Boolean(b) => if *b { 1 } else { 0 },
+                Value::Varchar(s) => s.parse().map_err(|_| Error::InvalidCast {
+                    from: "VARCHAR".to_string(),
+                    to: "SMALLINT".to_string(),
+                })?,
+                Value::Null => return Ok(Value::Null),
+                _ => return Err(Error::InvalidCast {
+                    from: val.logical_type().to_string(),
+                    to: target.to_string(),
+                }),
+            };
+            Ok(Value::SmallInt(i))
+        }
+        LogicalType::TinyInt => {
+            let i = match val {
+                Value::TinyInt(i) => *i,
+                Value::SmallInt(i) => *i as i8,
+                Value::Integer(i) => *i as i8,
+                Value::BigInt(i) => *i as i8,
+                Value::Float(f) => *f as i8,
+                Value::Double(f) => *f as i8,
+                Value::Boolean(b) => if *b { 1 } else { 0 },
+                Value::Varchar(s) => s.parse().map_err(|_| Error::InvalidCast {
+                    from: "VARCHAR".to_string(),
+                    to: "TINYINT".to_string(),
+                })?,
+                Value::Null => return Ok(Value::Null),
+                _ => return Err(Error::InvalidCast {
+                    from: val.logical_type().to_string(),
+                    to: target.to_string(),
+                }),
+            };
+            Ok(Value::TinyInt(i))
+        }
+        LogicalType::Float => {
+            let f = match val {
+                Value::Integer(i) => *i as f32,
+                Value::BigInt(i) => *i as f32,
+                Value::Float(f) => *f,
+                Value::Double(f) => *f as f32,
+                Value::Varchar(s) => s.parse().map_err(|_| Error::InvalidCast {
+                    from: "VARCHAR".to_string(),
+                    to: "FLOAT".to_string(),
+                })?,
+                Value::Null => return Ok(Value::Null),
+                _ => return Err(Error::InvalidCast {
+                    from: val.logical_type().to_string(),
+                    to: target.to_string(),
+                }),
+            };
+            Ok(Value::Float(f))
         }
         _ => Err(Error::NotImplemented(format!("Cast to {:?}", target))),
     }
