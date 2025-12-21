@@ -936,6 +936,10 @@ fn evaluate_function(name: &str, args: &[Value]) -> Result<Value> {
                 Ok(Value::Double(val.sqrt()))
             }
         }
+        "CBRT" => {
+            let val = args.first().and_then(|v| v.as_f64()).unwrap_or(0.0);
+            Ok(Value::Double(val.cbrt()))
+        }
         "LOG" | "LN" => {
             let val = args.first().and_then(|v| v.as_f64()).unwrap_or(1.0);
             if val <= 0.0 {

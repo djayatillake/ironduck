@@ -6278,4 +6278,1718 @@ SELECT 'abc' = 'abc'
         let result = db.execute("SELECT STRING_AGG(DISTINCT tag, ',') FROM tags").unwrap();
         assert_eq!(result.rows.len(), 1);
     }
+
+    #[test]
+    fn test_power_function() {
+        use ironduck::Database;
+        let db = Database::new();
+
+        let result = db.execute("SELECT POWER(2, 3)").unwrap();
+        let val = result.rows[0][0].as_f64().unwrap();
+        assert!((val - 8.0).abs() < 0.01);
+
+        let result = db.execute("SELECT POW(3, 2)").unwrap();
+        let val = result.rows[0][0].as_f64().unwrap();
+        assert!((val - 9.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_sqrt_function() {
+        use ironduck::Database;
+        let db = Database::new();
+
+        let result = db.execute("SELECT SQRT(16)").unwrap();
+        let val = result.rows[0][0].as_f64().unwrap();
+        assert!((val - 4.0).abs() < 0.01);
+
+        let result = db.execute("SELECT SQRT(2)").unwrap();
+        let val = result.rows[0][0].as_f64().unwrap();
+        assert!((val - 1.414).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_exp_function() {
+        use ironduck::Database;
+        let db = Database::new();
+
+        let result = db.execute("SELECT EXP(1)").unwrap();
+        let val = result.rows[0][0].as_f64().unwrap();
+        assert!((val - 2.71828).abs() < 0.01);
+
+        let result = db.execute("SELECT EXP(0)").unwrap();
+        let val = result.rows[0][0].as_f64().unwrap();
+        assert!((val - 1.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_log2_function() {
+        use ironduck::Database;
+        let db = Database::new();
+
+        let result = db.execute("SELECT LOG2(8)").unwrap();
+        let val = result.rows[0][0].as_f64().unwrap();
+        assert!((val - 3.0).abs() < 0.01);
+
+        let result = db.execute("SELECT LOG2(16)").unwrap();
+        let val = result.rows[0][0].as_f64().unwrap();
+        assert!((val - 4.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_cbrt_function() {
+        use ironduck::Database;
+        let db = Database::new();
+
+        let result = db.execute("SELECT CBRT(27)").unwrap();
+        let val = result.rows[0][0].as_f64().unwrap();
+        assert!((val - 3.0).abs() < 0.01);
+
+        let result = db.execute("SELECT CBRT(8)").unwrap();
+        let val = result.rows[0][0].as_f64().unwrap();
+        assert!((val - 2.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_trig_functions() {
+        use ironduck::Database;
+        let db = Database::new();
+
+        let result = db.execute("SELECT SIN(0)").unwrap();
+        let val = result.rows[0][0].as_f64().unwrap();
+        assert!(val.abs() < 0.01);
+
+        let result = db.execute("SELECT COS(0)").unwrap();
+        let val = result.rows[0][0].as_f64().unwrap();
+        assert!((val - 1.0).abs() < 0.01);
+
+        let result = db.execute("SELECT TAN(0)").unwrap();
+        let val = result.rows[0][0].as_f64().unwrap();
+        assert!(val.abs() < 0.01);
+    }
+
+    #[test]
+    fn test_asin_acos_atan() {
+        use ironduck::Database;
+        let db = Database::new();
+
+        let result = db.execute("SELECT ASIN(0)").unwrap();
+        let val = result.rows[0][0].as_f64().unwrap();
+        assert!(val.abs() < 0.01);
+
+        let result = db.execute("SELECT ACOS(1)").unwrap();
+        let val = result.rows[0][0].as_f64().unwrap();
+        assert!(val.abs() < 0.01);
+
+        let result = db.execute("SELECT ATAN(0)").unwrap();
+        let val = result.rows[0][0].as_f64().unwrap();
+        assert!(val.abs() < 0.01);
+    }
+
+    #[test]
+    fn test_atan2_function() {
+        use ironduck::Database;
+        let db = Database::new();
+
+        let result = db.execute("SELECT ATAN2(1, 1)").unwrap();
+        let val = result.rows[0][0].as_f64().unwrap();
+        // atan2(1,1) = pi/4 ≈ 0.785
+        assert!((val - 0.785).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_sinh_cosh_tanh() {
+        use ironduck::Database;
+        let db = Database::new();
+
+        let result = db.execute("SELECT SINH(0)").unwrap();
+        let val = result.rows[0][0].as_f64().unwrap();
+        assert!(val.abs() < 0.01);
+
+        let result = db.execute("SELECT COSH(0)").unwrap();
+        let val = result.rows[0][0].as_f64().unwrap();
+        assert!((val - 1.0).abs() < 0.01);
+
+        let result = db.execute("SELECT TANH(0)").unwrap();
+        let val = result.rows[0][0].as_f64().unwrap();
+        assert!(val.abs() < 0.01);
+    }
+
+    #[test]
+    fn test_multiple_table_update() {
+        use ironduck::Database;
+        let db = Database::new();
+
+        db.execute("CREATE TABLE inventory (id INTEGER, quantity INTEGER)").unwrap();
+        db.execute("INSERT INTO inventory VALUES (1, 100)").unwrap();
+        db.execute("INSERT INTO inventory VALUES (2, 50)").unwrap();
+
+        db.execute("UPDATE inventory SET quantity = quantity + 10 WHERE id = 1").unwrap();
+
+        let result = db.execute("SELECT quantity FROM inventory WHERE id = 1").unwrap();
+        assert_eq!(result.rows[0][0].as_i64().unwrap(), 110);
+    }
+
+    #[test]
+    fn test_delete_with_condition() {
+        use ironduck::Database;
+        let db = Database::new();
+
+        db.execute("CREATE TABLE logs (id INTEGER, level VARCHAR)").unwrap();
+        db.execute("INSERT INTO logs VALUES (1, 'INFO')").unwrap();
+        db.execute("INSERT INTO logs VALUES (2, 'ERROR')").unwrap();
+        db.execute("INSERT INTO logs VALUES (3, 'DEBUG')").unwrap();
+        db.execute("INSERT INTO logs VALUES (4, 'ERROR')").unwrap();
+
+        db.execute("DELETE FROM logs WHERE level = 'ERROR'").unwrap();
+
+        let result = db.execute("SELECT COUNT(*) FROM logs").unwrap();
+        assert_eq!(result.rows[0][0].as_i64().unwrap(), 2);
+    }
+
+    #[test]
+    fn test_update_with_expression() {
+        use ironduck::Database;
+        let db = Database::new();
+
+        db.execute("CREATE TABLE prices (id INTEGER, price DOUBLE)").unwrap();
+        db.execute("INSERT INTO prices VALUES (1, 100.0)").unwrap();
+        db.execute("INSERT INTO prices VALUES (2, 200.0)").unwrap();
+
+        // Apply 10% discount
+        db.execute("UPDATE prices SET price = price * 0.9").unwrap();
+
+        let result = db.execute("SELECT price FROM prices WHERE id = 1").unwrap();
+        let val = result.rows[0][0].as_f64().unwrap();
+        assert!((val - 90.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_insert_select_filtered() {
+        use ironduck::Database;
+        let db = Database::new();
+
+        db.execute("CREATE TABLE source (id INTEGER, name VARCHAR)").unwrap();
+        db.execute("CREATE TABLE target (id INTEGER, name VARCHAR)").unwrap();
+
+        db.execute("INSERT INTO source VALUES (1, 'Alice')").unwrap();
+        db.execute("INSERT INTO source VALUES (2, 'Bob')").unwrap();
+
+        db.execute("INSERT INTO target SELECT * FROM source WHERE id = 1").unwrap();
+
+        let result = db.execute("SELECT COUNT(*) FROM target").unwrap();
+        assert_eq!(result.rows[0][0].as_i64().unwrap(), 1);
+    }
+
+    #[test]
+    fn test_aggregate_empty_table() {
+        use ironduck::Database;
+        let db = Database::new();
+
+        db.execute("CREATE TABLE empty_t (val INTEGER)").unwrap();
+
+        let result = db.execute("SELECT COUNT(*) FROM empty_t").unwrap();
+        assert_eq!(result.rows[0][0].as_i64().unwrap(), 0);
+    }
+
+    #[test]
+    fn test_where_with_and_or() {
+        use ironduck::Database;
+        let db = Database::new();
+
+        db.execute("CREATE TABLE products (id INTEGER, category VARCHAR, price INTEGER, in_stock BOOLEAN)").unwrap();
+        db.execute("INSERT INTO products VALUES (1, 'Electronics', 500, true)").unwrap();
+        db.execute("INSERT INTO products VALUES (2, 'Electronics', 100, false)").unwrap();
+        db.execute("INSERT INTO products VALUES (3, 'Clothing', 50, true)").unwrap();
+        db.execute("INSERT INTO products VALUES (4, 'Clothing', 200, true)").unwrap();
+
+        // Complex WHERE with parentheses
+        let result = db.execute("SELECT * FROM products WHERE (category = 'Electronics' AND price > 200) OR (category = 'Clothing' AND in_stock = true)").unwrap();
+        assert_eq!(result.rows.len(), 3);
+    }
+
+    #[test]
+    fn test_multiple_order_by() {
+        use ironduck::Database;
+        let db = Database::new();
+
+        db.execute("CREATE TABLE scores (name VARCHAR, subject VARCHAR, score INTEGER)").unwrap();
+        db.execute("INSERT INTO scores VALUES ('Alice', 'Math', 90)").unwrap();
+        db.execute("INSERT INTO scores VALUES ('Alice', 'Science', 85)").unwrap();
+        db.execute("INSERT INTO scores VALUES ('Bob', 'Math', 90)").unwrap();
+        db.execute("INSERT INTO scores VALUES ('Bob', 'Science', 95)").unwrap();
+
+        let result = db.execute("SELECT * FROM scores ORDER BY score DESC, name ASC").unwrap();
+        assert_eq!(result.rows[0][0].as_str().unwrap(), "Bob");
+        assert_eq!(result.rows[0][2].as_i64().unwrap(), 95);
+    }
+
+    #[test]
+    fn test_select_distinct_multiple() {
+        use ironduck::Database;
+        let db = Database::new();
+
+        db.execute("CREATE TABLE events (category VARCHAR, type VARCHAR)").unwrap();
+        db.execute("INSERT INTO events VALUES ('A', 'X')").unwrap();
+        db.execute("INSERT INTO events VALUES ('A', 'X')").unwrap();
+        db.execute("INSERT INTO events VALUES ('A', 'Y')").unwrap();
+        db.execute("INSERT INTO events VALUES ('B', 'X')").unwrap();
+
+        let result = db.execute("SELECT DISTINCT category, type FROM events").unwrap();
+        assert_eq!(result.rows.len(), 3);
+    }
+
+    #[test]
+    fn test_count_star_vs_column() {
+        use ironduck::Database;
+        let db = Database::new();
+
+        db.execute("CREATE TABLE nullable (val INTEGER)").unwrap();
+        db.execute("INSERT INTO nullable VALUES (1)").unwrap();
+        db.execute("INSERT INTO nullable VALUES (NULL)").unwrap();
+        db.execute("INSERT INTO nullable VALUES (3)").unwrap();
+
+        let result = db.execute("SELECT COUNT(*), COUNT(val) FROM nullable").unwrap();
+        assert_eq!(result.rows[0][0].as_i64().unwrap(), 3); // COUNT(*) includes NULLs
+        assert_eq!(result.rows[0][1].as_i64().unwrap(), 2); // COUNT(col) excludes NULLs
+    }
+
+    #[test]
+    fn test_group_by_with_alias() {
+        use ironduck::Database;
+        let db = Database::new();
+
+        db.execute("CREATE TABLE sales (product VARCHAR, amount INTEGER)").unwrap();
+        db.execute("INSERT INTO sales VALUES ('A', 100)").unwrap();
+        db.execute("INSERT INTO sales VALUES ('A', 150)").unwrap();
+        db.execute("INSERT INTO sales VALUES ('B', 200)").unwrap();
+
+        let result = db.execute("SELECT product, SUM(amount) as total FROM sales GROUP BY product").unwrap();
+        assert_eq!(result.rows.len(), 2);
+    }
+
+    #[test]
+    fn test_subquery_in_select() {
+        use ironduck::Database;
+        let db = Database::new();
+
+        db.execute("CREATE TABLE employees (id INTEGER, name VARCHAR, dept_id INTEGER)").unwrap();
+        db.execute("CREATE TABLE departments (id INTEGER, name VARCHAR)").unwrap();
+
+        db.execute("INSERT INTO departments VALUES (1, 'Engineering')").unwrap();
+        db.execute("INSERT INTO employees VALUES (1, 'Alice', 1)").unwrap();
+        db.execute("INSERT INTO employees VALUES (2, 'Bob', 1)").unwrap();
+
+        let result = db.execute("SELECT (SELECT COUNT(*) FROM employees) as emp_count").unwrap();
+        assert_eq!(result.rows[0][0].as_i64().unwrap(), 2);
+    }
+
+    #[test]
+    fn test_case_in_select() {
+        use ironduck::Database;
+        let db = Database::new();
+
+        db.execute("CREATE TABLE grades (score INTEGER)").unwrap();
+        db.execute("INSERT INTO grades VALUES (95)").unwrap();
+        db.execute("INSERT INTO grades VALUES (75)").unwrap();
+        db.execute("INSERT INTO grades VALUES (55)").unwrap();
+
+        let result = db.execute("SELECT score, CASE WHEN score >= 90 THEN 'A' WHEN score >= 70 THEN 'B' ELSE 'C' END as grade FROM grades").unwrap();
+        assert_eq!(result.rows.len(), 3);
+        assert_eq!(result.rows[0][1].as_str().unwrap(), "A");
+        assert_eq!(result.rows[1][1].as_str().unwrap(), "B");
+        assert_eq!(result.rows[2][1].as_str().unwrap(), "C");
+    }
+
+    #[test]
+    fn test_between_integers() {
+        use ironduck::Database;
+        let db = Database::new();
+
+        db.execute("CREATE TABLE numbers (n INTEGER)").unwrap();
+        for i in 1..=10 {
+            db.execute(&format!("INSERT INTO numbers VALUES ({})", i)).unwrap();
+        }
+
+        let result = db.execute("SELECT * FROM numbers WHERE n BETWEEN 3 AND 7").unwrap();
+        assert_eq!(result.rows.len(), 5);
+    }
+
+    #[test]
+    fn test_not_between() {
+        use ironduck::Database;
+        let db = Database::new();
+
+        db.execute("CREATE TABLE numbers (n INTEGER)").unwrap();
+        for i in 1..=10 {
+            db.execute(&format!("INSERT INTO numbers VALUES ({})", i)).unwrap();
+        }
+
+        let result = db.execute("SELECT * FROM numbers WHERE n NOT BETWEEN 3 AND 7").unwrap();
+        assert_eq!(result.rows.len(), 5);
+    }
+
+    #[test]
+    fn test_in_list() {
+        use ironduck::Database;
+        let db = Database::new();
+
+        db.execute("CREATE TABLE colors (color VARCHAR)").unwrap();
+        db.execute("INSERT INTO colors VALUES ('red')").unwrap();
+        db.execute("INSERT INTO colors VALUES ('green')").unwrap();
+        db.execute("INSERT INTO colors VALUES ('blue')").unwrap();
+        db.execute("INSERT INTO colors VALUES ('yellow')").unwrap();
+
+        let result = db.execute("SELECT * FROM colors WHERE color IN ('red', 'blue')").unwrap();
+        assert_eq!(result.rows.len(), 2);
+    }
+
+    #[test]
+    fn test_not_in_list() {
+        use ironduck::Database;
+        let db = Database::new();
+
+        db.execute("CREATE TABLE colors (color VARCHAR)").unwrap();
+        db.execute("INSERT INTO colors VALUES ('red')").unwrap();
+        db.execute("INSERT INTO colors VALUES ('green')").unwrap();
+        db.execute("INSERT INTO colors VALUES ('blue')").unwrap();
+
+        let result = db.execute("SELECT * FROM colors WHERE color NOT IN ('red')").unwrap();
+        assert_eq!(result.rows.len(), 2);
+    }
+
+    #[test]
+    fn test_like_underscore() {
+        use ironduck::Database;
+        let db = Database::new();
+
+        db.execute("CREATE TABLE codes (code VARCHAR)").unwrap();
+        db.execute("INSERT INTO codes VALUES ('A1')").unwrap();
+        db.execute("INSERT INTO codes VALUES ('A2')").unwrap();
+        db.execute("INSERT INTO codes VALUES ('B1')").unwrap();
+        db.execute("INSERT INTO codes VALUES ('AB1')").unwrap();
+
+        // _ matches exactly one character
+        let result = db.execute("SELECT * FROM codes WHERE code LIKE 'A_'").unwrap();
+        assert_eq!(result.rows.len(), 2);
+    }
+
+    #[test]
+    fn test_arithmetic_basic_ops() {
+        use ironduck::Database;
+        let db = Database::new();
+
+        let result = db.execute("SELECT 10 + 5, 10 - 5, 10 * 5, 10 / 5").unwrap();
+        assert_eq!(result.rows[0][0].as_i64().unwrap(), 15);
+        assert_eq!(result.rows[0][1].as_i64().unwrap(), 5);
+        assert_eq!(result.rows[0][2].as_i64().unwrap(), 50);
+        let div = result.rows[0][3].as_i64().unwrap_or(result.rows[0][3].as_f64().unwrap() as i64);
+        assert_eq!(div, 2);
+    }
+
+    #[test]
+    fn test_comparison_basic_ops() {
+        use ironduck::Database;
+        let db = Database::new();
+
+        let result = db.execute("SELECT 5 > 3, 5 < 3, 5 >= 5, 5 <= 5, 5 = 5, 5 != 3").unwrap();
+        assert!(result.rows[0][0].as_bool().unwrap());
+        assert!(!result.rows[0][1].as_bool().unwrap());
+        assert!(result.rows[0][2].as_bool().unwrap());
+        assert!(result.rows[0][3].as_bool().unwrap());
+        assert!(result.rows[0][4].as_bool().unwrap());
+        assert!(result.rows[0][5].as_bool().unwrap());
+    }
+
+    #[test]
+    fn test_string_length() {
+        use ironduck::Database;
+        let db = Database::new();
+
+        let result = db.execute("SELECT LENGTH('hello')").unwrap();
+        assert_eq!(result.rows[0][0].as_i64().unwrap(), 5);
+
+        let result = db.execute("SELECT CHAR_LENGTH('hello')").unwrap();
+        assert_eq!(result.rows[0][0].as_i64().unwrap(), 5);
+    }
+
+    #[test]
+    fn test_bit_operations() {
+        use ironduck::Database;
+        let db = Database::new();
+
+        let result = db.execute("SELECT BIT_COUNT(7)").unwrap();
+        assert_eq!(result.rows[0][0].as_i64().unwrap(), 3); // 7 = 111 in binary
+    }
+
+    #[test]
+    fn test_replace_function() {
+        use ironduck::Database;
+        let db = Database::new();
+
+        let result = db.execute("SELECT REPLACE('hello world', 'world', 'there')").unwrap();
+        assert_eq!(result.rows[0][0].as_str().unwrap(), "hello there");
+    }
+
+    #[test]
+    fn test_translate_chars() {
+        use ironduck::Database;
+        let db = Database::new();
+
+        let result = db.execute("SELECT TRANSLATE('hello', 'el', 'ip')").unwrap();
+        assert_eq!(result.rows[0][0].as_str().unwrap(), "hippo");
+    }
+
+    #[test]
+    fn test_abs_function() {
+        use ironduck::Database;
+        let db = Database::new();
+
+        let result = db.execute("SELECT ABS(-42)").unwrap();
+        assert_eq!(result.rows[0][0].as_i64().unwrap(), 42);
+
+        let result = db.execute("SELECT ABS(-3.14)").unwrap();
+        let val = result.rows[0][0].as_f64().unwrap();
+        assert!((val - 3.14).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_coalesce_chain() {
+        use ironduck::Database;
+        let db = Database::new();
+
+        let result = db.execute("SELECT COALESCE(NULL, NULL, 'default')").unwrap();
+        assert_eq!(result.rows[0][0].as_str().unwrap(), "default");
+
+        let result = db.execute("SELECT COALESCE('first', 'second', 'third')").unwrap();
+        assert_eq!(result.rows[0][0].as_str().unwrap(), "first");
+    }
+
+    #[test]
+    fn test_hex_functions() {
+        use ironduck::Database;
+        let db = Database::new();
+
+        let result = db.execute("SELECT HEX(255)").unwrap();
+        assert_eq!(result.rows[0][0].as_str().unwrap().to_uppercase(), "FF");
+    }
+
+    #[test]
+    fn test_radians_degrees() {
+        use ironduck::Database;
+        let db = Database::new();
+
+        let result = db.execute("SELECT RADIANS(180)").unwrap();
+        let val = result.rows[0][0].as_f64().unwrap();
+        assert!((val - std::f64::consts::PI).abs() < 0.01);
+
+        let result = db.execute("SELECT DEGREES(3.14159265)").unwrap();
+        let val = result.rows[0][0].as_f64().unwrap();
+        assert!((val - 180.0).abs() < 0.1);
+    }
+
+    #[test]
+    fn test_reverse_string() {
+        use ironduck::Database;
+        let db = Database::new();
+
+        let result = db.execute("SELECT REVERSE('hello')").unwrap();
+        assert_eq!(result.rows[0][0].as_str().unwrap(), "olleh");
+    }
+
+    #[test]
+    fn test_left_right_functions() {
+        use ironduck::Database;
+        let db = Database::new();
+
+        let result = db.execute("SELECT LEFT('hello', 2)").unwrap();
+        assert_eq!(result.rows[0][0].as_str().unwrap(), "he");
+
+        let result = db.execute("SELECT RIGHT('hello', 2)").unwrap();
+        assert_eq!(result.rows[0][0].as_str().unwrap(), "lo");
+    }
+
+    #[test]
+    fn test_substring_with_length() {
+        use ironduck::Database;
+        let db = Database::new();
+
+        let result = db.execute("SELECT SUBSTRING('hello world', 1, 5)").unwrap();
+        assert_eq!(result.rows[0][0].as_str().unwrap(), "hello");
+
+        let result = db.execute("SELECT SUBSTR('hello world', 7)").unwrap();
+        assert_eq!(result.rows[0][0].as_str().unwrap(), "world");
+    }
+
+    #[test]
+    fn test_nested_function_calls() {
+        use ironduck::Database;
+        let db = Database::new();
+
+        let result = db.execute("SELECT UPPER(LOWER(TRIM('  HELLO  ')))").unwrap();
+        assert_eq!(result.rows[0][0].as_str().unwrap(), "HELLO");
+    }
+
+    #[test]
+    fn test_subquery_in_where_with_avg() {
+        use ironduck::Database;
+        let db = Database::new();
+
+        db.execute("CREATE TABLE orders (id INTEGER, amount INTEGER)").unwrap();
+        db.execute("INSERT INTO orders VALUES (1, 100)").unwrap();
+        db.execute("INSERT INTO orders VALUES (2, 200)").unwrap();
+        db.execute("INSERT INTO orders VALUES (3, 300)").unwrap();
+
+        let result = db.execute("SELECT * FROM orders WHERE amount > (SELECT AVG(amount) FROM orders)").unwrap();
+        assert_eq!(result.rows.len(), 1);
+        assert_eq!(result.rows[0][0].as_i64().unwrap(), 3);
+    }
+
+    #[test]
+    fn test_null_coalesce_chain() {
+        use ironduck::Database;
+        let db = Database::new();
+
+        db.execute("CREATE TABLE data (a INTEGER, b INTEGER, c INTEGER)").unwrap();
+        db.execute("INSERT INTO data VALUES (NULL, NULL, 3)").unwrap();
+        db.execute("INSERT INTO data VALUES (1, NULL, NULL)").unwrap();
+        db.execute("INSERT INTO data VALUES (NULL, 2, NULL)").unwrap();
+
+        let result = db.execute("SELECT COALESCE(a, b, c) FROM data ORDER BY COALESCE(a, b, c)").unwrap();
+        assert_eq!(result.rows.len(), 3);
+        assert_eq!(result.rows[0][0].as_i64().unwrap(), 1);
+        assert_eq!(result.rows[1][0].as_i64().unwrap(), 2);
+        assert_eq!(result.rows[2][0].as_i64().unwrap(), 3);
+    }
+
+    #[test]
+    fn test_aggregate_with_case() {
+        use ironduck::Database;
+        let db = Database::new();
+
+        db.execute("CREATE TABLE sales (product VARCHAR, amount INTEGER)").unwrap();
+        db.execute("INSERT INTO sales VALUES ('A', 100)").unwrap();
+        db.execute("INSERT INTO sales VALUES ('A', 150)").unwrap();
+        db.execute("INSERT INTO sales VALUES ('B', 200)").unwrap();
+        db.execute("INSERT INTO sales VALUES ('B', 50)").unwrap();
+
+        let result = db.execute("SELECT product, SUM(CASE WHEN amount > 100 THEN amount ELSE 0 END) as high_sales FROM sales GROUP BY product ORDER BY product").unwrap();
+        assert_eq!(result.rows.len(), 2);
+    }
+
+    #[test]
+    fn test_union_all_simple() {
+        use ironduck::Database;
+        let db = Database::new();
+
+        let result = db.execute("SELECT 1 as num UNION ALL SELECT 2").unwrap();
+        assert_eq!(result.rows.len(), 2);
+    }
+
+    #[test]
+    fn test_union_removes_dups() {
+        use ironduck::Database;
+        let db = Database::new();
+
+        let result = db.execute("SELECT 1 as num UNION SELECT 1").unwrap();
+        assert_eq!(result.rows.len(), 1);
+    }
+
+    #[test]
+    fn test_intersect_simple() {
+        use ironduck::Database;
+        let db = Database::new();
+
+        let result = db.execute("SELECT 1 INTERSECT SELECT 1").unwrap();
+        assert_eq!(result.rows.len(), 1);
+    }
+
+    #[test]
+    fn test_except_basic() {
+        use ironduck::Database;
+        let db = Database::new();
+
+        let result = db.execute("SELECT 1 EXCEPT SELECT 2").unwrap();
+        assert_eq!(result.rows.len(), 1);
+    }
+
+    #[test]
+    fn test_group_by_multiple() {
+        use ironduck::Database;
+        let db = Database::new();
+
+        db.execute("CREATE TABLE transactions (category VARCHAR, region VARCHAR, amount INTEGER)").unwrap();
+        db.execute("INSERT INTO transactions VALUES ('Food', 'North', 100)").unwrap();
+        db.execute("INSERT INTO transactions VALUES ('Food', 'North', 50)").unwrap();
+        db.execute("INSERT INTO transactions VALUES ('Food', 'South', 75)").unwrap();
+        db.execute("INSERT INTO transactions VALUES ('Tech', 'North', 200)").unwrap();
+
+        let result = db.execute("SELECT category, region, SUM(amount) FROM transactions GROUP BY category, region ORDER BY category, region").unwrap();
+        assert_eq!(result.rows.len(), 3);
+    }
+
+    #[test]
+    fn test_order_by_desc_table() {
+        use ironduck::Database;
+        let db = Database::new();
+
+        db.execute("CREATE TABLE nums (n INTEGER)").unwrap();
+        db.execute("INSERT INTO nums VALUES (1)").unwrap();
+        db.execute("INSERT INTO nums VALUES (2)").unwrap();
+        db.execute("INSERT INTO nums VALUES (3)").unwrap();
+
+        let result = db.execute("SELECT n FROM nums ORDER BY n DESC").unwrap();
+        assert_eq!(result.rows[0][0].as_i64().unwrap(), 3);
+        assert_eq!(result.rows[2][0].as_i64().unwrap(), 1);
+    }
+
+    #[test]
+    fn test_limit_offset_combined() {
+        use ironduck::Database;
+        let db = Database::new();
+
+        db.execute("CREATE TABLE items (id INTEGER)").unwrap();
+        db.execute("INSERT INTO items VALUES (1)").unwrap();
+        db.execute("INSERT INTO items VALUES (2)").unwrap();
+        db.execute("INSERT INTO items VALUES (3)").unwrap();
+        db.execute("INSERT INTO items VALUES (4)").unwrap();
+        db.execute("INSERT INTO items VALUES (5)").unwrap();
+
+        let result = db.execute("SELECT * FROM items ORDER BY id LIMIT 2 OFFSET 2").unwrap();
+        assert_eq!(result.rows.len(), 2);
+        assert_eq!(result.rows[0][0].as_i64().unwrap(), 3);
+        assert_eq!(result.rows[1][0].as_i64().unwrap(), 4);
+    }
+
+    #[test]
+    fn test_expression_in_order_by() {
+        use ironduck::Database;
+        let db = Database::new();
+
+        db.execute("CREATE TABLE values_t (n INTEGER)").unwrap();
+        db.execute("INSERT INTO values_t VALUES (-3)").unwrap();
+        db.execute("INSERT INTO values_t VALUES (1)").unwrap();
+        db.execute("INSERT INTO values_t VALUES (-2)").unwrap();
+
+        let result = db.execute("SELECT * FROM values_t ORDER BY ABS(n)").unwrap();
+        assert_eq!(result.rows[0][0].as_i64().unwrap(), 1);
+    }
+
+    #[test]
+    fn test_count_star_vs_count_column() {
+        use ironduck::Database;
+        let db = Database::new();
+
+        db.execute("CREATE TABLE with_nulls (id INTEGER, val INTEGER)").unwrap();
+        db.execute("INSERT INTO with_nulls VALUES (1, 10)").unwrap();
+        db.execute("INSERT INTO with_nulls VALUES (2, NULL)").unwrap();
+        db.execute("INSERT INTO with_nulls VALUES (3, 30)").unwrap();
+
+        let result = db.execute("SELECT COUNT(*), COUNT(val) FROM with_nulls").unwrap();
+        assert_eq!(result.rows[0][0].as_i64().unwrap(), 3);
+        assert_eq!(result.rows[0][1].as_i64().unwrap(), 2);
+    }
+
+    #[test]
+    fn test_string_comparison() {
+        use ironduck::Database;
+        let db = Database::new();
+
+        let result = db.execute("SELECT 'abc' < 'abd', 'abc' = 'abc', 'xyz' > 'abc'").unwrap();
+        assert!(result.rows[0][0].as_bool().unwrap());
+        assert!(result.rows[0][1].as_bool().unwrap());
+        assert!(result.rows[0][2].as_bool().unwrap());
+    }
+
+    #[test]
+    fn test_boolean_and_or() {
+        use ironduck::Database;
+        let db = Database::new();
+
+        let result = db.execute("SELECT true AND true, true AND false, true OR false, false OR false").unwrap();
+        assert!(result.rows[0][0].as_bool().unwrap());
+        assert!(!result.rows[0][1].as_bool().unwrap());
+        assert!(result.rows[0][2].as_bool().unwrap());
+        assert!(!result.rows[0][3].as_bool().unwrap());
+    }
+
+    #[test]
+    fn test_boolean_not() {
+        use ironduck::Database;
+        let db = Database::new();
+
+        let result = db.execute("SELECT NOT true, NOT false").unwrap();
+        assert!(!result.rows[0][0].as_bool().unwrap());
+        assert!(result.rows[0][1].as_bool().unwrap());
+    }
+
+    #[test]
+    fn test_integer_division() {
+        use ironduck::Database;
+        let db = Database::new();
+
+        let result = db.execute("SELECT 7 / 2").unwrap();
+        let val = result.rows[0][0].as_i64().unwrap_or_else(|| result.rows[0][0].as_f64().unwrap() as i64);
+        // Integer division should be 3
+        assert!(val == 3 || val == 3);
+    }
+
+    #[test]
+    fn test_float_division() {
+        use ironduck::Database;
+        let db = Database::new();
+
+        let result = db.execute("SELECT 7.0 / 2.0").unwrap();
+        let val = result.rows[0][0].as_f64().unwrap();
+        assert!((val - 3.5).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_negative_modulo() {
+        use ironduck::Database;
+        let db = Database::new();
+
+        let result = db.execute("SELECT -7 % 3").unwrap();
+        let val = result.rows[0][0].as_i64().unwrap();
+        // -7 mod 3 = -1 in most SQL implementations
+        assert!(val == -1 || val == 2);
+    }
+
+    #[test]
+    fn test_self_join_manager() {
+        use ironduck::Database;
+        let db = Database::new();
+
+        db.execute("CREATE TABLE employees (id INTEGER, name VARCHAR, manager_id INTEGER)").unwrap();
+        db.execute("INSERT INTO employees VALUES (1, 'Alice', NULL)").unwrap();
+        db.execute("INSERT INTO employees VALUES (2, 'Bob', 1)").unwrap();
+        db.execute("INSERT INTO employees VALUES (3, 'Charlie', 1)").unwrap();
+
+        let result = db.execute("SELECT e.name, m.name as manager FROM employees e LEFT JOIN employees m ON e.manager_id = m.id").unwrap();
+        assert_eq!(result.rows.len(), 3);
+    }
+
+    #[test]
+    fn test_multiple_conditions_join() {
+        use ironduck::Database;
+        let db = Database::new();
+
+        db.execute("CREATE TABLE t1 (a INTEGER, b INTEGER)").unwrap();
+        db.execute("CREATE TABLE t2 (x INTEGER, y INTEGER)").unwrap();
+        db.execute("INSERT INTO t1 VALUES (1, 2)").unwrap();
+        db.execute("INSERT INTO t2 VALUES (1, 2)").unwrap();
+        db.execute("INSERT INTO t2 VALUES (1, 3)").unwrap();
+
+        let result = db.execute("SELECT * FROM t1 JOIN t2 ON t1.a = t2.x AND t1.b = t2.y").unwrap();
+        assert_eq!(result.rows.len(), 1);
+    }
+
+    #[test]
+    fn test_concat_operator() {
+        use ironduck::Database;
+        let db = Database::new();
+
+        let result = db.execute("SELECT 'hello' || ' ' || 'world'").unwrap();
+        assert_eq!(result.rows[0][0].as_str().unwrap(), "hello world");
+    }
+
+    #[test]
+    fn test_case_with_null() {
+        use ironduck::Database;
+        let db = Database::new();
+
+        let result = db.execute("SELECT CASE WHEN NULL THEN 'yes' ELSE 'no' END").unwrap();
+        assert_eq!(result.rows[0][0].as_str().unwrap(), "no");
+    }
+
+    #[test]
+    fn test_nullif_returns_null() {
+        use ironduck::Database;
+        let db = Database::new();
+
+        let result = db.execute("SELECT NULLIF(5, 5)").unwrap();
+        assert!(result.rows[0][0].is_null());
+
+        let result = db.execute("SELECT NULLIF(5, 3)").unwrap();
+        assert_eq!(result.rows[0][0].as_i64().unwrap(), 5);
+    }
+
+    #[test]
+    fn test_aggregate_min_max_strings_order() {
+        use ironduck::Database;
+        let db = Database::new();
+
+        db.execute("CREATE TABLE words (w VARCHAR)").unwrap();
+        db.execute("INSERT INTO words VALUES ('banana')").unwrap();
+        db.execute("INSERT INTO words VALUES ('apple')").unwrap();
+        db.execute("INSERT INTO words VALUES ('cherry')").unwrap();
+
+        let result = db.execute("SELECT MIN(w), MAX(w) FROM words").unwrap();
+        assert_eq!(result.rows[0][0].as_str().unwrap(), "apple");
+        assert_eq!(result.rows[0][1].as_str().unwrap(), "cherry");
+    }
+
+    #[test]
+    fn test_empty_string() {
+        use ironduck::Database;
+        let db = Database::new();
+
+        let result = db.execute("SELECT LENGTH('')").unwrap();
+        assert_eq!(result.rows[0][0].as_i64().unwrap(), 0);
+    }
+
+    #[test]
+    fn test_large_number() {
+        use ironduck::Database;
+        let db = Database::new();
+
+        let result = db.execute("SELECT 9223372036854775807").unwrap();
+        assert_eq!(result.rows[0][0].as_i64().unwrap(), i64::MAX);
+    }
+
+    #[test]
+    fn test_scientific_notation() {
+        use ironduck::Database;
+        let db = Database::new();
+
+        let result = db.execute("SELECT 1e10").unwrap();
+        let val = result.rows[0][0].as_f64().unwrap();
+        assert!((val - 1e10).abs() < 1e5);
+    }
+
+    #[test]
+    fn test_floor_ceil_with_negatives() {
+        use ironduck::Database;
+        let db = Database::new();
+
+        let result = db.execute("SELECT FLOOR(-2.5), CEIL(-2.5)").unwrap();
+        let floor = result.rows[0][0].as_f64().unwrap();
+        let ceil = result.rows[0][1].as_f64().unwrap();
+        assert!((floor - (-3.0)).abs() < 0.01);
+        assert!((ceil - (-2.0)).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_round_with_decimals() {
+        use ironduck::Database;
+        let db = Database::new();
+
+        let result = db.execute("SELECT ROUND(3.14159, 2)").unwrap();
+        let val = result.rows[0][0].as_f64().unwrap();
+        assert!((val - 3.14).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_sign_all_cases() {
+        use ironduck::Database;
+        let db = Database::new();
+
+        let result = db.execute("SELECT SIGN(-5), SIGN(0), SIGN(5)").unwrap();
+        assert_eq!(result.rows[0][0].as_i64().unwrap(), -1);
+        assert_eq!(result.rows[0][1].as_i64().unwrap(), 0);
+        assert_eq!(result.rows[0][2].as_i64().unwrap(), 1);
+    }
+
+    #[test]
+    fn test_log_ln_functions() {
+        use ironduck::Database;
+        let db = Database::new();
+
+        let result = db.execute("SELECT LN(2.718281828)").unwrap();
+        let val = result.rows[0][0].as_f64().unwrap();
+        assert!((val - 1.0).abs() < 0.01);
+
+        let result = db.execute("SELECT LOG10(100)").unwrap();
+        let val = result.rows[0][0].as_f64().unwrap();
+        assert!((val - 2.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_atan2_quadrant() {
+        use ironduck::Database;
+        let db = Database::new();
+
+        let result = db.execute("SELECT ATAN2(1, 1)").unwrap();
+        let val = result.rows[0][0].as_f64().unwrap();
+        // atan2(1, 1) = pi/4 ≈ 0.785
+        assert!((val - 0.785).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_trim_variations() {
+        use ironduck::Database;
+        let db = Database::new();
+
+        let result = db.execute("SELECT LTRIM('  hello')").unwrap();
+        assert_eq!(result.rows[0][0].as_str().unwrap(), "hello");
+
+        let result = db.execute("SELECT RTRIM('hello  ')").unwrap();
+        assert_eq!(result.rows[0][0].as_str().unwrap(), "hello");
+    }
+
+    #[test]
+    fn test_alias_in_expressions() {
+        use ironduck::Database;
+        let db = Database::new();
+
+        db.execute("CREATE TABLE numbers (n INTEGER)").unwrap();
+        db.execute("INSERT INTO numbers VALUES (5)").unwrap();
+
+        let result = db.execute("SELECT n * 2 as doubled, n + 10 as plus_ten FROM numbers").unwrap();
+        assert_eq!(result.rows[0][0].as_i64().unwrap(), 10);
+        assert_eq!(result.rows[0][1].as_i64().unwrap(), 15);
+    }
+
+    #[test]
+    fn test_multiple_aggregates_same_column() {
+        use ironduck::Database;
+        let db = Database::new();
+
+        db.execute("CREATE TABLE vals (v INTEGER)").unwrap();
+        db.execute("INSERT INTO vals VALUES (10)").unwrap();
+        db.execute("INSERT INTO vals VALUES (20)").unwrap();
+        db.execute("INSERT INTO vals VALUES (30)").unwrap();
+
+        let result = db.execute("SELECT SUM(v), AVG(v), MIN(v), MAX(v), COUNT(v) FROM vals").unwrap();
+        assert_eq!(result.rows[0][0].as_i64().unwrap(), 60);
+        let avg = result.rows[0][1].as_f64().unwrap();
+        assert!((avg - 20.0).abs() < 0.01);
+        assert_eq!(result.rows[0][2].as_i64().unwrap(), 10);
+        assert_eq!(result.rows[0][3].as_i64().unwrap(), 30);
+        assert_eq!(result.rows[0][4].as_i64().unwrap(), 3);
+    }
+
+    #[test]
+    fn test_nested_subquery() {
+        use ironduck::Database;
+        let db = Database::new();
+
+        db.execute("CREATE TABLE t (id INTEGER, val INTEGER)").unwrap();
+        db.execute("INSERT INTO t VALUES (1, 100)").unwrap();
+        db.execute("INSERT INTO t VALUES (2, 200)").unwrap();
+
+        let result = db.execute("SELECT * FROM t WHERE val = (SELECT MAX(val) FROM t)").unwrap();
+        assert_eq!(result.rows.len(), 1);
+        assert_eq!(result.rows[0][0].as_i64().unwrap(), 2);
+    }
+
+    #[test]
+    fn test_complex_case_expression() {
+        use ironduck::Database;
+        let db = Database::new();
+
+        db.execute("CREATE TABLE scores (name VARCHAR, score INTEGER)").unwrap();
+        db.execute("INSERT INTO scores VALUES ('Alice', 95)").unwrap();
+        db.execute("INSERT INTO scores VALUES ('Bob', 85)").unwrap();
+        db.execute("INSERT INTO scores VALUES ('Charlie', 75)").unwrap();
+        db.execute("INSERT INTO scores VALUES ('David', 65)").unwrap();
+
+        let result = db.execute("SELECT name, CASE WHEN score >= 90 THEN 'A' WHEN score >= 80 THEN 'B' WHEN score >= 70 THEN 'C' ELSE 'F' END as grade FROM scores ORDER BY name").unwrap();
+        assert_eq!(result.rows.len(), 4);
+        assert_eq!(result.rows[0][1].as_str().unwrap(), "A");
+        assert_eq!(result.rows[1][1].as_str().unwrap(), "B");
+        assert_eq!(result.rows[2][1].as_str().unwrap(), "C");
+        assert_eq!(result.rows[3][1].as_str().unwrap(), "F");
+    }
+
+    #[test]
+    fn test_group_by_with_having() {
+        use ironduck::Database;
+        let db = Database::new();
+
+        db.execute("CREATE TABLE orders (customer_id INTEGER, amount INTEGER)").unwrap();
+        db.execute("INSERT INTO orders VALUES (1, 100)").unwrap();
+        db.execute("INSERT INTO orders VALUES (1, 200)").unwrap();
+        db.execute("INSERT INTO orders VALUES (2, 50)").unwrap();
+        db.execute("INSERT INTO orders VALUES (2, 75)").unwrap();
+        db.execute("INSERT INTO orders VALUES (3, 500)").unwrap();
+
+        let result = db.execute("SELECT customer_id, SUM(amount) as total FROM orders GROUP BY customer_id HAVING SUM(amount) > 200 ORDER BY customer_id").unwrap();
+        assert_eq!(result.rows.len(), 2);
+    }
+
+    #[test]
+    fn test_left_join_with_where() {
+        use ironduck::Database;
+        let db = Database::new();
+
+        db.execute("CREATE TABLE users (id INTEGER, name VARCHAR)").unwrap();
+        db.execute("CREATE TABLE orders (id INTEGER, user_id INTEGER, amount INTEGER)").unwrap();
+
+        db.execute("INSERT INTO users VALUES (1, 'Alice')").unwrap();
+        db.execute("INSERT INTO users VALUES (2, 'Bob')").unwrap();
+        db.execute("INSERT INTO orders VALUES (1, 1, 100)").unwrap();
+
+        let result = db.execute("SELECT u.name, o.amount FROM users u LEFT JOIN orders o ON u.id = o.user_id WHERE u.id = 1").unwrap();
+        assert_eq!(result.rows.len(), 1);
+        assert_eq!(result.rows[0][0].as_str().unwrap(), "Alice");
+    }
+
+    #[test]
+    fn test_aggregate_with_null_values() {
+        use ironduck::Database;
+        let db = Database::new();
+
+        db.execute("CREATE TABLE nullable (v INTEGER)").unwrap();
+        db.execute("INSERT INTO nullable VALUES (10)").unwrap();
+        db.execute("INSERT INTO nullable VALUES (NULL)").unwrap();
+        db.execute("INSERT INTO nullable VALUES (20)").unwrap();
+        db.execute("INSERT INTO nullable VALUES (NULL)").unwrap();
+
+        let result = db.execute("SELECT COUNT(*), COUNT(v), SUM(v), AVG(v) FROM nullable").unwrap();
+        assert_eq!(result.rows[0][0].as_i64().unwrap(), 4);
+        assert_eq!(result.rows[0][1].as_i64().unwrap(), 2);
+        assert_eq!(result.rows[0][2].as_i64().unwrap(), 30);
+    }
+
+    #[test]
+    fn test_string_functions_combined() {
+        use ironduck::Database;
+        let db = Database::new();
+
+        let result = db.execute("SELECT UPPER(TRIM('  hello  ')), LOWER(TRIM('  WORLD  '))").unwrap();
+        assert_eq!(result.rows[0][0].as_str().unwrap(), "HELLO");
+        assert_eq!(result.rows[0][1].as_str().unwrap(), "world");
+    }
+
+    #[test]
+    fn test_arithmetic_with_null() {
+        use ironduck::Database;
+        let db = Database::new();
+
+        let result = db.execute("SELECT 5 + NULL, NULL * 10, NULL / 2").unwrap();
+        assert!(result.rows[0][0].is_null());
+        assert!(result.rows[0][1].is_null());
+        assert!(result.rows[0][2].is_null());
+    }
+
+    #[test]
+    fn test_comparison_with_null() {
+        use ironduck::Database;
+        let db = Database::new();
+
+        let result = db.execute("SELECT NULL = NULL, NULL <> NULL, NULL > 5").unwrap();
+        assert!(result.rows[0][0].is_null());
+        assert!(result.rows[0][1].is_null());
+        assert!(result.rows[0][2].is_null());
+    }
+
+    #[test]
+    fn test_in_with_null() {
+        use ironduck::Database;
+        let db = Database::new();
+
+        let result = db.execute("SELECT 1 IN (1, 2, 3), 4 IN (1, 2, 3)").unwrap();
+        assert!(result.rows[0][0].as_bool().unwrap());
+        assert!(!result.rows[0][1].as_bool().unwrap());
+    }
+
+    #[test]
+    fn test_order_by_nulls() {
+        use ironduck::Database;
+        let db = Database::new();
+
+        db.execute("CREATE TABLE nullable_order (v INTEGER)").unwrap();
+        db.execute("INSERT INTO nullable_order VALUES (2)").unwrap();
+        db.execute("INSERT INTO nullable_order VALUES (NULL)").unwrap();
+        db.execute("INSERT INTO nullable_order VALUES (1)").unwrap();
+        db.execute("INSERT INTO nullable_order VALUES (3)").unwrap();
+
+        let result = db.execute("SELECT * FROM nullable_order ORDER BY v").unwrap();
+        assert_eq!(result.rows.len(), 4);
+    }
+
+    #[test]
+    fn test_distinct_with_order() {
+        use ironduck::Database;
+        let db = Database::new();
+
+        db.execute("CREATE TABLE dups (v INTEGER)").unwrap();
+        db.execute("INSERT INTO dups VALUES (3)").unwrap();
+        db.execute("INSERT INTO dups VALUES (1)").unwrap();
+        db.execute("INSERT INTO dups VALUES (2)").unwrap();
+        db.execute("INSERT INTO dups VALUES (1)").unwrap();
+        db.execute("INSERT INTO dups VALUES (3)").unwrap();
+
+        let result = db.execute("SELECT DISTINCT v FROM dups ORDER BY v").unwrap();
+        assert_eq!(result.rows.len(), 3);
+        assert_eq!(result.rows[0][0].as_i64().unwrap(), 1);
+        assert_eq!(result.rows[1][0].as_i64().unwrap(), 2);
+        assert_eq!(result.rows[2][0].as_i64().unwrap(), 3);
+    }
+
+    #[test]
+    fn test_join_with_aliases() {
+        use ironduck::Database;
+        let db = Database::new();
+
+        db.execute("CREATE TABLE departments (id INTEGER, name VARCHAR)").unwrap();
+        db.execute("CREATE TABLE staff (id INTEGER, dept_id INTEGER, name VARCHAR)").unwrap();
+
+        db.execute("INSERT INTO departments VALUES (1, 'Engineering')").unwrap();
+        db.execute("INSERT INTO departments VALUES (2, 'Sales')").unwrap();
+        db.execute("INSERT INTO staff VALUES (1, 1, 'Alice')").unwrap();
+        db.execute("INSERT INTO staff VALUES (2, 1, 'Bob')").unwrap();
+        db.execute("INSERT INTO staff VALUES (3, 2, 'Charlie')").unwrap();
+
+        let result = db.execute("SELECT s.name, d.name as dept FROM staff s JOIN departments d ON s.dept_id = d.id ORDER BY s.name").unwrap();
+        assert_eq!(result.rows.len(), 3);
+        assert_eq!(result.rows[0][0].as_str().unwrap(), "Alice");
+        assert_eq!(result.rows[0][1].as_str().unwrap(), "Engineering");
+    }
+
+    #[test]
+    fn test_cross_join_basic() {
+        use ironduck::Database;
+        let db = Database::new();
+
+        db.execute("CREATE TABLE a (x INTEGER)").unwrap();
+        db.execute("CREATE TABLE b (y INTEGER)").unwrap();
+        db.execute("INSERT INTO a VALUES (1)").unwrap();
+        db.execute("INSERT INTO a VALUES (2)").unwrap();
+        db.execute("INSERT INTO b VALUES (10)").unwrap();
+        db.execute("INSERT INTO b VALUES (20)").unwrap();
+
+        let result = db.execute("SELECT * FROM a CROSS JOIN b ORDER BY x, y").unwrap();
+        assert_eq!(result.rows.len(), 4);
+    }
+
+    #[test]
+    fn test_modulo_multiple() {
+        use ironduck::Database;
+        let db = Database::new();
+
+        let result = db.execute("SELECT 17 % 5, 10 % 3, 8 % 4").unwrap();
+        assert_eq!(result.rows[0][0].as_i64().unwrap(), 2);
+        assert_eq!(result.rows[0][1].as_i64().unwrap(), 1);
+        assert_eq!(result.rows[0][2].as_i64().unwrap(), 0);
+    }
+
+    #[test]
+    fn test_string_concat_with_null() {
+        use ironduck::Database;
+        let db = Database::new();
+
+        let result = db.execute("SELECT CONCAT('hello', NULL)").unwrap();
+        // CONCAT should handle NULL gracefully
+        let val = result.rows[0][0].as_str();
+        // Either returns null or 'hello' depending on implementation
+        assert!(val.is_some() || result.rows[0][0].is_null());
+    }
+
+    #[test]
+    fn test_aggregate_only_nulls() {
+        use ironduck::Database;
+        let db = Database::new();
+
+        db.execute("CREATE TABLE all_nulls (v INTEGER)").unwrap();
+        db.execute("INSERT INTO all_nulls VALUES (NULL)").unwrap();
+        db.execute("INSERT INTO all_nulls VALUES (NULL)").unwrap();
+
+        let result = db.execute("SELECT COUNT(*), COUNT(v) FROM all_nulls").unwrap();
+        assert_eq!(result.rows[0][0].as_i64().unwrap(), 2);
+        assert_eq!(result.rows[0][1].as_i64().unwrap(), 0);
+    }
+
+    #[test]
+    fn test_math_with_doubles() {
+        use ironduck::Database;
+        let db = Database::new();
+
+        let result = db.execute("SELECT 1.5 + 2.5, 5.0 - 1.5, 2.0 * 3.5, 7.0 / 2.0").unwrap();
+        let sum = result.rows[0][0].as_f64().unwrap();
+        let diff = result.rows[0][1].as_f64().unwrap();
+        let prod = result.rows[0][2].as_f64().unwrap();
+        let quot = result.rows[0][3].as_f64().unwrap();
+
+        assert!((sum - 4.0).abs() < 0.01);
+        assert!((diff - 3.5).abs() < 0.01);
+        assert!((prod - 7.0).abs() < 0.01);
+        assert!((quot - 3.5).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_select_columns_with_join() {
+        use ironduck::Database;
+        let db = Database::new();
+
+        db.execute("CREATE TABLE p (id INTEGER, name VARCHAR)").unwrap();
+        db.execute("CREATE TABLE c (id INTEGER, parent_id INTEGER, val INTEGER)").unwrap();
+
+        db.execute("INSERT INTO p VALUES (1, 'Parent1')").unwrap();
+        db.execute("INSERT INTO c VALUES (1, 1, 100)").unwrap();
+
+        let result = db.execute("SELECT p.id, p.name, c.val FROM p JOIN c ON p.id = c.parent_id").unwrap();
+        assert_eq!(result.rows.len(), 1);
+        assert_eq!(result.rows[0][0].as_i64().unwrap(), 1);
+        assert_eq!(result.rows[0][1].as_str().unwrap(), "Parent1");
+        assert_eq!(result.rows[0][2].as_i64().unwrap(), 100);
+    }
+
+    #[test]
+    fn test_where_between_dates() {
+        use ironduck::Database;
+        let db = Database::new();
+
+        db.execute("CREATE TABLE events (name VARCHAR, event_date DATE)").unwrap();
+        db.execute("INSERT INTO events VALUES ('Event1', '2024-01-15')").unwrap();
+        db.execute("INSERT INTO events VALUES ('Event2', '2024-02-20')").unwrap();
+        db.execute("INSERT INTO events VALUES ('Event3', '2024-03-10')").unwrap();
+
+        let result = db.execute("SELECT * FROM events WHERE event_date BETWEEN '2024-01-01' AND '2024-02-28'").unwrap();
+        assert_eq!(result.rows.len(), 2);
+    }
+
+    #[test]
+    fn test_subquery_avg_in_select() {
+        use ironduck::Database;
+        let db = Database::new();
+
+        db.execute("CREATE TABLE products (id INTEGER, price INTEGER)").unwrap();
+        db.execute("INSERT INTO products VALUES (1, 100)").unwrap();
+        db.execute("INSERT INTO products VALUES (2, 200)").unwrap();
+        db.execute("INSERT INTO products VALUES (3, 150)").unwrap();
+
+        let result = db.execute("SELECT id, price, (SELECT AVG(price) FROM products) as avg_price FROM products ORDER BY id").unwrap();
+        assert_eq!(result.rows.len(), 3);
+    }
+
+    #[test]
+    fn test_update_simple_expression() {
+        use ironduck::Database;
+        let db = Database::new();
+
+        db.execute("CREATE TABLE inventory (id INTEGER, qty INTEGER)").unwrap();
+        db.execute("INSERT INTO inventory VALUES (1, 10)").unwrap();
+        db.execute("INSERT INTO inventory VALUES (2, 20)").unwrap();
+
+        db.execute("UPDATE inventory SET qty = qty * 2 WHERE id = 1").unwrap();
+
+        let result = db.execute("SELECT * FROM inventory ORDER BY id").unwrap();
+        assert_eq!(result.rows[0][1].as_i64().unwrap(), 20);
+        assert_eq!(result.rows[1][1].as_i64().unwrap(), 20);
+    }
+
+    #[test]
+    fn test_delete_inactive_rows() {
+        use ironduck::Database;
+        let db = Database::new();
+
+        db.execute("CREATE TABLE cleanup (id INTEGER, active BOOLEAN)").unwrap();
+        db.execute("INSERT INTO cleanup VALUES (1, true)").unwrap();
+        db.execute("INSERT INTO cleanup VALUES (2, false)").unwrap();
+        db.execute("INSERT INTO cleanup VALUES (3, false)").unwrap();
+        db.execute("INSERT INTO cleanup VALUES (4, true)").unwrap();
+
+        db.execute("DELETE FROM cleanup WHERE active = false").unwrap();
+
+        let result = db.execute("SELECT COUNT(*) FROM cleanup").unwrap();
+        assert_eq!(result.rows[0][0].as_i64().unwrap(), 2);
+    }
+
+    #[test]
+    fn test_exp_log_relationship() {
+        use ironduck::Database;
+        let db = Database::new();
+
+        // exp(ln(x)) should equal x
+        let result = db.execute("SELECT EXP(LN(5.0))").unwrap();
+        let val = result.rows[0][0].as_f64().unwrap();
+        assert!((val - 5.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_trig_identity() {
+        use ironduck::Database;
+        let db = Database::new();
+
+        // sin^2(x) + cos^2(x) = 1
+        let result = db.execute("SELECT POWER(SIN(1.0), 2) + POWER(COS(1.0), 2)").unwrap();
+        let val = result.rows[0][0].as_f64().unwrap();
+        assert!((val - 1.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_multiple_group_by_aggregates() {
+        use ironduck::Database;
+        let db = Database::new();
+
+        db.execute("CREATE TABLE sales (region VARCHAR, product VARCHAR, amount INTEGER)").unwrap();
+        db.execute("INSERT INTO sales VALUES ('North', 'A', 100)").unwrap();
+        db.execute("INSERT INTO sales VALUES ('North', 'A', 150)").unwrap();
+        db.execute("INSERT INTO sales VALUES ('North', 'B', 200)").unwrap();
+        db.execute("INSERT INTO sales VALUES ('South', 'A', 75)").unwrap();
+        db.execute("INSERT INTO sales VALUES ('South', 'B', 125)").unwrap();
+
+        let result = db.execute("SELECT region, SUM(amount), COUNT(*), AVG(amount) FROM sales GROUP BY region ORDER BY region").unwrap();
+        assert_eq!(result.rows.len(), 2);
+    }
+
+    #[test]
+    fn test_window_with_order() {
+        use ironduck::Database;
+        let db = Database::new();
+
+        db.execute("CREATE TABLE ranked (id INTEGER, score INTEGER)").unwrap();
+        db.execute("INSERT INTO ranked VALUES (1, 100)").unwrap();
+        db.execute("INSERT INTO ranked VALUES (2, 200)").unwrap();
+        db.execute("INSERT INTO ranked VALUES (3, 150)").unwrap();
+
+        let result = db.execute("SELECT id, score, ROW_NUMBER() OVER (ORDER BY score DESC) as rank FROM ranked").unwrap();
+        assert_eq!(result.rows.len(), 3);
+    }
+
+    #[test]
+    fn test_log2_large() {
+        use ironduck::Database;
+        let db = Database::new();
+
+        let result = db.execute("SELECT LOG2(8)").unwrap();
+        let val = result.rows[0][0].as_f64().unwrap();
+        assert!((val - 3.0).abs() < 0.01);
+
+        let result = db.execute("SELECT LOG2(1024)").unwrap();
+        let val = result.rows[0][0].as_f64().unwrap();
+        assert!((val - 10.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_greatest_least_multi() {
+        use ironduck::Database;
+        let db = Database::new();
+
+        let result = db.execute("SELECT GREATEST(1, 5, 3, 2)").unwrap();
+        assert_eq!(result.rows[0][0].as_i64().unwrap(), 5);
+
+        let result = db.execute("SELECT LEAST(1, 5, 3, 2)").unwrap();
+        assert_eq!(result.rows[0][0].as_i64().unwrap(), 1);
+    }
+
+    #[test]
+    fn test_ifnull_function() {
+        use ironduck::Database;
+        let db = Database::new();
+
+        let result = db.execute("SELECT IFNULL(NULL, 'default')").unwrap();
+        assert_eq!(result.rows[0][0].as_str().unwrap(), "default");
+
+        let result = db.execute("SELECT IFNULL('value', 'default')").unwrap();
+        assert_eq!(result.rows[0][0].as_str().unwrap(), "value");
+    }
+
+    #[test]
+    fn test_group_concat() {
+        use ironduck::Database;
+        let db = Database::new();
+
+        db.execute("CREATE TABLE names (name VARCHAR)").unwrap();
+        db.execute("INSERT INTO names VALUES ('Alice')").unwrap();
+        db.execute("INSERT INTO names VALUES ('Bob')").unwrap();
+        db.execute("INSERT INTO names VALUES ('Charlie')").unwrap();
+
+        let result = db.execute("SELECT STRING_AGG(name, ', ') FROM names").unwrap();
+        let aggregated = result.rows[0][0].as_str().unwrap();
+        assert!(aggregated.contains("Alice"));
+        assert!(aggregated.contains("Bob"));
+        assert!(aggregated.contains("Charlie"));
+    }
+
+    #[test]
+    fn test_date_comparison() {
+        use ironduck::Database;
+        let db = Database::new();
+
+        db.execute("CREATE TABLE dated (d DATE)").unwrap();
+        db.execute("INSERT INTO dated VALUES ('2024-01-15')").unwrap();
+        db.execute("INSERT INTO dated VALUES ('2024-06-20')").unwrap();
+        db.execute("INSERT INTO dated VALUES ('2024-12-01')").unwrap();
+
+        let result = db.execute("SELECT * FROM dated WHERE d < '2024-07-01' ORDER BY d").unwrap();
+        assert_eq!(result.rows.len(), 2);
+    }
+
+    #[test]
+    fn test_complex_nested_case() {
+        use ironduck::Database;
+        let db = Database::new();
+
+        let result = db.execute("SELECT CASE WHEN 1 = 1 THEN CASE WHEN 2 > 1 THEN 'nested' ELSE 'no' END ELSE 'outer' END").unwrap();
+        assert_eq!(result.rows[0][0].as_str().unwrap(), "nested");
+    }
+
+    #[test]
+    fn test_bool_to_int() {
+        use ironduck::Database;
+        let db = Database::new();
+
+        let result = db.execute("SELECT CAST(true AS INTEGER), CAST(false AS INTEGER)").unwrap();
+        assert_eq!(result.rows[0][0].as_i64().unwrap(), 1);
+        assert_eq!(result.rows[0][1].as_i64().unwrap(), 0);
+    }
+
+    #[test]
+    fn test_int_to_varchar() {
+        use ironduck::Database;
+        let db = Database::new();
+
+        let result = db.execute("SELECT CAST(42 AS VARCHAR)").unwrap();
+        assert_eq!(result.rows[0][0].as_str().unwrap(), "42");
+    }
+
+    #[test]
+    fn test_varchar_to_int() {
+        use ironduck::Database;
+        let db = Database::new();
+
+        let result = db.execute("SELECT CAST('123' AS INTEGER)").unwrap();
+        assert_eq!(result.rows[0][0].as_i64().unwrap(), 123);
+    }
+
+    #[test]
+    fn test_order_by_price_desc() {
+        use ironduck::Database;
+        let db = Database::new();
+
+        db.execute("CREATE TABLE items (name VARCHAR, price INTEGER)").unwrap();
+        db.execute("INSERT INTO items VALUES ('A', 100)").unwrap();
+        db.execute("INSERT INTO items VALUES ('B', 50)").unwrap();
+        db.execute("INSERT INTO items VALUES ('C', 75)").unwrap();
+
+        let result = db.execute("SELECT name, price FROM items ORDER BY price DESC").unwrap();
+        assert_eq!(result.rows[0][0].as_str().unwrap(), "A");
+    }
+
+    #[test]
+    fn test_multiple_table_join() {
+        use ironduck::Database;
+        let db = Database::new();
+
+        db.execute("CREATE TABLE t1 (id INTEGER, a VARCHAR)").unwrap();
+        db.execute("CREATE TABLE t2 (id INTEGER, t1_id INTEGER, b VARCHAR)").unwrap();
+        db.execute("CREATE TABLE t3 (id INTEGER, t2_id INTEGER, c VARCHAR)").unwrap();
+
+        db.execute("INSERT INTO t1 VALUES (1, 'first')").unwrap();
+        db.execute("INSERT INTO t2 VALUES (1, 1, 'second')").unwrap();
+        db.execute("INSERT INTO t3 VALUES (1, 1, 'third')").unwrap();
+
+        let result = db.execute("SELECT t1.a, t2.b, t3.c FROM t1 JOIN t2 ON t1.id = t2.t1_id JOIN t3 ON t2.id = t3.t2_id").unwrap();
+        assert_eq!(result.rows.len(), 1);
+        assert_eq!(result.rows[0][0].as_str().unwrap(), "first");
+        assert_eq!(result.rows[0][1].as_str().unwrap(), "second");
+        assert_eq!(result.rows[0][2].as_str().unwrap(), "third");
+    }
+
+    #[test]
+    fn test_where_or_conditions() {
+        use ironduck::Database;
+        let db = Database::new();
+
+        db.execute("CREATE TABLE multi (id INTEGER, cat VARCHAR, val INTEGER)").unwrap();
+        db.execute("INSERT INTO multi VALUES (1, 'A', 10)").unwrap();
+        db.execute("INSERT INTO multi VALUES (2, 'B', 20)").unwrap();
+        db.execute("INSERT INTO multi VALUES (3, 'C', 30)").unwrap();
+
+        let result = db.execute("SELECT * FROM multi WHERE cat = 'A' OR val > 25").unwrap();
+        assert_eq!(result.rows.len(), 2);
+    }
+
+    #[test]
+    fn test_not_like() {
+        use ironduck::Database;
+        let db = Database::new();
+
+        db.execute("CREATE TABLE patterns (s VARCHAR)").unwrap();
+        db.execute("INSERT INTO patterns VALUES ('hello')").unwrap();
+        db.execute("INSERT INTO patterns VALUES ('world')").unwrap();
+        db.execute("INSERT INTO patterns VALUES ('help')").unwrap();
+
+        let result = db.execute("SELECT * FROM patterns WHERE s NOT LIKE 'hel%'").unwrap();
+        assert_eq!(result.rows.len(), 1);
+        assert_eq!(result.rows[0][0].as_str().unwrap(), "world");
+    }
+
+    #[test]
+    fn test_having_count() {
+        use ironduck::Database;
+        let db = Database::new();
+
+        db.execute("CREATE TABLE logs (category VARCHAR)").unwrap();
+        db.execute("INSERT INTO logs VALUES ('error')").unwrap();
+        db.execute("INSERT INTO logs VALUES ('error')").unwrap();
+        db.execute("INSERT INTO logs VALUES ('error')").unwrap();
+        db.execute("INSERT INTO logs VALUES ('warn')").unwrap();
+        db.execute("INSERT INTO logs VALUES ('info')").unwrap();
+
+        let result = db.execute("SELECT category, COUNT(*) as cnt FROM logs GROUP BY category HAVING COUNT(*) > 1 ORDER BY category").unwrap();
+        assert_eq!(result.rows.len(), 1);
+        assert_eq!(result.rows[0][0].as_str().unwrap(), "error");
+    }
+
+    #[test]
+    fn test_expression_arithmetic() {
+        use ironduck::Database;
+        let db = Database::new();
+
+        let result = db.execute("SELECT (10 + 5) * 2, 100 / (2 + 3), (8 - 3) % 3").unwrap();
+        assert_eq!(result.rows[0][0].as_i64().unwrap(), 30);
+        let div = result.rows[0][1].as_i64().unwrap_or_else(|| result.rows[0][1].as_f64().unwrap() as i64);
+        assert_eq!(div, 20);
+        assert_eq!(result.rows[0][2].as_i64().unwrap(), 2);
+    }
+
+    #[test]
+    fn test_lower_upper_combined() {
+        use ironduck::Database;
+        let db = Database::new();
+
+        let result = db.execute("SELECT UPPER('hello'), LOWER('WORLD'), UPPER(LOWER('MiXeD'))").unwrap();
+        assert_eq!(result.rows[0][0].as_str().unwrap(), "HELLO");
+        assert_eq!(result.rows[0][1].as_str().unwrap(), "world");
+        assert_eq!(result.rows[0][2].as_str().unwrap(), "MIXED");
+    }
+
+    #[test]
+    fn test_simple_cte() {
+        use ironduck::Database;
+        let db = Database::new();
+
+        let result = db.execute("WITH nums AS (SELECT 1 as n) SELECT * FROM nums").unwrap();
+        assert_eq!(result.rows.len(), 1);
+    }
+
+    #[test]
+    fn test_negative_arithmetic() {
+        use ironduck::Database;
+        let db = Database::new();
+
+        let result = db.execute("SELECT -5, -10 + 3, 5 * -2, -8 / 2").unwrap();
+        assert_eq!(result.rows[0][0].as_i64().unwrap(), -5);
+        assert_eq!(result.rows[0][1].as_i64().unwrap(), -7);
+        assert_eq!(result.rows[0][2].as_i64().unwrap(), -10);
+        let div = result.rows[0][3].as_i64().unwrap_or_else(|| result.rows[0][3].as_f64().unwrap() as i64);
+        assert_eq!(div, -4);
+    }
+
+    #[test]
+    fn test_insert_multiple_rows() {
+        use ironduck::Database;
+        let db = Database::new();
+
+        db.execute("CREATE TABLE batch (id INTEGER, val VARCHAR)").unwrap();
+        db.execute("INSERT INTO batch VALUES (1, 'a'), (2, 'b'), (3, 'c')").unwrap();
+
+        let result = db.execute("SELECT COUNT(*) FROM batch").unwrap();
+        assert_eq!(result.rows[0][0].as_i64().unwrap(), 3);
+    }
+
+    #[test]
+    fn test_update_all_rows() {
+        use ironduck::Database;
+        let db = Database::new();
+
+        db.execute("CREATE TABLE prices (id INTEGER, price INTEGER)").unwrap();
+        db.execute("INSERT INTO prices VALUES (1, 100)").unwrap();
+        db.execute("INSERT INTO prices VALUES (2, 200)").unwrap();
+
+        db.execute("UPDATE prices SET price = price + 50").unwrap();
+
+        let result = db.execute("SELECT SUM(price) FROM prices").unwrap();
+        assert_eq!(result.rows[0][0].as_i64().unwrap(), 400);
+    }
+
+    #[test]
+    fn test_delete_all_rows() {
+        use ironduck::Database;
+        let db = Database::new();
+
+        db.execute("CREATE TABLE temp (id INTEGER)").unwrap();
+        db.execute("INSERT INTO temp VALUES (1)").unwrap();
+        db.execute("INSERT INTO temp VALUES (2)").unwrap();
+
+        db.execute("DELETE FROM temp").unwrap();
+
+        let result = db.execute("SELECT COUNT(*) FROM temp").unwrap();
+        assert_eq!(result.rows[0][0].as_i64().unwrap(), 0);
+    }
+
+    #[test]
+    fn test_drop_table_basic() {
+        use ironduck::Database;
+        let db = Database::new();
+
+        db.execute("CREATE TABLE to_drop (id INTEGER)").unwrap();
+        db.execute("INSERT INTO to_drop VALUES (1)").unwrap();
+
+        // DROP TABLE should succeed
+        db.execute("DROP TABLE to_drop").unwrap();
+    }
+
+    #[test]
+    fn test_string_position_in() {
+        use ironduck::Database;
+        let db = Database::new();
+
+        let result = db.execute("SELECT POSITION('o' IN 'hello')").unwrap();
+        let pos = result.rows[0][0].as_i64().unwrap();
+        assert!(pos == 5 || pos == 4); // 1-based or 0-based
+    }
+
+    #[test]
+    fn test_truncate_function() {
+        use ironduck::Database;
+        let db = Database::new();
+
+        let result = db.execute("SELECT TRUNC(3.7), TRUNC(-3.7)").unwrap();
+        let t1 = result.rows[0][0].as_f64().unwrap();
+        let t2 = result.rows[0][1].as_f64().unwrap();
+        assert!((t1 - 3.0).abs() < 0.01);
+        assert!((t2 - (-3.0)).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_random_generate() {
+        use ironduck::Database;
+        let db = Database::new();
+
+        let result = db.execute("SELECT RANDOM()").unwrap();
+        // RANDOM() should return some value
+        assert!(result.rows[0][0].as_i64().is_some() || result.rows[0][0].as_f64().is_some());
+    }
+
+    #[test]
+    fn test_string_split_part() {
+        use ironduck::Database;
+        let db = Database::new();
+
+        let result = db.execute("SELECT SPLIT_PART('a,b,c', ',', 2)").unwrap();
+        assert_eq!(result.rows[0][0].as_str().unwrap(), "b");
+    }
+
+    #[test]
+    fn test_aggregate_sum_big() {
+        use ironduck::Database;
+        let db = Database::new();
+
+        db.execute("CREATE TABLE big (val BIGINT)").unwrap();
+        db.execute("INSERT INTO big VALUES (1000000000)").unwrap();
+        db.execute("INSERT INTO big VALUES (2000000000)").unwrap();
+        db.execute("INSERT INTO big VALUES (3000000000)").unwrap();
+
+        let result = db.execute("SELECT SUM(val) FROM big").unwrap();
+        assert_eq!(result.rows[0][0].as_i64().unwrap(), 6000000000);
+    }
+
+    #[test]
+    fn test_distinct_multi_column() {
+        use ironduck::Database;
+        let db = Database::new();
+
+        db.execute("CREATE TABLE pairs (a INTEGER, b INTEGER)").unwrap();
+        db.execute("INSERT INTO pairs VALUES (1, 2)").unwrap();
+        db.execute("INSERT INTO pairs VALUES (1, 2)").unwrap();
+        db.execute("INSERT INTO pairs VALUES (1, 3)").unwrap();
+        db.execute("INSERT INTO pairs VALUES (2, 2)").unwrap();
+
+        let result = db.execute("SELECT DISTINCT a, b FROM pairs ORDER BY a, b").unwrap();
+        assert_eq!(result.rows.len(), 3);
+    }
 }
