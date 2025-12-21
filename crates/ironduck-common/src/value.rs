@@ -258,10 +258,10 @@ impl Eq for Value {}
 impl PartialOrd for Value {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         match (self, other) {
-            // NULL comparisons
+            // NULL comparisons - NULLS LAST for ascending order (DuckDB standard)
             (Value::Null, Value::Null) => Some(Ordering::Equal),
-            (Value::Null, _) => Some(Ordering::Less),
-            (_, Value::Null) => Some(Ordering::Greater),
+            (Value::Null, _) => Some(Ordering::Greater),  // NULL sorts after non-null values
+            (_, Value::Null) => Some(Ordering::Less),     // Non-null sorts before NULL
 
             // Same-type comparisons
             (Value::Boolean(a), Value::Boolean(b)) => a.partial_cmp(b),
@@ -309,7 +309,8 @@ impl fmt::Display for Value {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Value::Null => write!(f, "NULL"),
-            Value::Boolean(b) => write!(f, "{}", b),
+            // Display booleans as 1/0 for SQL compatibility
+            Value::Boolean(b) => write!(f, "{}", if *b { 1 } else { 0 }),
             Value::TinyInt(i) => write!(f, "{}", i),
             Value::SmallInt(i) => write!(f, "{}", i),
             Value::Integer(i) => write!(f, "{}", i),
@@ -433,7 +434,9 @@ mod tests {
     fn test_value_display() {
         assert_eq!(Value::Integer(42).to_string(), "42");
         assert_eq!(Value::Varchar("hello".to_string()).to_string(), "hello");
-        assert_eq!(Value::Boolean(true).to_string(), "true");
+        // Booleans display as 1/0 for SQL compatibility
+        assert_eq!(Value::Boolean(true).to_string(), "1");
+        assert_eq!(Value::Boolean(false).to_string(), "0");
     }
 
     #[test]

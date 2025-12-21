@@ -66,6 +66,11 @@ pub fn bind_statement(binder: &Binder, stmt: &sql::Statement) -> Result<BoundSta
             Ok(BoundStatement::Update(bound))
         }
 
+        sql::Statement::Explain { statement, .. } => {
+            let inner = bind_statement(binder, statement)?;
+            Ok(BoundStatement::Explain(Box::new(inner)))
+        }
+
         _ => Err(Error::NotImplemented(format!("Statement: {:?}", stmt))),
     }
 }

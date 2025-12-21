@@ -148,6 +148,31 @@ fn evaluate_binary_op(
                 let pattern = value_to_string(&r);
                 Value::Boolean(like_match(&text, &pattern, true))
             }
+            BitwiseAnd => {
+                let l = l.as_i64().unwrap_or(0);
+                let r = r.as_i64().unwrap_or(0);
+                Value::BigInt(l & r)
+            }
+            BitwiseOr => {
+                let l = l.as_i64().unwrap_or(0);
+                let r = r.as_i64().unwrap_or(0);
+                Value::BigInt(l | r)
+            }
+            BitwiseXor => {
+                let l = l.as_i64().unwrap_or(0);
+                let r = r.as_i64().unwrap_or(0);
+                Value::BigInt(l ^ r)
+            }
+            ShiftLeft => {
+                let l = l.as_i64().unwrap_or(0);
+                let r = r.as_i64().unwrap_or(0);
+                Value::BigInt(l << r)
+            }
+            ShiftRight => {
+                let l = l.as_i64().unwrap_or(0);
+                let r = r.as_i64().unwrap_or(0);
+                Value::BigInt(l >> r)
+            }
         };
         values.push(result);
     }
@@ -178,6 +203,11 @@ fn evaluate_unary_op(
             },
             Not => match v {
                 Value::Boolean(b) => Value::Boolean(!b),
+                _ => Value::Null,
+            },
+            BitwiseNot => match v {
+                Value::Integer(i) => Value::Integer(!i),
+                Value::BigInt(i) => Value::BigInt(!i),
                 _ => Value::Null,
             },
         };

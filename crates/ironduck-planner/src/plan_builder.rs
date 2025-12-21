@@ -99,6 +99,15 @@ pub fn build_plan(statement: &BoundStatement) -> Result<LogicalPlan> {
             ))
         }
         BoundStatement::SetOperation(set_op) => build_set_operation_plan(set_op),
+        BoundStatement::Explain(inner) => {
+            let inner_plan = build_plan(inner)?;
+            Ok(LogicalPlan::new(
+                LogicalOperator::Explain {
+                    input: Box::new(inner_plan.root),
+                },
+                vec!["plan".to_string()],
+            ))
+        }
     }
 }
 
@@ -310,6 +319,25 @@ fn build_select_plan(select: &BoundSelect) -> Result<LogicalPlan> {
                 output_types,
             };
         } else {
+            // For non-aggregate, non-window case: apply Sort BEFORE Project
+            // This ensures ORDER BY references original columns, not projected values
+            if !select.order_by.is_empty() {
+                let order_by: Vec<_> = select
+                    .order_by
+                    .iter()
+                    .map(|o| super::OrderByExpression {
+                        expr: convert_expression(&o.expr),
+                        ascending: o.ascending,
+                        nulls_first: o.nulls_first,
+                    })
+                    .collect();
+
+                plan = LogicalOperator::Sort {
+                    input: Box::new(plan),
+                    order_by,
+                };
+            }
+
             // Add projection (non-aggregate, non-window case)
             let expressions: Vec<_> = select.select_list.iter().map(convert_expression).collect();
             let output_types: Vec<_> = select.select_list.iter().map(|e| e.return_type.clone()).collect();
@@ -323,22 +351,34 @@ fn build_select_plan(select: &BoundSelect) -> Result<LogicalPlan> {
         }
     }
 
-    // Add ORDER BY
-    if !select.order_by.is_empty() {
-        let order_by: Vec<_> = select
-            .order_by
-            .iter()
-            .map(|o| super::OrderByExpression {
-                expr: convert_expression(&o.expr),
-                ascending: o.ascending,
-                nulls_first: o.nulls_first,
-            })
-            .collect();
+    // Add ORDER BY (for aggregate/window cases - Sort is already added above for non-aggregate)
+    if has_aggregates || select.select_list.iter().any(has_window_function) {
+        if !select.order_by.is_empty() {
+            let order_by: Vec<_> = select
+                .order_by
+                .iter()
+                .map(|o| {
+                    // For aggregate/window queries, we need to remap ORDER BY expressions
+                    // to reference the correct column in the projected output
+                    let order_expr = convert_expression(&o.expr);
 
-        plan = LogicalOperator::Sort {
-            input: Box::new(plan),
-            order_by,
-        };
+                    // Try to find matching column in select list
+                    let remapped_expr = find_matching_output_column(&order_expr, &select.select_list, &output_names)
+                        .unwrap_or(order_expr);
+
+                    super::OrderByExpression {
+                        expr: remapped_expr,
+                        ascending: o.ascending,
+                        nulls_first: o.nulls_first,
+                    }
+                })
+                .collect();
+
+            plan = LogicalOperator::Sort {
+                input: Box::new(plan),
+                order_by,
+            };
+        }
     }
 
     // Add LIMIT/OFFSET
@@ -712,6 +752,23 @@ fn extract_aggregate(expr: &BoundExpression) -> Option<super::AggregateExpressio
                 "LAST" => super::AggregateFunction::Last,
                 "STRING_AGG" | "GROUP_CONCAT" | "LISTAGG" => super::AggregateFunction::StringAgg,
                 "ARRAY_AGG" => super::AggregateFunction::ArrayAgg,
+                "STDDEV" | "STDDEV_SAMP" => super::AggregateFunction::StdDev,
+                "STDDEV_POP" => super::AggregateFunction::StdDevPop,
+                "VARIANCE" | "VAR_SAMP" => super::AggregateFunction::Variance,
+                "VAR_POP" => super::AggregateFunction::VariancePop,
+                "BOOL_AND" | "EVERY" => super::AggregateFunction::BoolAnd,
+                "BOOL_OR" | "ANY" => super::AggregateFunction::BoolOr,
+                "BIT_AND" => super::AggregateFunction::BitAnd,
+                "BIT_OR" => super::AggregateFunction::BitOr,
+                "BIT_XOR" => super::AggregateFunction::BitXor,
+                "PRODUCT" => super::AggregateFunction::Product,
+                "MEDIAN" => super::AggregateFunction::Median,
+                "PERCENTILE_CONT" | "PERCENTILE" => super::AggregateFunction::PercentileCont,
+                "PERCENTILE_DISC" => super::AggregateFunction::PercentileDisc,
+                "MODE" => super::AggregateFunction::Mode,
+                "COVAR_POP" => super::AggregateFunction::CovarPop,
+                "COVAR_SAMP" => super::AggregateFunction::CovarSamp,
+                "CORR" => super::AggregateFunction::Corr,
                 _ => return None,
             };
 
@@ -949,4 +1006,59 @@ fn convert_having_expression(
     }
 
     convert_inner(expr, group_by, num_group_by, select_list, &mut having_agg_idx)
+}
+
+/// Find a matching output column for an ORDER BY expression
+/// Returns a ColumnRef pointing to the correct output column index if found
+fn find_matching_output_column(
+    order_expr: &super::Expression,
+    select_list: &[BoundExpression],
+    output_names: &[String],
+) -> Option<super::Expression> {
+    // Extract the column name from the ORDER BY expression if it's a column reference
+    let order_col_name = match order_expr {
+        super::Expression::ColumnRef { name, .. } => Some(name.as_str()),
+        _ => None,
+    };
+
+    // Try to find a matching column in the select list by comparing converted expressions
+    for (idx, bound_expr) in select_list.iter().enumerate() {
+        let select_expr = convert_expression(bound_expr);
+
+        // Check if expressions are equal
+        if expressions_equal(order_expr, &select_expr) {
+            return Some(super::Expression::ColumnRef {
+                table_index: 0,
+                column_index: idx,
+                name: output_names.get(idx).cloned().unwrap_or_default(),
+            });
+        }
+
+        // Also check by name for column references
+        if let Some(order_name) = order_col_name {
+            // Check if this select list item has the same name
+            if let super::Expression::ColumnRef { name: select_name, .. } = &select_expr {
+                if order_name.eq_ignore_ascii_case(select_name) {
+                    return Some(super::Expression::ColumnRef {
+                        table_index: 0,
+                        column_index: idx,
+                        name: output_names.get(idx).cloned().unwrap_or_default(),
+                    });
+                }
+            }
+
+            // Check if output name matches
+            if let Some(out_name) = output_names.get(idx) {
+                if order_name.eq_ignore_ascii_case(out_name) {
+                    return Some(super::Expression::ColumnRef {
+                        table_index: 0,
+                        column_index: idx,
+                        name: out_name.clone(),
+                    });
+                }
+            }
+        }
+    }
+
+    None
 }

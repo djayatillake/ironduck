@@ -14,6 +14,7 @@ pub enum BoundStatement {
     CreateTable(BoundCreateTable),
     CreateSchema(BoundCreateSchema),
     Drop(BoundDrop),
+    Explain(Box<BoundStatement>),
 }
 
 /// Bound set operation (UNION, INTERSECT, EXCEPT)

@@ -647,10 +647,35 @@ fn bind_function(
             let arg_type = args.first().map(|a| a.return_type.clone()).unwrap_or(LogicalType::Null);
             (true, LogicalType::List(Box::new(arg_type)))
         }
+        // Statistical aggregates
+        "STDDEV" | "STDDEV_SAMP" | "STDDEV_POP" => (true, LogicalType::Double),
+        "VARIANCE" | "VAR_SAMP" | "VAR_POP" => (true, LogicalType::Double),
+        // Boolean aggregates
+        "BOOL_AND" | "EVERY" => (true, LogicalType::Boolean),
+        "BOOL_OR" | "ANY" => (true, LogicalType::Boolean),
+        // Bitwise aggregates
+        "BIT_AND" | "BIT_OR" | "BIT_XOR" => (true, LogicalType::BigInt),
+        // Product aggregate
+        "PRODUCT" => (true, LogicalType::Double),
+        // Percentile/median aggregates
+        "MEDIAN" => (true, LogicalType::Double),
+        "PERCENTILE_CONT" | "PERCENTILE" => (true, LogicalType::Double),
+        "PERCENTILE_DISC" => {
+            let arg_type = args.first().map(|a| a.return_type.clone()).unwrap_or(LogicalType::Double);
+            (true, arg_type)
+        }
+        "MODE" => {
+            let arg_type = args.first().map(|a| a.return_type.clone()).unwrap_or(LogicalType::Unknown);
+            (true, arg_type)
+        }
+        // Covariance and correlation
+        "COVAR_POP" | "COVAR_SAMP" | "CORR" => (true, LogicalType::Double),
 
         // Scalar functions
         "LOWER" | "UPPER" | "TRIM" | "LTRIM" | "RTRIM" => (false, LogicalType::Varchar),
         "LENGTH" | "CHAR_LENGTH" => (false, LogicalType::BigInt),
+        "ASCII" => (false, LogicalType::Integer),
+        "CHAR" | "CHR" => (false, LogicalType::Varchar),
         "ABS" => {
             let arg_type = args.first().map(|a| a.return_type.clone()).unwrap_or(LogicalType::Double);
             (false, arg_type)
@@ -673,6 +698,7 @@ fn bind_function(
         }
         "NOW" | "CURRENT_TIMESTAMP" => (false, LogicalType::Timestamp),
         "CURRENT_DATE" => (false, LogicalType::Date),
+        "GCD" | "LCM" | "FACTORIAL" => (false, LogicalType::BigInt),
 
         _ => {
             // Unknown function - assume scalar returning null for now

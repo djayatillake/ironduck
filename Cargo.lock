@@ -1147,8 +1147,10 @@ dependencies = [
  "ironduck-storage",
  "rand",
  "regex",
+ "serde_json",
  "thiserror",
  "tokio",
+ "uuid",
 ]
 
 [[package]]

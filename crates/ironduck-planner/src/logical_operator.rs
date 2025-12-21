@@ -144,6 +144,11 @@ pub enum LogicalOperator {
         /// Types for output
         output_types: Vec<LogicalType>,
     },
+
+    /// EXPLAIN - returns the query plan as text
+    Explain {
+        input: Box<LogicalOperator>,
+    },
 }
 
 /// Type of set operation
@@ -195,6 +200,7 @@ impl LogicalOperator {
             LogicalOperator::Drop { .. } => vec![LogicalType::Varchar],
             LogicalOperator::SetOperation { left, .. } => left.output_types(),
             LogicalOperator::Window { output_types, .. } => output_types.clone(),
+            LogicalOperator::Explain { .. } => vec![LogicalType::Varchar],
         }
     }
 }
@@ -299,12 +305,20 @@ pub enum BinaryOperator {
     Concat,
     Like,
     ILike,
+
+    // Bitwise
+    BitwiseAnd,
+    BitwiseOr,
+    BitwiseXor,
+    ShiftLeft,
+    ShiftRight,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UnaryOperator {
     Negate,
     Not,
+    BitwiseNot,
 }
 
 #[derive(Debug, Clone)]
@@ -325,6 +339,15 @@ impl AggregateExpression {
             AggregateFunction::First | AggregateFunction::Last => LogicalType::Unknown,
             AggregateFunction::StringAgg => LogicalType::Varchar,
             AggregateFunction::ArrayAgg => LogicalType::Unknown,
+            AggregateFunction::StdDev | AggregateFunction::StdDevPop => LogicalType::Double,
+            AggregateFunction::Variance | AggregateFunction::VariancePop => LogicalType::Double,
+            AggregateFunction::BoolAnd | AggregateFunction::BoolOr => LogicalType::Boolean,
+            AggregateFunction::BitAnd | AggregateFunction::BitOr | AggregateFunction::BitXor => LogicalType::BigInt,
+            AggregateFunction::Product => LogicalType::Double,
+            AggregateFunction::Median | AggregateFunction::PercentileCont => LogicalType::Double,
+            AggregateFunction::PercentileDisc => LogicalType::Unknown, // Same as input
+            AggregateFunction::Mode => LogicalType::Unknown, // Same as input
+            AggregateFunction::CovarPop | AggregateFunction::CovarSamp | AggregateFunction::Corr => LogicalType::Double,
         }
     }
 }
@@ -340,6 +363,23 @@ pub enum AggregateFunction {
     Last,
     StringAgg,
     ArrayAgg,
+    StdDev,      // Sample standard deviation
+    StdDevPop,   // Population standard deviation
+    Variance,    // Sample variance
+    VariancePop, // Population variance
+    BoolAnd,     // Logical AND of all values
+    BoolOr,      // Logical OR of all values
+    BitAnd,        // Bitwise AND of all values
+    BitOr,         // Bitwise OR of all values
+    BitXor,        // Bitwise XOR of all values
+    Product,       // Product of all values
+    Median,        // Median (50th percentile)
+    PercentileCont, // Continuous percentile
+    PercentileDisc, // Discrete percentile
+    Mode,          // Most frequent value
+    CovarPop,      // Population covariance
+    CovarSamp,     // Sample covariance
+    Corr,          // Correlation coefficient
 }
 
 #[derive(Debug, Clone)]

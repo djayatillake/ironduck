@@ -790,6 +790,51 @@ impl Executor {
                                     window_results[win_idx][*orig_idx] = Value::BigInt(rank);
                                 }
                             }
+                            WindowFunction::PercentRank => {
+                                // PERCENT_RANK = (rank - 1) / (partition_size - 1)
+                                let n = partition.len() as f64;
+                                if n <= 1.0 {
+                                    for (orig_idx, _) in &partition {
+                                        window_results[win_idx][*orig_idx] = Value::Double(0.0);
+                                    }
+                                } else {
+                                    let mut rank = 1i64;
+                                    for (idx, (orig_idx, row)) in partition.iter().enumerate() {
+                                        if idx > 0 && !win_expr.order_by.is_empty() {
+                                            let prev_row = &partition[idx - 1].1;
+                                            let same = win_expr.order_by.iter().all(|ob| {
+                                                evaluate(&ob.expr, row).unwrap_or(Value::Null)
+                                                    == evaluate(&ob.expr, prev_row).unwrap_or(Value::Null)
+                                            });
+                                            if !same {
+                                                rank = (idx + 1) as i64;
+                                            }
+                                        }
+                                        let pct = (rank - 1) as f64 / (n - 1.0);
+                                        window_results[win_idx][*orig_idx] = Value::Double(pct);
+                                    }
+                                }
+                            }
+                            WindowFunction::CumeDist => {
+                                // CUME_DIST = rows_up_to_and_including / partition_size
+                                let n = partition.len() as f64;
+                                for (idx, (orig_idx, row)) in partition.iter().enumerate() {
+                                    // Count rows with same or smaller order values
+                                    let mut count = 0;
+                                    for (_, other_row) in &partition {
+                                        let le = win_expr.order_by.iter().all(|ob| {
+                                            let curr = evaluate(&ob.expr, row).unwrap_or(Value::Null);
+                                            let other = evaluate(&ob.expr, other_row).unwrap_or(Value::Null);
+                                            other <= curr
+                                        });
+                                        if le || win_expr.order_by.is_empty() {
+                                            count += 1;
+                                        }
+                                    }
+                                    let cume = count as f64 / n;
+                                    window_results[win_idx][*orig_idx] = Value::Double(cume);
+                                }
+                            }
                             WindowFunction::Lag => {
                                 // LAG(expr, offset, default) - get value from previous row
                                 let offset = if win_expr.args.len() > 1 {
@@ -872,6 +917,48 @@ impl Executor {
                                     window_results[win_idx][*orig_idx] = val;
                                 }
                             }
+                            WindowFunction::NthValue => {
+                                // NTH_VALUE(expr, n) - get nth value in partition
+                                let n = win_expr.args.get(1)
+                                    .and_then(|e| evaluate(e, &partition[0].1).ok())
+                                    .and_then(|v| v.as_i64())
+                                    .unwrap_or(1) as usize;
+                                let nth_val = if n > 0 && n <= partition.len() {
+                                    if let Some(arg) = win_expr.args.first() {
+                                        evaluate(arg, &partition[n - 1].1).unwrap_or(Value::Null)
+                                    } else {
+                                        Value::Null
+                                    }
+                                } else {
+                                    Value::Null
+                                };
+                                for (orig_idx, _) in &partition {
+                                    window_results[win_idx][*orig_idx] = nth_val.clone();
+                                }
+                            }
+                            WindowFunction::Ntile => {
+                                // NTILE(n) - divide partition into n buckets
+                                let n = win_expr.args.first()
+                                    .and_then(|e| evaluate(e, &partition[0].1).ok())
+                                    .and_then(|v| v.as_i64())
+                                    .unwrap_or(1) as usize;
+                                let n = n.max(1);
+                                let rows_per_bucket = partition.len() / n;
+                                let extra_rows = partition.len() % n;
+                                let mut bucket = 1;
+                                let mut count = 0;
+                                let bucket_size = if extra_rows > 0 { rows_per_bucket + 1 } else { rows_per_bucket };
+                                let mut current_bucket_size = bucket_size;
+                                for (orig_idx, _) in &partition {
+                                    window_results[win_idx][*orig_idx] = Value::BigInt(bucket as i64);
+                                    count += 1;
+                                    if count >= current_bucket_size && bucket < n {
+                                        bucket += 1;
+                                        count = 0;
+                                        current_bucket_size = if bucket <= extra_rows { rows_per_bucket + 1 } else { rows_per_bucket };
+                                    }
+                                }
+                            }
                             _ => {
                                 // For unsupported window functions, return NULL
                                 for (orig_idx, _) in &partition {
@@ -894,6 +981,116 @@ impl Executor {
 
                 Ok(output_rows)
             }
+
+            LogicalOperator::Explain { input } => {
+                // Format the query plan as a string
+                let plan_str = format_plan(input, 0);
+                Ok(vec![vec![Value::Varchar(plan_str)]])
+            }
+        }
+    }
+}
+
+/// Format a logical operator as a string for EXPLAIN output
+fn format_plan(op: &LogicalOperator, indent: usize) -> String {
+    let prefix = "  ".repeat(indent);
+    match op {
+        LogicalOperator::Scan { schema, table, .. } => {
+            format!("{}Scan: {}.{}", prefix, schema, table)
+        }
+        LogicalOperator::DummyScan => {
+            format!("{}DummyScan", prefix)
+        }
+        LogicalOperator::Filter { input, .. } => {
+            format!("{}Filter\n{}", prefix, format_plan(input, indent + 1))
+        }
+        LogicalOperator::Project { input, output_names, .. } => {
+            format!(
+                "{}Project: [{}]\n{}",
+                prefix,
+                output_names.join(", "),
+                format_plan(input, indent + 1)
+            )
+        }
+        LogicalOperator::Aggregate { input, group_by, aggregates, .. } => {
+            format!(
+                "{}Aggregate (groups: {}, aggs: {})\n{}",
+                prefix,
+                group_by.len(),
+                aggregates.len(),
+                format_plan(input, indent + 1)
+            )
+        }
+        LogicalOperator::Join { left, right, join_type, .. } => {
+            format!(
+                "{}{:?}Join\n{}\n{}",
+                prefix,
+                join_type,
+                format_plan(left, indent + 1),
+                format_plan(right, indent + 1)
+            )
+        }
+        LogicalOperator::Sort { input, order_by, .. } => {
+            format!(
+                "{}Sort ({} columns)\n{}",
+                prefix,
+                order_by.len(),
+                format_plan(input, indent + 1)
+            )
+        }
+        LogicalOperator::Limit { input, limit, offset } => {
+            format!(
+                "{}Limit (limit: {:?}, offset: {:?})\n{}",
+                prefix,
+                limit,
+                offset,
+                format_plan(input, indent + 1)
+            )
+        }
+        LogicalOperator::Distinct { input, .. } => {
+            format!("{}Distinct\n{}", prefix, format_plan(input, indent + 1))
+        }
+        LogicalOperator::Values { values, .. } => {
+            format!("{}Values ({} rows)", prefix, values.len())
+        }
+        LogicalOperator::CreateTable { name, .. } => {
+            format!("{}CreateTable: {}", prefix, name)
+        }
+        LogicalOperator::CreateSchema { name, .. } => {
+            format!("{}CreateSchema: {}", prefix, name)
+        }
+        LogicalOperator::Insert { table, .. } => {
+            format!("{}Insert: {}", prefix, table)
+        }
+        LogicalOperator::Delete { table, .. } => {
+            format!("{}Delete: {}", prefix, table)
+        }
+        LogicalOperator::Update { table, .. } => {
+            format!("{}Update: {}", prefix, table)
+        }
+        LogicalOperator::Drop { name, .. } => {
+            format!("{}Drop: {}", prefix, name)
+        }
+        LogicalOperator::SetOperation { left, right, op, all } => {
+            format!(
+                "{}{:?}{}\n{}\n{}",
+                prefix,
+                op,
+                if *all { " ALL" } else { "" },
+                format_plan(left, indent + 1),
+                format_plan(right, indent + 1)
+            )
+        }
+        LogicalOperator::Window { input, window_exprs, .. } => {
+            format!(
+                "{}Window ({} expressions)\n{}",
+                prefix,
+                window_exprs.len(),
+                format_plan(input, indent + 1)
+            )
+        }
+        LogicalOperator::Explain { input } => {
+            format!("{}Explain\n{}", prefix, format_plan(input, indent + 1))
         }
     }
 }
@@ -1276,6 +1473,442 @@ fn compute_aggregate(
                 }
             }
             Ok(Value::List(values))
+        }
+
+        StdDev => {
+            // Sample standard deviation: sqrt(sum((x - mean)^2) / (n - 1))
+            let mut values: Vec<f64> = Vec::new();
+            for row in rows {
+                if args.is_empty() {
+                    continue;
+                }
+                let val = evaluate(&args[0], row)?;
+                if let Some(f) = val.as_f64() {
+                    values.push(f);
+                }
+            }
+            if values.len() < 2 {
+                return Ok(Value::Null);
+            }
+            let mean = values.iter().sum::<f64>() / values.len() as f64;
+            let variance: f64 = values.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / (values.len() - 1) as f64;
+            Ok(Value::Double(variance.sqrt()))
+        }
+
+        StdDevPop => {
+            // Population standard deviation: sqrt(sum((x - mean)^2) / n)
+            let mut values: Vec<f64> = Vec::new();
+            for row in rows {
+                if args.is_empty() {
+                    continue;
+                }
+                let val = evaluate(&args[0], row)?;
+                if let Some(f) = val.as_f64() {
+                    values.push(f);
+                }
+            }
+            if values.is_empty() {
+                return Ok(Value::Null);
+            }
+            let mean = values.iter().sum::<f64>() / values.len() as f64;
+            let variance: f64 = values.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / values.len() as f64;
+            Ok(Value::Double(variance.sqrt()))
+        }
+
+        Variance => {
+            // Sample variance: sum((x - mean)^2) / (n - 1)
+            let mut values: Vec<f64> = Vec::new();
+            for row in rows {
+                if args.is_empty() {
+                    continue;
+                }
+                let val = evaluate(&args[0], row)?;
+                if let Some(f) = val.as_f64() {
+                    values.push(f);
+                }
+            }
+            if values.len() < 2 {
+                return Ok(Value::Null);
+            }
+            let mean = values.iter().sum::<f64>() / values.len() as f64;
+            let variance: f64 = values.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / (values.len() - 1) as f64;
+            Ok(Value::Double(variance))
+        }
+
+        VariancePop => {
+            // Population variance: sum((x - mean)^2) / n
+            let mut values: Vec<f64> = Vec::new();
+            for row in rows {
+                if args.is_empty() {
+                    continue;
+                }
+                let val = evaluate(&args[0], row)?;
+                if let Some(f) = val.as_f64() {
+                    values.push(f);
+                }
+            }
+            if values.is_empty() {
+                return Ok(Value::Null);
+            }
+            let mean = values.iter().sum::<f64>() / values.len() as f64;
+            let variance: f64 = values.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / values.len() as f64;
+            Ok(Value::Double(variance))
+        }
+
+        BoolAnd => {
+            // Logical AND of all boolean values (returns false if any is false)
+            for row in rows {
+                if args.is_empty() {
+                    continue;
+                }
+                let val = evaluate(&args[0], row)?;
+                match val {
+                    Value::Boolean(false) => return Ok(Value::Boolean(false)),
+                    Value::Null => continue, // Skip NULLs
+                    _ => {}
+                }
+            }
+            Ok(Value::Boolean(true))
+        }
+
+        BoolOr => {
+            // Logical OR of all boolean values (returns true if any is true)
+            for row in rows {
+                if args.is_empty() {
+                    continue;
+                }
+                let val = evaluate(&args[0], row)?;
+                match val {
+                    Value::Boolean(true) => return Ok(Value::Boolean(true)),
+                    Value::Null => continue, // Skip NULLs
+                    _ => {}
+                }
+            }
+            Ok(Value::Boolean(false))
+        }
+
+        BitAnd => {
+            // Bitwise AND of all integer values
+            let mut result: Option<i64> = None;
+            for row in rows {
+                if args.is_empty() {
+                    continue;
+                }
+                let val = evaluate(&args[0], row)?;
+                if let Some(i) = val.as_i64() {
+                    result = Some(match result {
+                        None => i,
+                        Some(r) => r & i,
+                    });
+                }
+            }
+            Ok(result.map(Value::BigInt).unwrap_or(Value::Null))
+        }
+
+        BitOr => {
+            // Bitwise OR of all integer values
+            let mut result: i64 = 0;
+            let mut has_value = false;
+            for row in rows {
+                if args.is_empty() {
+                    continue;
+                }
+                let val = evaluate(&args[0], row)?;
+                if let Some(i) = val.as_i64() {
+                    result |= i;
+                    has_value = true;
+                }
+            }
+            if has_value {
+                Ok(Value::BigInt(result))
+            } else {
+                Ok(Value::Null)
+            }
+        }
+
+        BitXor => {
+            // Bitwise XOR of all integer values
+            let mut result: i64 = 0;
+            let mut has_value = false;
+            for row in rows {
+                if args.is_empty() {
+                    continue;
+                }
+                let val = evaluate(&args[0], row)?;
+                if let Some(i) = val.as_i64() {
+                    result ^= i;
+                    has_value = true;
+                }
+            }
+            if has_value {
+                Ok(Value::BigInt(result))
+            } else {
+                Ok(Value::Null)
+            }
+        }
+
+        Product => {
+            // Product of all numeric values
+            let mut result: f64 = 1.0;
+            let mut has_value = false;
+            for row in rows {
+                if args.is_empty() {
+                    continue;
+                }
+                let val = evaluate(&args[0], row)?;
+                if let Some(f) = val.as_f64() {
+                    result *= f;
+                    has_value = true;
+                }
+            }
+            if has_value {
+                Ok(Value::Double(result))
+            } else {
+                Ok(Value::Null)
+            }
+        }
+
+        Median => {
+            // Median = 50th percentile
+            let mut values: Vec<f64> = Vec::new();
+            for row in rows {
+                if args.is_empty() {
+                    continue;
+                }
+                let val = evaluate(&args[0], row)?;
+                if let Some(f) = val.as_f64() {
+                    values.push(f);
+                }
+            }
+            if values.is_empty() {
+                return Ok(Value::Null);
+            }
+            values.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            let n = values.len();
+            let median = if n % 2 == 0 {
+                // Average of two middle values
+                (values[n / 2 - 1] + values[n / 2]) / 2.0
+            } else {
+                values[n / 2]
+            };
+            Ok(Value::Double(median))
+        }
+
+        PercentileCont => {
+            // PERCENTILE_CONT(percentile, column) - continuous percentile with interpolation
+            // First arg is percentile (0.0-1.0), second arg is the column
+            if args.len() < 2 {
+                return Ok(Value::Null);
+            }
+            let percentile = evaluate(&args[0], &[])?.as_f64().unwrap_or(0.5);
+
+            let mut values: Vec<f64> = Vec::new();
+            for row in rows {
+                let val = evaluate(&args[1], row)?;
+                if let Some(f) = val.as_f64() {
+                    values.push(f);
+                }
+            }
+            if values.is_empty() {
+                return Ok(Value::Null);
+            }
+            values.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+
+            // Use linear interpolation
+            let n = values.len();
+            if n == 1 {
+                return Ok(Value::Double(values[0]));
+            }
+
+            let idx = percentile * (n - 1) as f64;
+            let lower_idx = idx.floor() as usize;
+            let upper_idx = idx.ceil() as usize;
+            let frac = idx - lower_idx as f64;
+
+            let result = if lower_idx == upper_idx {
+                values[lower_idx]
+            } else {
+                values[lower_idx] * (1.0 - frac) + values[upper_idx] * frac
+            };
+            Ok(Value::Double(result))
+        }
+
+        PercentileDisc => {
+            // PERCENTILE_DISC(percentile, column) - discrete percentile (returns actual value)
+            // First arg is percentile (0.0-1.0), second arg is the column
+            if args.len() < 2 {
+                return Ok(Value::Null);
+            }
+            let percentile = evaluate(&args[0], &[])?.as_f64().unwrap_or(0.5);
+
+            let mut values: Vec<Value> = Vec::new();
+            for row in rows {
+                let val = evaluate(&args[1], row)?;
+                if !val.is_null() {
+                    values.push(val);
+                }
+            }
+            if values.is_empty() {
+                return Ok(Value::Null);
+            }
+
+            // Sort values
+            values.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+
+            // Find the index for the given percentile
+            let n = values.len();
+            let idx = ((percentile * n as f64).ceil() as usize).saturating_sub(1).min(n - 1);
+            Ok(values[idx].clone())
+        }
+
+        Mode => {
+            // MODE - returns the most frequent value
+            if args.is_empty() {
+                return Ok(Value::Null);
+            }
+
+            // Collect all non-null values
+            let mut values: Vec<Value> = Vec::new();
+            for row in rows {
+                let val = evaluate(&args[0], row)?;
+                if !val.is_null() {
+                    values.push(val);
+                }
+            }
+            if values.is_empty() {
+                return Ok(Value::Null);
+            }
+
+            // Count occurrences using a HashMap
+            let mut counts: std::collections::HashMap<String, (usize, Value)> = std::collections::HashMap::new();
+            for val in values {
+                let key = format!("{:?}", val);
+                counts.entry(key)
+                    .and_modify(|(count, _)| *count += 1)
+                    .or_insert((1, val));
+            }
+
+            // Find the value with the highest count
+            let mode = counts.into_iter()
+                .max_by_key(|(_, (count, _))| *count)
+                .map(|(_, (_, val))| val)
+                .unwrap_or(Value::Null);
+
+            Ok(mode)
+        }
+
+        CovarPop => {
+            // Population covariance: sum((x - mean_x) * (y - mean_y)) / n
+            if args.len() < 2 {
+                return Ok(Value::Null);
+            }
+
+            let mut x_values: Vec<f64> = Vec::new();
+            let mut y_values: Vec<f64> = Vec::new();
+
+            for row in rows {
+                let x = evaluate(&args[0], row)?;
+                let y = evaluate(&args[1], row)?;
+                if let (Some(xf), Some(yf)) = (x.as_f64(), y.as_f64()) {
+                    x_values.push(xf);
+                    y_values.push(yf);
+                }
+            }
+
+            if x_values.is_empty() {
+                return Ok(Value::Null);
+            }
+
+            let n = x_values.len() as f64;
+            let mean_x: f64 = x_values.iter().sum::<f64>() / n;
+            let mean_y: f64 = y_values.iter().sum::<f64>() / n;
+
+            let covar: f64 = x_values.iter().zip(y_values.iter())
+                .map(|(x, y)| (x - mean_x) * (y - mean_y))
+                .sum::<f64>() / n;
+
+            Ok(Value::Double(covar))
+        }
+
+        CovarSamp => {
+            // Sample covariance: sum((x - mean_x) * (y - mean_y)) / (n - 1)
+            if args.len() < 2 {
+                return Ok(Value::Null);
+            }
+
+            let mut x_values: Vec<f64> = Vec::new();
+            let mut y_values: Vec<f64> = Vec::new();
+
+            for row in rows {
+                let x = evaluate(&args[0], row)?;
+                let y = evaluate(&args[1], row)?;
+                if let (Some(xf), Some(yf)) = (x.as_f64(), y.as_f64()) {
+                    x_values.push(xf);
+                    y_values.push(yf);
+                }
+            }
+
+            if x_values.len() < 2 {
+                return Ok(Value::Null);
+            }
+
+            let n = x_values.len() as f64;
+            let mean_x: f64 = x_values.iter().sum::<f64>() / n;
+            let mean_y: f64 = y_values.iter().sum::<f64>() / n;
+
+            let covar: f64 = x_values.iter().zip(y_values.iter())
+                .map(|(x, y)| (x - mean_x) * (y - mean_y))
+                .sum::<f64>() / (n - 1.0);
+
+            Ok(Value::Double(covar))
+        }
+
+        Corr => {
+            // Pearson correlation coefficient
+            if args.len() < 2 {
+                return Ok(Value::Null);
+            }
+
+            let mut x_values: Vec<f64> = Vec::new();
+            let mut y_values: Vec<f64> = Vec::new();
+
+            for row in rows {
+                let x = evaluate(&args[0], row)?;
+                let y = evaluate(&args[1], row)?;
+                if let (Some(xf), Some(yf)) = (x.as_f64(), y.as_f64()) {
+                    x_values.push(xf);
+                    y_values.push(yf);
+                }
+            }
+
+            if x_values.is_empty() {
+                return Ok(Value::Null);
+            }
+
+            let n = x_values.len() as f64;
+            let mean_x: f64 = x_values.iter().sum::<f64>() / n;
+            let mean_y: f64 = y_values.iter().sum::<f64>() / n;
+
+            let covar: f64 = x_values.iter().zip(y_values.iter())
+                .map(|(x, y)| (x - mean_x) * (y - mean_y))
+                .sum::<f64>();
+
+            let std_x: f64 = x_values.iter()
+                .map(|x| (x - mean_x).powi(2))
+                .sum::<f64>()
+                .sqrt();
+
+            let std_y: f64 = y_values.iter()
+                .map(|y| (y - mean_y).powi(2))
+                .sum::<f64>()
+                .sqrt();
+
+            if std_x == 0.0 || std_y == 0.0 {
+                return Ok(Value::Null);
+            }
+
+            let corr = covar / (std_x * std_y);
+            Ok(Value::Double(corr))
         }
     }
 }
