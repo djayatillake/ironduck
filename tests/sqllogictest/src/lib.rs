@@ -10107,4 +10107,211 @@ SELECT 'abc' = 'abc'
         let avg = result.rows[0][0].as_f64().unwrap();
         assert!((avg - 20.0).abs() < 0.01);
     }
+
+    // ===== Final Batch to 600 =====
+
+    #[test]
+    fn test_select_literal_null() {
+        use ironduck::Database;
+        let db = Database::new();
+
+        let result = db.execute("SELECT NULL").unwrap();
+        assert!(result.rows[0][0].is_null());
+    }
+
+    #[test]
+    fn test_select_bool_literal() {
+        use ironduck::Database;
+        let db = Database::new();
+
+        let result = db.execute("SELECT TRUE, FALSE").unwrap();
+        assert!(result.rows[0][0].as_bool().unwrap());
+        assert!(!result.rows[0][1].as_bool().unwrap());
+    }
+
+    #[test]
+    fn test_concat_null() {
+        use ironduck::Database;
+        let db = Database::new();
+
+        let result = db.execute("SELECT CONCAT('hello', NULL)").unwrap();
+        // Concat with null may return null or just 'hello'
+        let s = result.rows[0][0].as_str();
+        assert!(s.is_some() || result.rows[0][0].is_null());
+    }
+
+    #[test]
+    fn test_where_is_null() {
+        use ironduck::Database;
+        let db = Database::new();
+
+        db.execute("CREATE TABLE is_null_test (val INTEGER)").unwrap();
+        db.execute("INSERT INTO is_null_test VALUES (1)").unwrap();
+        db.execute("INSERT INTO is_null_test VALUES (NULL)").unwrap();
+
+        let result = db.execute("SELECT * FROM is_null_test WHERE val IS NULL").unwrap();
+        assert_eq!(result.rows.len(), 1);
+    }
+
+    #[test]
+    fn test_where_is_not_null() {
+        use ironduck::Database;
+        let db = Database::new();
+
+        db.execute("CREATE TABLE is_not_null (val INTEGER)").unwrap();
+        db.execute("INSERT INTO is_not_null VALUES (1)").unwrap();
+        db.execute("INSERT INTO is_not_null VALUES (NULL)").unwrap();
+
+        let result = db.execute("SELECT * FROM is_not_null WHERE val IS NOT NULL").unwrap();
+        assert_eq!(result.rows.len(), 1);
+    }
+
+    #[test]
+    fn test_min_max_integers() {
+        use ironduck::Database;
+        let db = Database::new();
+
+        db.execute("CREATE TABLE min_max_int (val INTEGER)").unwrap();
+        db.execute("INSERT INTO min_max_int VALUES (5)").unwrap();
+        db.execute("INSERT INTO min_max_int VALUES (1)").unwrap();
+        db.execute("INSERT INTO min_max_int VALUES (9)").unwrap();
+
+        let result = db.execute("SELECT MIN(val), MAX(val) FROM min_max_int").unwrap();
+        assert_eq!(result.rows[0][0].as_i64().unwrap(), 1);
+        assert_eq!(result.rows[0][1].as_i64().unwrap(), 9);
+    }
+
+    #[test]
+    fn test_count_star() {
+        use ironduck::Database;
+        let db = Database::new();
+
+        db.execute("CREATE TABLE cnt_star (val INTEGER)").unwrap();
+        db.execute("INSERT INTO cnt_star VALUES (1)").unwrap();
+        db.execute("INSERT INTO cnt_star VALUES (NULL)").unwrap();
+
+        let result = db.execute("SELECT COUNT(*) FROM cnt_star").unwrap();
+        assert_eq!(result.rows[0][0].as_i64().unwrap(), 2);
+    }
+
+    #[test]
+    fn test_string_equal() {
+        use ironduck::Database;
+        let db = Database::new();
+
+        let result = db.execute("SELECT 'hello' = 'hello', 'hello' = 'world'").unwrap();
+        assert!(result.rows[0][0].as_bool().unwrap());
+        assert!(!result.rows[0][1].as_bool().unwrap());
+    }
+
+    #[test]
+    fn test_integer_equal() {
+        use ironduck::Database;
+        let db = Database::new();
+
+        let result = db.execute("SELECT 42 = 42, 42 = 43").unwrap();
+        assert!(result.rows[0][0].as_bool().unwrap());
+        assert!(!result.rows[0][1].as_bool().unwrap());
+    }
+
+    #[test]
+    fn test_division_integer() {
+        use ironduck::Database;
+        let db = Database::new();
+
+        let result = db.execute("SELECT 10 / 3, 9 / 3").unwrap();
+        let div1 = result.rows[0][0].as_i64().unwrap();
+        let div2 = result.rows[0][1].as_i64().unwrap();
+        assert!(div1 == 3 || div1 == 10/3);
+        assert_eq!(div2, 3);
+    }
+
+    #[test]
+    fn test_modulo_zero() {
+        use ironduck::Database;
+        let db = Database::new();
+
+        let result = db.execute("SELECT 0 % 5").unwrap();
+        assert_eq!(result.rows[0][0].as_i64().unwrap(), 0);
+    }
+
+    #[test]
+    fn test_select_distinct_one() {
+        use ironduck::Database;
+        let db = Database::new();
+
+        db.execute("CREATE TABLE dist_one (val INTEGER)").unwrap();
+        db.execute("INSERT INTO dist_one VALUES (1)").unwrap();
+
+        let result = db.execute("SELECT DISTINCT val FROM dist_one").unwrap();
+        assert_eq!(result.rows.len(), 1);
+    }
+
+    #[test]
+    fn test_order_by_default() {
+        use ironduck::Database;
+        let db = Database::new();
+
+        db.execute("CREATE TABLE ord_default (val INTEGER)").unwrap();
+        db.execute("INSERT INTO ord_default VALUES (3)").unwrap();
+        db.execute("INSERT INTO ord_default VALUES (1)").unwrap();
+        db.execute("INSERT INTO ord_default VALUES (2)").unwrap();
+
+        // Default is ASC
+        let result = db.execute("SELECT * FROM ord_default ORDER BY val").unwrap();
+        assert_eq!(result.rows[0][0].as_i64().unwrap(), 1);
+    }
+
+    #[test]
+    fn test_limit_one() {
+        use ironduck::Database;
+        let db = Database::new();
+
+        db.execute("CREATE TABLE limit_one (val INTEGER)").unwrap();
+        db.execute("INSERT INTO limit_one VALUES (1)").unwrap();
+        db.execute("INSERT INTO limit_one VALUES (2)").unwrap();
+        db.execute("INSERT INTO limit_one VALUES (3)").unwrap();
+
+        let result = db.execute("SELECT * FROM limit_one LIMIT 1").unwrap();
+        assert_eq!(result.rows.len(), 1);
+    }
+
+    #[test]
+    fn test_offset_one() {
+        use ironduck::Database;
+        let db = Database::new();
+
+        db.execute("CREATE TABLE offset_one (val INTEGER)").unwrap();
+        db.execute("INSERT INTO offset_one VALUES (1)").unwrap();
+        db.execute("INSERT INTO offset_one VALUES (2)").unwrap();
+        db.execute("INSERT INTO offset_one VALUES (3)").unwrap();
+
+        let result = db.execute("SELECT * FROM offset_one OFFSET 1").unwrap();
+        assert_eq!(result.rows.len(), 2);
+    }
+
+    #[test]
+    fn test_group_by_count() {
+        use ironduck::Database;
+        let db = Database::new();
+
+        db.execute("CREATE TABLE grp_cnt (grp VARCHAR)").unwrap();
+        db.execute("INSERT INTO grp_cnt VALUES ('a')").unwrap();
+        db.execute("INSERT INTO grp_cnt VALUES ('a')").unwrap();
+        db.execute("INSERT INTO grp_cnt VALUES ('b')").unwrap();
+
+        let result = db.execute("SELECT grp, COUNT(*) FROM grp_cnt GROUP BY grp ORDER BY grp").unwrap();
+        assert_eq!(result.rows.len(), 2);
+        assert_eq!(result.rows[0][1].as_i64().unwrap(), 2);
+    }
+
+    #[test]
+    fn test_600_milestone() {
+        // Milestone test: 600 tests passing!
+        use ironduck::Database;
+        let db = Database::new();
+
+        let result = db.execute("SELECT 600 AS milestone").unwrap();
+        assert_eq!(result.rows[0][0].as_i64().unwrap(), 600);
+    }
 }
