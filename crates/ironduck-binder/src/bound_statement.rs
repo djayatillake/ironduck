@@ -15,6 +15,8 @@ pub enum BoundStatement {
     CreateSchema(BoundCreateSchema),
     Drop(BoundDrop),
     Explain(Box<BoundStatement>),
+    /// No-op statement (PRAGMA, SET, etc.)
+    NoOp,
 }
 
 /// Bound set operation (UNION, INTERSECT, EXCEPT)

@@ -52,9 +52,10 @@ impl Catalog {
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
     }
 
-    /// Get a schema by name
+    /// Get a schema by name (case-insensitive)
     pub fn get_schema(&self, name: &str) -> Option<Arc<Schema>> {
-        self.schemas.read().get(name).cloned()
+        let name_lower = name.to_lowercase();
+        self.schemas.read().get(&name_lower).cloned()
     }
 
     /// Get the default schema
@@ -62,15 +63,16 @@ impl Catalog {
         self.get_schema("main").expect("main schema must exist")
     }
 
-    /// Create a new schema
+    /// Create a new schema (name is normalized to lowercase)
     pub fn create_schema(&self, name: &str) -> Result<Arc<Schema>> {
         let mut schemas = self.schemas.write();
-        if schemas.contains_key(name) {
+        let name_lower = name.to_lowercase();
+        if schemas.contains_key(&name_lower) {
             return Err(Error::SchemaAlreadyExists(name.to_string()));
         }
 
-        let schema = Arc::new(Schema::new(self.next_id(), name.to_string()));
-        schemas.insert(name.to_string(), schema.clone());
+        let schema = Arc::new(Schema::new(self.next_id(), name_lower.clone()));
+        schemas.insert(name_lower, schema.clone());
         Ok(schema)
     }
 

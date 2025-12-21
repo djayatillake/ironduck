@@ -618,6 +618,36 @@ fn bind_function(
         _ => false,
     };
 
+    // Validate argument count for functions that require specific numbers
+    match name.as_str() {
+        // Single-argument aggregate functions
+        "AVG" | "SUM" | "MIN" | "MAX" | "FIRST" | "LAST" | "STDDEV" | "STDDEV_SAMP"
+        | "STDDEV_POP" | "VARIANCE" | "VAR_SAMP" | "VAR_POP" | "BIT_AND" | "BIT_OR"
+        | "BIT_XOR" | "PRODUCT" | "MEDIAN" | "MODE" | "ARRAY_AGG" | "BOOL_AND"
+        | "BOOL_OR" | "EVERY" | "ANY" => {
+            // These functions need exactly 1 argument (excluding COUNT which can be 0 with *)
+            if args.is_empty() {
+                return Err(Error::InvalidArguments(format!(
+                    "{}() requires an argument", name
+                )));
+            }
+            if args.len() > 1 {
+                return Err(Error::InvalidArguments(format!(
+                    "{}() takes only 1 argument, got {}", name, args.len()
+                )));
+            }
+        }
+        // Two-argument functions
+        "COVAR_POP" | "COVAR_SAMP" | "CORR" => {
+            if args.len() != 2 {
+                return Err(Error::InvalidArguments(format!(
+                    "{}() requires exactly 2 arguments, got {}", name, args.len()
+                )));
+            }
+        }
+        _ => {}
+    }
+
     // Determine if aggregate and return type
     let (is_aggregate, return_type) = match name.as_str() {
         // Aggregate functions

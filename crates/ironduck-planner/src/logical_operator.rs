@@ -149,6 +149,9 @@ pub enum LogicalOperator {
     Explain {
         input: Box<LogicalOperator>,
     },
+
+    /// No-op - for PRAGMA, SET, and other configuration statements
+    NoOp,
 }
 
 /// Type of set operation
@@ -201,6 +204,7 @@ impl LogicalOperator {
             LogicalOperator::SetOperation { left, .. } => left.output_types(),
             LogicalOperator::Window { output_types, .. } => output_types.clone(),
             LogicalOperator::Explain { .. } => vec![LogicalType::Varchar],
+            LogicalOperator::NoOp => vec![LogicalType::Varchar],
         }
     }
 }

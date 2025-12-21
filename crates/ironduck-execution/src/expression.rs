@@ -139,16 +139,25 @@ fn evaluate_binary_op(left: &Value, op: BinaryOperator, right: &Value) -> Result
         BinaryOperator::Subtract => arithmetic_op(left, right, |a, b| a - b, |a, b| a - b),
         BinaryOperator::Multiply => arithmetic_op(left, right, |a, b| a * b, |a, b| a * b),
         BinaryOperator::Divide => {
-            // Check for division by zero
+            // Division by zero returns NULL in SQL (DuckDB behavior)
             match right {
-                Value::Integer(0) | Value::BigInt(0) => return Err(Error::DivisionByZero),
-                Value::Double(f) if *f == 0.0 => return Err(Error::DivisionByZero),
-                Value::Float(f) if *f == 0.0 => return Err(Error::DivisionByZero),
+                Value::Integer(0) | Value::BigInt(0) => return Ok(Value::Null),
+                Value::Double(f) if *f == 0.0 => return Ok(Value::Null),
+                Value::Float(f) if *f == 0.0 => return Ok(Value::Null),
                 _ => {}
             }
             arithmetic_op(left, right, |a, b| a / b, |a, b| a / b)
         }
-        BinaryOperator::Modulo => arithmetic_op(left, right, |a, b| a % b, |a, b| a % b),
+        BinaryOperator::Modulo => {
+            // Modulo by zero returns NULL in SQL (DuckDB behavior)
+            match right {
+                Value::Integer(0) | Value::BigInt(0) => return Ok(Value::Null),
+                Value::Double(f) if *f == 0.0 => return Ok(Value::Null),
+                Value::Float(f) if *f == 0.0 => return Ok(Value::Null),
+                _ => {}
+            }
+            arithmetic_op(left, right, |a, b| a % b, |a, b| a % b)
+        }
 
         // Comparison operations
         BinaryOperator::Equal => comparison_op(left, right, |o| o == std::cmp::Ordering::Equal),

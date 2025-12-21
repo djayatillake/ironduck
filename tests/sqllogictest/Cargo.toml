@@ -11,5 +11,9 @@ tokio.workspace = true
 thiserror.workspace = true
 anyhow.workspace = true
 
+[[bin]]
+name = "run_duckdb_tests"
+path = "src/bin/run_duckdb_tests.rs"
+
 [dev-dependencies]
 criterion.workspace = true

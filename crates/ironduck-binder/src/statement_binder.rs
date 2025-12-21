@@ -71,6 +71,15 @@ pub fn bind_statement(binder: &Binder, stmt: &sql::Statement) -> Result<BoundSta
             Ok(BoundStatement::Explain(Box::new(inner)))
         }
 
+        // Configuration statements - treat as no-ops for compatibility
+        sql::Statement::SetVariable { .. } => Ok(BoundStatement::NoOp),
+        sql::Statement::SetNames { .. } => Ok(BoundStatement::NoOp),
+        sql::Statement::SetNamesDefault { .. } => Ok(BoundStatement::NoOp),
+        sql::Statement::SetTimeZone { .. } => Ok(BoundStatement::NoOp),
+
+        // PRAGMA statements - treat as no-ops for compatibility
+        sql::Statement::Pragma { .. } => Ok(BoundStatement::NoOp),
+
         _ => Err(Error::NotImplemented(format!("Statement: {:?}", stmt))),
     }
 }

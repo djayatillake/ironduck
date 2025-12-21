@@ -27,9 +27,11 @@ impl Schema {
         }
     }
 
-    /// Add a table to this schema
-    pub fn add_table(&self, table: Table) -> Result<()> {
+    /// Add a table to this schema (name is normalized to lowercase)
+    pub fn add_table(&self, mut table: Table) -> Result<()> {
         let mut tables = self.tables.write();
+        // Normalize table name to lowercase for case-insensitive lookup
+        table.name = table.name.to_lowercase();
         if tables.contains_key(&table.name) {
             return Err(Error::TableAlreadyExists(table.name.clone()));
         }
@@ -37,9 +39,10 @@ impl Schema {
         Ok(())
     }
 
-    /// Get a table by name
+    /// Get a table by name (case-insensitive)
     pub fn get_table(&self, name: &str) -> Option<Arc<Table>> {
-        self.tables.read().get(name).cloned()
+        let name_lower = name.to_lowercase();
+        self.tables.read().get(&name_lower).cloned()
     }
 
     /// List all table names in this schema
@@ -47,10 +50,11 @@ impl Schema {
         self.tables.read().keys().cloned().collect()
     }
 
-    /// Remove a table by name
+    /// Remove a table by name (case-insensitive)
     pub fn drop_table(&self, name: &str) -> Result<()> {
         let mut tables = self.tables.write();
-        if tables.remove(name).is_none() {
+        let name_lower = name.to_lowercase();
+        if tables.remove(&name_lower).is_none() {
             return Err(Error::TableNotFound(name.to_string()));
         }
         Ok(())

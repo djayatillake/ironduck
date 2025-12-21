@@ -110,14 +110,12 @@ impl TestRunner {
             } => {
                 match self.db.execute(sql) {
                     Ok(result) => {
+                        // Flatten results: each value on its own line
                         let mut actual: Vec<String> = result
                             .rows
                             .iter()
-                            .map(|row| {
-                                row.iter()
-                                    .map(|v| v.to_string())
-                                    .collect::<Vec<_>>()
-                                    .join("\t")
+                            .flat_map(|row| {
+                                row.iter().map(|v| v.to_string())
                             })
                             .collect();
 

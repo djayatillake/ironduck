@@ -108,6 +108,13 @@ pub fn build_plan(statement: &BoundStatement) -> Result<LogicalPlan> {
                 vec!["plan".to_string()],
             ))
         }
+        BoundStatement::NoOp => {
+            // No-op statements (PRAGMA, SET, etc.) produce an empty result
+            Ok(LogicalPlan::new(
+                LogicalOperator::NoOp,
+                vec!["Success".to_string()],
+            ))
+        }
     }
 }
 
@@ -772,9 +779,20 @@ fn extract_aggregate(expr: &BoundExpression) -> Option<super::AggregateExpressio
                 _ => return None,
             };
 
+            // For COUNT(*), filter out the Star expression so args is empty
+            // This allows the executor to treat it as a row count
+            let converted_args: Vec<_> = if func == super::AggregateFunction::Count {
+                args.iter()
+                    .filter(|a| !matches!(a.expr, BoundExpressionKind::Star))
+                    .map(convert_expression)
+                    .collect()
+            } else {
+                args.iter().map(convert_expression).collect()
+            };
+
             Some(super::AggregateExpression {
                 function: func,
-                args: args.iter().map(convert_expression).collect(),
+                args: converted_args,
                 distinct: *distinct,
                 filter: None,
             })

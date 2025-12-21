@@ -38,6 +38,9 @@ pub enum Error {
     #[error("Invalid type cast from {from} to {to}")]
     InvalidCast { from: String, to: String },
 
+    #[error("Invalid arguments: {0}")]
+    InvalidArguments(String),
+
     // Execution errors
     #[error("Division by zero")]
     DivisionByZero,

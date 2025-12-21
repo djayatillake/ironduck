@@ -987,6 +987,11 @@ impl Executor {
                 let plan_str = format_plan(input, 0);
                 Ok(vec![vec![Value::Varchar(plan_str)]])
             }
+
+            LogicalOperator::NoOp => {
+                // No-op statements return empty result
+                Ok(vec![vec![Value::Varchar("OK".to_string())]])
+            }
         }
     }
 }
@@ -1091,6 +1096,9 @@ fn format_plan(op: &LogicalOperator, indent: usize) -> String {
         }
         LogicalOperator::Explain { input } => {
             format!("{}Explain\n{}", prefix, format_plan(input, indent + 1))
+        }
+        LogicalOperator::NoOp => {
+            format!("{}NoOp", prefix)
         }
     }
 }
@@ -1257,8 +1265,8 @@ fn compute_aggregate(
 
     match agg.function {
         Count => {
-            if args.is_empty() || matches!(args.first(), Some(Expression::Constant(Value::Null))) {
-                // COUNT(*) or COUNT(literal)
+            if args.is_empty() {
+                // COUNT(*) counts all rows
                 Ok(Value::BigInt(rows.len() as i64))
             } else if distinct {
                 // COUNT(DISTINCT expr) - count distinct non-NULL values
