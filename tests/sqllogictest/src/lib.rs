@@ -1982,4 +1982,73 @@ SELECT CAST('10' AS INTEGER) + CAST('20' AS INTEGER)
         assert_eq!(report.passed, 5);
         assert_eq!(report.failed, 0);
     }
+
+    #[test]
+    fn test_cross_join() {
+        let mut runner = TestRunner::new();
+        let content = r#"
+statement ok
+CREATE TABLE colors (name VARCHAR)
+
+statement ok
+INSERT INTO colors VALUES ('Red'), ('Blue')
+
+statement ok
+CREATE TABLE sizes (name VARCHAR)
+
+statement ok
+INSERT INTO sizes VALUES ('S'), ('M'), ('L')
+
+# CROSS JOIN produces Cartesian product
+query TT
+SELECT c.name, s.name FROM colors c CROSS JOIN sizes s ORDER BY c.name, s.name
+----
+Blue	L
+Blue	M
+Blue	S
+Red	L
+Red	M
+Red	S
+
+# CROSS JOIN with WHERE clause
+query TT
+SELECT c.name, s.name FROM colors c CROSS JOIN sizes s WHERE s.name != 'M' ORDER BY c.name, s.name
+----
+Blue	L
+Blue	S
+Red	L
+Red	S
+"#;
+        let report = runner.run_tests(content).unwrap();
+        assert_eq!(report.passed, 6);
+        assert_eq!(report.failed, 0);
+    }
+
+    #[test]
+    fn test_aggregate_expressions() {
+        let mut runner = TestRunner::new();
+        let content = r#"
+statement ok
+CREATE TABLE numbers (val INT, category VARCHAR)
+
+statement ok
+INSERT INTO numbers VALUES (1, 'A'), (2, 'A'), (3, 'B'), (4, 'B'), (5, 'B')
+
+# Multiple aggregates in one query
+query IRII
+SELECT SUM(val), AVG(val), MIN(val), MAX(val) FROM numbers
+----
+15	3	1	5
+
+# GROUP BY with multiple aggregates
+query TIRI
+SELECT category, SUM(val), AVG(val), COUNT(*) FROM numbers GROUP BY category ORDER BY category
+----
+A	3	1.5	2
+B	12	4	3
+"#;
+        let report = runner.run_tests(content).unwrap();
+        assert_eq!(report.passed, 4);
+        assert_eq!(report.failed, 0);
+    }
 }
