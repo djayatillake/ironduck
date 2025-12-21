@@ -1292,9 +1292,8 @@ fn compute_aggregate(
         }
 
         Sum => {
-            let mut sum = 0i64;
-            let mut has_float = false;
-            let mut float_sum = 0f64;
+            let mut sum = 0f64;
+            let mut has_value = false;
 
             for row in rows {
                 if args.is_empty() {
@@ -1302,15 +1301,21 @@ fn compute_aggregate(
                 }
                 let val = evaluate(&args[0], row)?;
                 match val {
-                    Value::Integer(i) => sum += i as i64,
-                    Value::BigInt(i) => sum += i,
+                    Value::Integer(i) => {
+                        has_value = true;
+                        sum += i as f64;
+                    }
+                    Value::BigInt(i) => {
+                        has_value = true;
+                        sum += i as f64;
+                    }
                     Value::Float(f) => {
-                        has_float = true;
-                        float_sum += f as f64;
+                        has_value = true;
+                        sum += f as f64;
                     }
                     Value::Double(f) => {
-                        has_float = true;
-                        float_sum += f;
+                        has_value = true;
+                        sum += f;
                     }
                     Value::Null => {}
                     _ => {
@@ -1322,10 +1327,11 @@ fn compute_aggregate(
                 }
             }
 
-            if has_float {
-                Ok(Value::Double(float_sum + sum as f64))
+            // DuckDB returns NULL for SUM of no values, otherwise DOUBLE
+            if has_value {
+                Ok(Value::Double(sum))
             } else {
-                Ok(Value::BigInt(sum))
+                Ok(Value::Null)
             }
         }
 
