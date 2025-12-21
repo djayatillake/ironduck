@@ -111,11 +111,19 @@ impl TestRunner {
                 match self.db.execute(sql) {
                     Ok(result) => {
                         // Flatten results: each value on its own line
+                        // Empty strings are displayed as "(empty)" in sqllogictest format
                         let mut actual: Vec<String> = result
                             .rows
                             .iter()
                             .flat_map(|row| {
-                                row.iter().map(|v| v.to_string())
+                                row.iter().map(|v| {
+                                    let s = v.to_string();
+                                    if s.is_empty() {
+                                        "(empty)".to_string()
+                                    } else {
+                                        s
+                                    }
+                                })
                             })
                             .collect();
 

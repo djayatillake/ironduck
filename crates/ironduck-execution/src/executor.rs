@@ -1301,6 +1301,14 @@ fn compute_aggregate(
                 }
                 let val = evaluate(&args[0], row)?;
                 match val {
+                    Value::TinyInt(i) => {
+                        has_value = true;
+                        sum += i as f64;
+                    }
+                    Value::SmallInt(i) => {
+                        has_value = true;
+                        sum += i as f64;
+                    }
                     Value::Integer(i) => {
                         has_value = true;
                         sum += i as f64;
@@ -1344,9 +1352,38 @@ fn compute_aggregate(
                     continue;
                 }
                 let val = evaluate(&args[0], row)?;
-                if let Some(f) = val.as_f64() {
-                    sum += f;
-                    count += 1;
+                match val {
+                    Value::Null => {} // Skip nulls
+                    Value::TinyInt(i) => {
+                        sum += i as f64;
+                        count += 1;
+                    }
+                    Value::SmallInt(i) => {
+                        sum += i as f64;
+                        count += 1;
+                    }
+                    Value::Integer(i) => {
+                        sum += i as f64;
+                        count += 1;
+                    }
+                    Value::BigInt(i) => {
+                        sum += i as f64;
+                        count += 1;
+                    }
+                    Value::Float(f) => {
+                        sum += f as f64;
+                        count += 1;
+                    }
+                    Value::Double(f) => {
+                        sum += f;
+                        count += 1;
+                    }
+                    _ => {
+                        return Err(Error::TypeMismatch {
+                            expected: "numeric".to_string(),
+                            got: format!("{:?}", val),
+                        })
+                    }
                 }
             }
 
