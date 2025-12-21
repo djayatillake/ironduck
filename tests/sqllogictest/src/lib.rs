@@ -1878,4 +1878,108 @@ SELECT id, name FROM departments WHERE EXISTS (SELECT 1) ORDER BY id
         assert_eq!(report.passed, 7);
         assert_eq!(report.failed, 0);
     }
+
+    #[test]
+    fn test_full_outer_join() {
+        let mut runner = TestRunner::new();
+        let content = r#"
+statement ok
+CREATE TABLE left_tbl (id INT, val VARCHAR)
+
+statement ok
+INSERT INTO left_tbl VALUES (1, 'A'), (2, 'B'), (3, 'C')
+
+statement ok
+CREATE TABLE right_tbl (id INT, val VARCHAR)
+
+statement ok
+INSERT INTO right_tbl VALUES (2, 'X'), (3, 'Y'), (4, 'Z')
+
+# FULL OUTER JOIN - all rows from both sides
+query ITIT
+SELECT l.id, l.val, r.id, r.val FROM left_tbl l FULL OUTER JOIN right_tbl r ON l.id = r.id ORDER BY COALESCE(l.id, r.id)
+----
+1	A	NULL	NULL
+2	B	2	X
+3	C	3	Y
+NULL	NULL	4	Z
+"#;
+        let report = runner.run_tests(content).unwrap();
+        assert_eq!(report.passed, 5);
+        assert_eq!(report.failed, 0);
+    }
+
+    #[test]
+    fn test_scalar_subquery() {
+        let mut runner = TestRunner::new();
+        let content = r#"
+statement ok
+CREATE TABLE products (id INT, name VARCHAR, price INT)
+
+statement ok
+INSERT INTO products VALUES (1, 'Phone', 500), (2, 'Laptop', 1200), (3, 'Tablet', 300)
+
+# Scalar subquery in SELECT
+query ITI
+SELECT id, name, (SELECT MAX(price) FROM products) as max_price FROM products ORDER BY id
+----
+1	Phone	1200
+2	Laptop	1200
+3	Tablet	1200
+
+# Scalar subquery with column reference in WHERE
+query IT
+SELECT id, name FROM products WHERE price = (SELECT MAX(price) FROM products)
+----
+2	Laptop
+
+# Scalar subquery comparing to aggregate
+query IT
+SELECT id, name FROM products WHERE price > (SELECT AVG(price) FROM products) ORDER BY id
+----
+2	Laptop
+"#;
+        let report = runner.run_tests(content).unwrap();
+        assert_eq!(report.passed, 5);
+        assert_eq!(report.failed, 0);
+    }
+
+    #[test]
+    fn test_cast() {
+        let mut runner = TestRunner::new();
+        let content = r#"
+# CAST integer to varchar
+query T
+SELECT CAST(123 AS VARCHAR)
+----
+123
+
+# CAST varchar to integer
+query I
+SELECT CAST('456' AS INTEGER)
+----
+456
+
+# CAST double to integer (truncates)
+query I
+SELECT CAST(3.7 AS INTEGER)
+----
+3
+
+# CAST integer to double
+query R
+SELECT CAST(42 AS DOUBLE)
+----
+42
+
+# CAST in expressions
+query I
+SELECT CAST('10' AS INTEGER) + CAST('20' AS INTEGER)
+----
+30
+"#;
+        let report = runner.run_tests(content).unwrap();
+        assert_eq!(report.passed, 5);
+        assert_eq!(report.failed, 0);
+    }
 }

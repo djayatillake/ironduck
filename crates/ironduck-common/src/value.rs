@@ -284,6 +284,22 @@ impl PartialOrd for Value {
             (Value::Integer(a), Value::BigInt(b)) => (*a as i64).partial_cmp(b),
             (Value::BigInt(a), Value::Integer(b)) => a.partial_cmp(&(*b as i64)),
 
+            // Integer to Float/Double comparisons
+            (Value::Integer(a), Value::Double(b)) => (*a as f64).partial_cmp(b),
+            (Value::Double(a), Value::Integer(b)) => a.partial_cmp(&(*b as f64)),
+            (Value::Integer(a), Value::Float(b)) => (*a as f32).partial_cmp(b),
+            (Value::Float(a), Value::Integer(b)) => a.partial_cmp(&(*b as f32)),
+
+            // BigInt to Float/Double comparisons
+            (Value::BigInt(a), Value::Double(b)) => (*a as f64).partial_cmp(b),
+            (Value::Double(a), Value::BigInt(b)) => a.partial_cmp(&(*b as f64)),
+            (Value::BigInt(a), Value::Float(b)) => (*a as f32).partial_cmp(b),
+            (Value::Float(a), Value::BigInt(b)) => a.partial_cmp(&(*b as f32)),
+
+            // Float to Double comparisons
+            (Value::Float(a), Value::Double(b)) => (*a as f64).partial_cmp(b),
+            (Value::Double(a), Value::Float(b)) => a.partial_cmp(&(*b as f64)),
+
             _ => None,
         }
     }

@@ -72,11 +72,16 @@ impl Executor {
             } => {
                 let input_rows = self.execute_operator(input)?;
                 let mut output_rows = Vec::new();
+                let has_subquery = expressions.iter().any(contains_subquery);
 
                 for row in &input_rows {
                     let mut output_row = Vec::new();
                     for expr in expressions {
-                        let value = evaluate(expr, row)?;
+                        let value = if has_subquery {
+                            evaluate_with_subqueries(self, expr, row)?
+                        } else {
+                            evaluate(expr, row)?
+                        };
                         output_row.push(value);
                     }
                     output_rows.push(output_row);
@@ -86,7 +91,11 @@ impl Executor {
                 if input_rows.is_empty() && expressions.iter().all(is_constant) {
                     let mut output_row = Vec::new();
                     for expr in expressions {
-                        let value = evaluate(expr, &[])?;
+                        let value = if has_subquery {
+                            evaluate_with_subqueries(self, expr, &[])?
+                        } else {
+                            evaluate(expr, &[])?
+                        };
                         output_row.push(value);
                     }
                     output_rows.push(output_row);
