@@ -514,8 +514,39 @@ pub struct WindowExpression {
     pub partition_by: Vec<Expression>,
     /// ORDER BY expressions
     pub order_by: Vec<OrderByExpression>,
+    /// Window frame specification
+    pub frame: Option<WindowFrame>,
     /// Output type
     pub output_type: LogicalType,
+}
+
+/// Window frame specification
+#[derive(Debug, Clone)]
+pub struct WindowFrame {
+    /// Frame type: ROWS or RANGE
+    pub frame_type: WindowFrameType,
+    /// Start bound
+    pub start: WindowFrameBound,
+    /// End bound
+    pub end: WindowFrameBound,
+}
+
+/// Window frame type
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WindowFrameType {
+    Rows,
+    Range,
+    Groups,
+}
+
+/// Window frame bound
+#[derive(Debug, Clone)]
+pub enum WindowFrameBound {
+    UnboundedPreceding,
+    Preceding(Expression),
+    CurrentRow,
+    Following(Expression),
+    UnboundedFollowing,
 }
 
 /// Window function types

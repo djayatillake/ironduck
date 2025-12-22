@@ -1036,7 +1036,7 @@ fn bind_window_function(
     ctx: &ExpressionBinderContext,
 ) -> Result<BoundExpression> {
     // Extract window specification
-    let (partition_by, order_by) = match over {
+    let (partition_by, order_by, frame) = match over {
         sql::WindowType::WindowSpec(spec) => {
             // Bind PARTITION BY
             let partition_by: Result<Vec<_>> = spec
@@ -1059,7 +1059,14 @@ fn bind_window_function(
                 .collect();
             let order_by = order_by?;
 
-            (partition_by, order_by)
+            // Bind window frame if present
+            let frame = if let Some(window_frame) = &spec.window_frame {
+                Some(bind_window_frame(binder, window_frame, ctx)?)
+            } else {
+                None
+            };
+
+            (partition_by, order_by, frame)
         }
         sql::WindowType::NamedWindow(_) => {
             return Err(Error::NotImplemented("Named window references".to_string()));
@@ -1094,7 +1101,59 @@ fn bind_window_function(
             args,
             partition_by,
             order_by,
+            frame,
         },
         return_type,
     ))
+}
+
+/// Bind a window frame specification
+fn bind_window_frame(
+    binder: &Binder,
+    frame: &sql::WindowFrame,
+    ctx: &ExpressionBinderContext,
+) -> Result<super::WindowFrame> {
+    use super::{WindowFrame, WindowFrameBound, WindowFrameType};
+
+    let frame_type = match frame.units {
+        sql::WindowFrameUnits::Rows => WindowFrameType::Rows,
+        sql::WindowFrameUnits::Range => WindowFrameType::Range,
+        sql::WindowFrameUnits::Groups => WindowFrameType::Groups,
+    };
+
+    let start = bind_window_frame_bound(binder, &frame.start_bound, ctx)?;
+
+    let end = match &frame.end_bound {
+        Some(end) => bind_window_frame_bound(binder, end, ctx)?,
+        None => WindowFrameBound::CurrentRow,
+    };
+
+    Ok(WindowFrame {
+        frame_type,
+        start,
+        end,
+    })
+}
+
+/// Bind a window frame bound
+fn bind_window_frame_bound(
+    binder: &Binder,
+    bound: &sql::WindowFrameBound,
+    ctx: &ExpressionBinderContext,
+) -> Result<super::WindowFrameBound> {
+    use super::WindowFrameBound;
+
+    match bound {
+        sql::WindowFrameBound::CurrentRow => Ok(WindowFrameBound::CurrentRow),
+        sql::WindowFrameBound::Preceding(None) => Ok(WindowFrameBound::UnboundedPreceding),
+        sql::WindowFrameBound::Preceding(Some(expr)) => {
+            let bound_expr = bind_expression(binder, expr, ctx)?;
+            Ok(WindowFrameBound::Preceding(Box::new(bound_expr)))
+        }
+        sql::WindowFrameBound::Following(None) => Ok(WindowFrameBound::UnboundedFollowing),
+        sql::WindowFrameBound::Following(Some(expr)) => {
+            let bound_expr = bind_expression(binder, expr, ctx)?;
+            Ok(WindowFrameBound::Following(Box::new(bound_expr)))
+        }
+    }
 }

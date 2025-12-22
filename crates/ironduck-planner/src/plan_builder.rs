@@ -1075,6 +1075,7 @@ fn extract_window_expression(expr: &BoundExpression) -> Option<super::WindowExpr
             args,
             partition_by,
             order_by,
+            frame,
         } => {
             let func = match name.as_str() {
                 "ROW_NUMBER" => super::WindowFunction::RowNumber,
@@ -1096,6 +1097,9 @@ fn extract_window_expression(expr: &BoundExpression) -> Option<super::WindowExpr
                 _ => return None,
             };
 
+            // Convert window frame if present
+            let converted_frame = frame.as_ref().map(|f| convert_window_frame(f));
+
             Some(super::WindowExpression {
                 function: func,
                 args: args.iter().map(convert_expression).collect(),
@@ -1108,10 +1112,44 @@ fn extract_window_expression(expr: &BoundExpression) -> Option<super::WindowExpr
                         nulls_first: *nulls_first,
                     })
                     .collect(),
+                frame: converted_frame,
                 output_type: expr.return_type.clone(),
             })
         }
         _ => None,
+    }
+}
+
+/// Convert bound window frame to logical window frame
+fn convert_window_frame(frame: &ironduck_binder::WindowFrame) -> super::WindowFrame {
+    use ironduck_binder::{WindowFrameBound as BoundBound, WindowFrameType as BoundType};
+
+    let frame_type = match frame.frame_type {
+        BoundType::Rows => super::WindowFrameType::Rows,
+        BoundType::Range => super::WindowFrameType::Range,
+        BoundType::Groups => super::WindowFrameType::Groups,
+    };
+
+    let start = convert_window_frame_bound(&frame.start);
+    let end = convert_window_frame_bound(&frame.end);
+
+    super::WindowFrame {
+        frame_type,
+        start,
+        end,
+    }
+}
+
+/// Convert bound window frame bound to logical window frame bound
+fn convert_window_frame_bound(bound: &ironduck_binder::WindowFrameBound) -> super::WindowFrameBound {
+    use ironduck_binder::WindowFrameBound as BoundBound;
+
+    match bound {
+        BoundBound::UnboundedPreceding => super::WindowFrameBound::UnboundedPreceding,
+        BoundBound::Preceding(expr) => super::WindowFrameBound::Preceding(convert_expression(expr)),
+        BoundBound::CurrentRow => super::WindowFrameBound::CurrentRow,
+        BoundBound::Following(expr) => super::WindowFrameBound::Following(convert_expression(expr)),
+        BoundBound::UnboundedFollowing => super::WindowFrameBound::UnboundedFollowing,
     }
 }
 

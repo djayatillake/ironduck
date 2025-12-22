@@ -154,12 +154,51 @@ pub enum BoundExpressionKind {
         partition_by: Vec<BoundExpression>,
         /// ORDER BY expressions (expression, ascending, nulls_first)
         order_by: Vec<(BoundExpression, bool, bool)>,
+        /// Window frame specification
+        frame: Option<WindowFrame>,
     },
 
     /// Row ID pseudo-column
     RowId {
         table_idx: usize,
     },
+}
+
+/// Window frame specification
+#[derive(Debug, Clone)]
+pub struct WindowFrame {
+    /// Frame type: ROWS or RANGE
+    pub frame_type: WindowFrameType,
+    /// Start bound of the frame
+    pub start: WindowFrameBound,
+    /// End bound of the frame (None means CURRENT ROW for single-bound frames)
+    pub end: WindowFrameBound,
+}
+
+/// Window frame type
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WindowFrameType {
+    /// ROWS - physical row offsets
+    Rows,
+    /// RANGE - logical value ranges
+    Range,
+    /// GROUPS - group-based offsets
+    Groups,
+}
+
+/// Window frame bound
+#[derive(Debug, Clone)]
+pub enum WindowFrameBound {
+    /// UNBOUNDED PRECEDING
+    UnboundedPreceding,
+    /// n PRECEDING
+    Preceding(Box<BoundExpression>),
+    /// CURRENT ROW
+    CurrentRow,
+    /// n FOLLOWING
+    Following(Box<BoundExpression>),
+    /// UNBOUNDED FOLLOWING
+    UnboundedFollowing,
 }
 
 /// Binary operators
