@@ -21,13 +21,40 @@ pub enum BoundStatement {
     NoOp,
 }
 
+/// Operand of a set operation (can be a select or another set operation)
+#[derive(Debug, Clone)]
+pub enum SetOperand {
+    /// A simple SELECT query
+    Select(BoundSelect),
+    /// A nested set operation
+    SetOperation(Box<BoundSetOperation>),
+}
+
+impl SetOperand {
+    /// Get output column types
+    pub fn output_types(&self) -> Vec<LogicalType> {
+        match self {
+            SetOperand::Select(sel) => sel.output_types(),
+            SetOperand::SetOperation(op) => op.left.output_types(),
+        }
+    }
+
+    /// Get output column names
+    pub fn output_names(&self) -> Vec<String> {
+        match self {
+            SetOperand::Select(sel) => sel.output_names(),
+            SetOperand::SetOperation(op) => op.left.output_names(),
+        }
+    }
+}
+
 /// Bound set operation (UNION, INTERSECT, EXCEPT)
 #[derive(Debug, Clone)]
 pub struct BoundSetOperation {
-    /// Left query
-    pub left: Box<BoundSelect>,
-    /// Right query
-    pub right: Box<BoundSelect>,
+    /// Left operand (query or nested set operation)
+    pub left: Box<SetOperand>,
+    /// Right operand (query or nested set operation)
+    pub right: Box<SetOperand>,
     /// Type of set operation
     pub set_op: SetOperationType,
     /// Whether to eliminate duplicates (true for UNION, false for UNION ALL)

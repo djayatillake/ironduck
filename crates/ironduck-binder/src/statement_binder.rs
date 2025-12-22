@@ -5,8 +5,8 @@ use super::{
     BoundCTE, BoundColumnDef, BoundCreateSchema, BoundCreateSequence, BoundCreateTable,
     BoundCreateView, BoundDelete, BoundDrop, BoundExpression, BoundInsert, BoundJoinType,
     BoundOrderBy, BoundRecursiveCTE, BoundSelect, BoundSetOperation, BoundStatement,
-    BoundTableRef, BoundUpdate, Binder, DistinctKind, DropObjectType, SetOperationType,
-    TableFunctionType,
+    BoundTableRef, BoundUpdate, Binder, DistinctKind, DropObjectType, SetOperand,
+    SetOperationType, TableFunctionType,
 };
 use ironduck_common::{Error, Result};
 use sqlparser::ast as sql;
@@ -107,9 +107,9 @@ fn bind_query(binder: &Binder, query: &sql::Query) -> Result<BoundStatement> {
     // Handle the body - check for set operations first
     match query.body.as_ref() {
         sql::SetExpr::SetOperation { op, set_quantifier, left, right } => {
-            // Recursively bind left and right sides
-            let left_select = bind_set_expr_with_ctes(binder, left, &ctes)?;
-            let right_select = bind_set_expr_with_ctes(binder, right, &ctes)?;
+            // Recursively bind left and right sides as operands (supports nesting)
+            let left_operand = bind_set_expr_to_operand(binder, left, &ctes)?;
+            let right_operand = bind_set_expr_to_operand(binder, right, &ctes)?;
 
             let set_op = match op {
                 sql::SetOperator::Union => SetOperationType::Union,
@@ -120,9 +120,14 @@ fn bind_query(binder: &Binder, query: &sql::Query) -> Result<BoundStatement> {
             let all = matches!(set_quantifier, sql::SetQuantifier::All);
 
             // Build order by, limit, offset
+            // For ORDER BY context, extract FROM clause from left operand
             let mut order_by = Vec::new();
             if let Some(ob) = &query.order_by {
-                let ctx = ExpressionBinderContext::new(&left_select.from);
+                let from_clause = match &left_operand {
+                    SetOperand::Select(sel) => &sel.from,
+                    SetOperand::SetOperation(_) => &Vec::new(),
+                };
+                let ctx = ExpressionBinderContext::new(from_clause);
                 for order in &ob.exprs {
                     let expr = bind_expression(binder, &order.expr, &ctx)?;
                     order_by.push(BoundOrderBy {
@@ -154,8 +159,8 @@ fn bind_query(binder: &Binder, query: &sql::Query) -> Result<BoundStatement> {
             };
 
             Ok(BoundStatement::SetOperation(BoundSetOperation {
-                left: Box::new(left_select),
-                right: Box::new(right_select),
+                left: Box::new(left_operand),
+                right: Box::new(right_operand),
                 set_op,
                 all,
                 order_by,
@@ -398,6 +403,7 @@ fn bind_set_expr(binder: &Binder, set_expr: &sql::SetExpr) -> Result<BoundSelect
 }
 
 /// Bind a set expression to a BoundSelect (with CTE support)
+/// Note: For nested set operations, use bind_set_expr_to_operand instead
 fn bind_set_expr_with_ctes(
     binder: &Binder,
     set_expr: &sql::SetExpr,
@@ -408,8 +414,62 @@ fn bind_set_expr_with_ctes(
         sql::SetExpr::Values(values) => bind_values(binder, values),
         sql::SetExpr::Query(query) => bind_query_select_with_ctes(binder, query, ctes),
         sql::SetExpr::SetOperation { .. } => {
-            // Nested set operations - for now, wrap in a query
-            Err(Error::NotImplemented("Nested set operations".to_string()))
+            // For nested set operations in contexts requiring BoundSelect,
+            // the caller should use bind_set_expr_to_operand instead
+            Err(Error::NotImplemented(
+                "Nested set operations in this context (use bind_set_expr_to_operand)".to_string(),
+            ))
+        }
+        _ => Err(Error::NotImplemented(format!("Set expression: {:?}", set_expr))),
+    }
+}
+
+/// Bind a set expression to a SetOperand (supports nested set operations)
+fn bind_set_expr_to_operand(
+    binder: &Binder,
+    set_expr: &sql::SetExpr,
+    ctes: &[BoundCTE],
+) -> Result<SetOperand> {
+    match set_expr {
+        sql::SetExpr::Select(select) => {
+            let bound = bind_select_with_ctes(binder, select, ctes)?;
+            Ok(SetOperand::Select(bound))
+        }
+        sql::SetExpr::Values(values) => {
+            let bound = bind_values(binder, values)?;
+            Ok(SetOperand::Select(bound))
+        }
+        sql::SetExpr::Query(query) => {
+            // If the query body is a set operation, handle it recursively
+            if let sql::SetExpr::SetOperation { .. } = query.body.as_ref() {
+                bind_set_expr_to_operand(binder, query.body.as_ref(), ctes)
+            } else {
+                let bound = bind_query_select_with_ctes(binder, query, ctes)?;
+                Ok(SetOperand::Select(bound))
+            }
+        }
+        sql::SetExpr::SetOperation { op, set_quantifier, left, right } => {
+            // Recursively bind left and right sides as operands
+            let left_operand = bind_set_expr_to_operand(binder, left, ctes)?;
+            let right_operand = bind_set_expr_to_operand(binder, right, ctes)?;
+
+            let set_op = match op {
+                sql::SetOperator::Union => SetOperationType::Union,
+                sql::SetOperator::Intersect => SetOperationType::Intersect,
+                sql::SetOperator::Except => SetOperationType::Except,
+            };
+
+            let all = matches!(set_quantifier, sql::SetQuantifier::All);
+
+            Ok(SetOperand::SetOperation(Box::new(BoundSetOperation {
+                left: Box::new(left_operand),
+                right: Box::new(right_operand),
+                set_op,
+                all,
+                order_by: Vec::new(),
+                limit: None,
+                offset: None,
+            })))
         }
         _ => Err(Error::NotImplemented(format!("Set expression: {:?}", set_expr))),
     }
@@ -1241,7 +1301,7 @@ fn bind_create_view(
     let bound_stmt = bind_query(binder, query)?;
     let column_names = match &bound_stmt {
         BoundStatement::Select(sel) => sel.select_list.iter().map(|e| e.name()).collect(),
-        BoundStatement::SetOperation(op) => op.left.select_list.iter().map(|e| e.name()).collect(),
+        BoundStatement::SetOperation(op) => op.left.output_names(),
         _ => return Err(Error::NotImplemented("View query must be SELECT".to_string())),
     };
 

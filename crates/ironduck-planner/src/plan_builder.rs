@@ -3,7 +3,7 @@
 use super::{LogicalOperator, LogicalPlan, SetOperationType};
 use ironduck_binder::{
     BoundCTE, BoundDelete, BoundExpression, BoundExpressionKind, BoundSelect, BoundSetOperation,
-    BoundStatement, BoundTableRef, BoundUpdate, DistinctKind,
+    BoundStatement, BoundTableRef, BoundUpdate, DistinctKind, SetOperand,
 };
 use ironduck_common::{Error, LogicalType, Result, Value};
 
@@ -148,10 +148,41 @@ pub fn build_plan(statement: &BoundStatement) -> Result<LogicalPlan> {
     }
 }
 
+/// Build a plan for a SetOperand (either a SELECT or a nested set operation)
+fn build_operand_plan(operand: &SetOperand) -> Result<LogicalPlan> {
+    match operand {
+        SetOperand::Select(select) => build_select_plan(select),
+        SetOperand::SetOperation(set_op) => build_set_operation_plan_inner(set_op),
+    }
+}
+
+/// Build a plan for a set operation (UNION, INTERSECT, EXCEPT) - inner helper
+fn build_set_operation_plan_inner(set_op: &BoundSetOperation) -> Result<LogicalPlan> {
+    let left_plan = build_operand_plan(&set_op.left)?;
+    let right_plan = build_operand_plan(&set_op.right)?;
+
+    let op = match set_op.set_op {
+        ironduck_binder::SetOperationType::Union => SetOperationType::Union,
+        ironduck_binder::SetOperationType::Intersect => SetOperationType::Intersect,
+        ironduck_binder::SetOperationType::Except => SetOperationType::Except,
+    };
+
+    let plan = LogicalOperator::SetOperation {
+        left: Box::new(left_plan.root),
+        right: Box::new(right_plan.root),
+        op,
+        all: set_op.all,
+    };
+
+    // Note: ORDER BY and LIMIT are only applied to the outermost set operation
+    // (handled in build_set_operation_plan), not to nested operations
+    Ok(LogicalPlan::new(plan, left_plan.output_names))
+}
+
 /// Build a plan for a set operation (UNION, INTERSECT, EXCEPT)
 fn build_set_operation_plan(set_op: &BoundSetOperation) -> Result<LogicalPlan> {
-    let left_plan = build_select_plan(&set_op.left)?;
-    let right_plan = build_select_plan(&set_op.right)?;
+    let left_plan = build_operand_plan(&set_op.left)?;
+    let right_plan = build_operand_plan(&set_op.right)?;
 
     let op = match set_op.set_op {
         ironduck_binder::SetOperationType::Union => SetOperationType::Union,
