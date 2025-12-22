@@ -721,6 +721,7 @@ fn collect_tables_from_ref(table_ref: &BoundTableRef) -> Vec<BoundTableRef> {
             tables
         }
         BoundTableRef::Subquery { .. } => vec![table_ref.clone()],
+        BoundTableRef::SetOperationSubquery { .. } => vec![table_ref.clone()],
         BoundTableRef::TableFunction { .. } => vec![table_ref.clone()],
         BoundTableRef::RecursiveCTERef { .. } => vec![table_ref.clone()],
         BoundTableRef::Empty => vec![],
@@ -1025,22 +1026,31 @@ fn bind_table_factor_with_ctes(
 
         sql::TableFactor::Derived { subquery, alias, .. } => {
             let bound_stmt = bind_query(binder, subquery)?;
-            let bound_select = match bound_stmt {
-                BoundStatement::Select(sel) => sel,
-                BoundStatement::SetOperation(_) => {
-                    return Err(Error::NotImplemented("Set operation in subquery".to_string()))
-                }
-                _ => return Err(Error::NotImplemented("Unsupported subquery type".to_string())),
-            };
             let alias_name = alias
                 .as_ref()
                 .map(|a| a.name.value.clone())
                 .unwrap_or_else(|| "subquery".to_string());
 
-            Ok(BoundTableRef::Subquery {
-                subquery: Box::new(bound_select),
-                alias: alias_name,
-            })
+            match bound_stmt {
+                BoundStatement::Select(sel) => {
+                    Ok(BoundTableRef::Subquery {
+                        subquery: Box::new(sel),
+                        alias: alias_name,
+                    })
+                }
+                BoundStatement::SetOperation(set_op) => {
+                    // Get column info from the left operand
+                    let column_names = set_op.left.output_names();
+                    let column_types = set_op.left.output_types();
+                    Ok(BoundTableRef::SetOperationSubquery {
+                        set_operation: Box::new(set_op),
+                        alias: alias_name,
+                        column_names,
+                        column_types,
+                    })
+                }
+                _ => Err(Error::NotImplemented("Unsupported subquery type".to_string())),
+            }
         }
 
         sql::TableFactor::Function { name, args, alias, .. } => {
@@ -1600,6 +1610,24 @@ fn expand_qualified_wildcard(
             *col_offset += column_names.len();
             matches
         }
+        BoundTableRef::SetOperationSubquery { alias, column_names, column_types, .. } => {
+            let matches = alias.eq_ignore_ascii_case(target_name);
+
+            if matches {
+                for (idx, (col_name, typ)) in column_names.iter().zip(column_types.iter()).enumerate() {
+                    select_list.push(BoundExpression::new(
+                        super::BoundExpressionKind::ColumnRef {
+                            table_idx,
+                            column_idx: *col_offset + idx,
+                            name: col_name.clone(),
+                        },
+                        typ.clone(),
+                    ));
+                }
+            }
+            *col_offset += column_names.len();
+            matches
+        }
         BoundTableRef::Empty => false,
     }
 }
@@ -1708,6 +1736,25 @@ fn expand_qualified_wildcard_with_skip(
         BoundTableRef::RecursiveCTERef { cte_name, alias, column_names, column_types } => {
             let matches = alias.eq_ignore_ascii_case(target_name)
                 || cte_name.eq_ignore_ascii_case(target_name);
+
+            for (idx, (col_name, typ)) in column_names.iter().zip(column_types.iter()).enumerate() {
+                let should_skip = skip_columns.iter().any(|sc| sc.eq_ignore_ascii_case(col_name));
+                if matches && !should_skip {
+                    select_list.push(BoundExpression::new(
+                        super::BoundExpressionKind::ColumnRef {
+                            table_idx,
+                            column_idx: *col_offset + idx,
+                            name: col_name.clone(),
+                        },
+                        typ.clone(),
+                    ));
+                }
+            }
+            *col_offset += column_names.len();
+            matches
+        }
+        BoundTableRef::SetOperationSubquery { alias, column_names, column_types, .. } => {
+            let matches = alias.eq_ignore_ascii_case(target_name);
 
             for (idx, (col_name, typ)) in column_names.iter().zip(column_types.iter()).enumerate() {
                 let should_skip = skip_columns.iter().any(|sc| sc.eq_ignore_ascii_case(col_name));
@@ -1856,6 +1903,33 @@ fn expand_qualified_wildcard_with_options(
             *col_offset += column_names.len();
             matches
         }
+        BoundTableRef::SetOperationSubquery { alias, column_names, column_types, .. } => {
+            let matches = alias.eq_ignore_ascii_case(target_name);
+
+            if matches {
+                for (idx, (col_name, typ)) in column_names.iter().zip(column_types.iter()).enumerate() {
+                    let should_exclude = exclude_columns.iter().any(|ec| ec.eq_ignore_ascii_case(col_name));
+                    if !should_exclude {
+                        if let Some(replacement) = replace_map.get(&col_name.to_uppercase()) {
+                            let mut replaced = replacement.clone();
+                            replaced.alias = Some(col_name.clone());
+                            select_list.push(replaced);
+                        } else {
+                            select_list.push(BoundExpression::new(
+                                super::BoundExpressionKind::ColumnRef {
+                                    table_idx,
+                                    column_idx: *col_offset + idx,
+                                    name: col_name.clone(),
+                                },
+                                typ.clone(),
+                            ));
+                        }
+                    }
+                }
+            }
+            *col_offset += column_names.len();
+            matches
+        }
         BoundTableRef::Empty => false,
     }
 }
@@ -1868,6 +1942,9 @@ fn matches_table_name(table_ref: &BoundTableRef, name: &str) -> bool {
                 || table_name.eq_ignore_ascii_case(name)
         }
         BoundTableRef::Subquery { alias, .. } => {
+            alias.eq_ignore_ascii_case(name)
+        }
+        BoundTableRef::SetOperationSubquery { alias, .. } => {
             alias.eq_ignore_ascii_case(name)
         }
         BoundTableRef::Join { left, right, .. } => {
@@ -2019,6 +2096,28 @@ fn expand_wildcard_with_options(
             }
             *col_offset += column_names.len();
         }
+        BoundTableRef::SetOperationSubquery { column_names, column_types, .. } => {
+            for (idx, (name, typ)) in column_names.iter().zip(column_types.iter()).enumerate() {
+                let should_exclude = exclude_columns.iter().any(|ec| ec.eq_ignore_ascii_case(name));
+                if !should_exclude {
+                    if let Some(replacement) = replace_map.get(&name.to_uppercase()) {
+                        let mut replaced = replacement.clone();
+                        replaced.alias = Some(name.clone());
+                        select_list.push(replaced);
+                    } else {
+                        select_list.push(BoundExpression::new(
+                            super::BoundExpressionKind::ColumnRef {
+                                table_idx,
+                                column_idx: *col_offset + idx,
+                                name: name.clone(),
+                            },
+                            typ.clone(),
+                        ));
+                    }
+                }
+            }
+            *col_offset += column_names.len();
+        }
         BoundTableRef::Empty => {}
     }
 }
@@ -2112,6 +2211,24 @@ fn expand_wildcard_rec_with_skip(
             }
             *col_offset += local_col_idx;
         }
+        BoundTableRef::SetOperationSubquery { column_names, column_types, .. } => {
+            let mut local_col_idx = 0;
+            for (name, typ) in column_names.iter().zip(column_types.iter()) {
+                let should_skip = skip_columns.iter().any(|sc| sc.eq_ignore_ascii_case(name));
+                if !should_skip {
+                    select_list.push(BoundExpression::new(
+                        super::BoundExpressionKind::ColumnRef {
+                            table_idx,
+                            column_idx: *col_offset + local_col_idx,
+                            name: name.clone(),
+                        },
+                        typ.clone(),
+                    ));
+                    local_col_idx += 1;
+                }
+            }
+            *col_offset += local_col_idx;
+        }
         BoundTableRef::Empty => {}
     }
 }
@@ -2185,6 +2302,7 @@ fn get_table_ref_columns(table_ref: &BoundTableRef) -> Vec<String> {
         BoundTableRef::Subquery { subquery, .. } => {
             subquery.select_list.iter().map(|e| e.name()).collect()
         }
+        BoundTableRef::SetOperationSubquery { column_names, .. } => column_names.clone(),
         BoundTableRef::Join { left, right, .. } => {
             let mut cols = get_table_ref_columns(left);
             cols.extend(get_table_ref_columns(right));

@@ -678,6 +678,12 @@ fn build_table_ref_plan(table_ref: &BoundTableRef) -> Result<LogicalOperator> {
             column_names: column_names.clone(),
             output_types: column_types.clone(),
         }),
+
+        BoundTableRef::SetOperationSubquery { set_operation, .. } => {
+            // Build the set operation plan
+            let plan = build_set_operation_plan(set_operation)?;
+            Ok(plan.root)
+        }
     }
 }
 

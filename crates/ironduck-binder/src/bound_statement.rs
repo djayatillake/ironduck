@@ -158,6 +158,15 @@ pub enum BoundTableRef {
         subquery: Box<BoundSelect>,
         alias: String,
     },
+    /// Set operation subquery (e.g., (SELECT ... UNION SELECT ...) AS alias)
+    SetOperationSubquery {
+        set_operation: Box<BoundSetOperation>,
+        alias: String,
+        /// Column names from the set operation
+        column_names: Vec<String>,
+        /// Column types from the set operation
+        column_types: Vec<LogicalType>,
+    },
     /// Join
     Join {
         left: Box<BoundTableRef>,

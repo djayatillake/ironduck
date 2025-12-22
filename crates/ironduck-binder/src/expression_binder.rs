@@ -699,6 +699,9 @@ fn collect_base_tables_rec(table_ref: &BoundTableRef, result: &mut Vec<(String, 
         BoundTableRef::RecursiveCTERef { cte_name, alias, column_names, column_types } => {
             result.push((cte_name.clone(), Some(alias.clone()), column_names.clone(), column_types.clone()));
         }
+        BoundTableRef::SetOperationSubquery { alias, column_names, column_types, .. } => {
+            result.push((alias.clone(), Some(alias.clone()), column_names.clone(), column_types.clone()));
+        }
         BoundTableRef::Empty => {}
     }
 }
