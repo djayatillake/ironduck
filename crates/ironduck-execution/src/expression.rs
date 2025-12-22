@@ -398,11 +398,11 @@ fn evaluate_unary_op(op: UnaryOperator, val: &Value) -> Result<Value> {
 fn evaluate_function(name: &str, args: &[Value]) -> Result<Value> {
     match name.to_uppercase().as_str() {
         // String functions
-        "LOWER" => {
+        "LOWER" | "LCASE" => {
             let s = args.first().and_then(|v| v.as_str()).unwrap_or("");
             Ok(Value::Varchar(s.to_lowercase()))
         }
-        "UPPER" => {
+        "UPPER" | "UCASE" => {
             let s = args.first().and_then(|v| v.as_str()).unwrap_or("");
             Ok(Value::Varchar(s.to_uppercase()))
         }
@@ -472,7 +472,7 @@ fn evaluate_function(name: &str, args: &[Value]) -> Result<Value> {
             let start = chars.len().saturating_sub(n);
             Ok(Value::Varchar(chars.into_iter().skip(start).collect()))
         }
-        "ASCII" => {
+        "ASCII" | "ORD" => {
             // Return the ASCII code of the first character
             let s = args.first().and_then(|v| v.as_str()).unwrap_or("");
             if s.is_empty() {
@@ -494,6 +494,56 @@ fn evaluate_function(name: &str, args: &[Value]) -> Result<Value> {
                 }
                 None => Ok(Value::Null),
             }
+        }
+        "UNICODE" => {
+            // Return Unicode code point of first character
+            let s = args.first().and_then(|v| v.as_str()).unwrap_or("");
+            if s.is_empty() {
+                Ok(Value::Null)
+            } else {
+                Ok(Value::Integer(s.chars().next().unwrap() as i32))
+            }
+        }
+        "STRIP_ACCENTS" => {
+            // Remove accents from characters (simplified version)
+            let s = args.first().and_then(|v| v.as_str()).unwrap_or("");
+            let result: String = s.chars().map(|c| {
+                match c {
+                    'á' | 'à' | 'â' | 'ä' | 'ã' | 'å' => 'a',
+                    'é' | 'è' | 'ê' | 'ë' => 'e',
+                    'í' | 'ì' | 'î' | 'ï' => 'i',
+                    'ó' | 'ò' | 'ô' | 'ö' | 'õ' => 'o',
+                    'ú' | 'ù' | 'û' | 'ü' => 'u',
+                    'ñ' => 'n',
+                    'ç' => 'c',
+                    'Á' | 'À' | 'Â' | 'Ä' | 'Ã' | 'Å' => 'A',
+                    'É' | 'È' | 'Ê' | 'Ë' => 'E',
+                    'Í' | 'Ì' | 'Î' | 'Ï' => 'I',
+                    'Ó' | 'Ò' | 'Ô' | 'Ö' | 'Õ' => 'O',
+                    'Ú' | 'Ù' | 'Û' | 'Ü' => 'U',
+                    'Ñ' => 'N',
+                    'Ç' => 'C',
+                    _ => c,
+                }
+            }).collect();
+            Ok(Value::Varchar(result))
+        }
+        "BAR" => {
+            // Create a bar chart string (like DuckDB's bar function)
+            // bar(value, min, max, width) -> string of █ characters
+            let value = args.first().and_then(|v| v.as_f64()).unwrap_or(0.0);
+            let min = args.get(1).and_then(|v| v.as_f64()).unwrap_or(0.0);
+            let max = args.get(2).and_then(|v| v.as_f64()).unwrap_or(100.0);
+            let width = args.get(3).and_then(|v| v.as_i64()).unwrap_or(80) as usize;
+
+            if max <= min {
+                return Ok(Value::Varchar(String::new()));
+            }
+
+            let ratio = ((value - min) / (max - min)).clamp(0.0, 1.0);
+            let filled = (ratio * width as f64).round() as usize;
+            let bar: String = "█".repeat(filled);
+            Ok(Value::Varchar(bar))
         }
         "REVERSE" => {
             let s = args.first().and_then(|v| v.as_str()).unwrap_or("");
@@ -575,12 +625,12 @@ fn evaluate_function(name: &str, args: &[Value]) -> Result<Value> {
                 .join(" ");
             Ok(Value::Varchar(result))
         }
-        "STARTS_WITH" => {
+        "STARTS_WITH" | "PREFIX" => {
             let s = args.first().and_then(|v| v.as_str()).unwrap_or("");
             let prefix = args.get(1).and_then(|v| v.as_str()).unwrap_or("");
             Ok(Value::Boolean(s.starts_with(prefix)))
         }
-        "ENDS_WITH" => {
+        "ENDS_WITH" | "SUFFIX" => {
             let s = args.first().and_then(|v| v.as_str()).unwrap_or("");
             let suffix = args.get(1).and_then(|v| v.as_str()).unwrap_or("");
             Ok(Value::Boolean(s.ends_with(suffix)))
@@ -951,6 +1001,166 @@ fn evaluate_function(name: &str, args: &[Value]) -> Result<Value> {
             }
         }
 
+        // Map functions
+        "MAP" | "MAP_FROM_ENTRIES" => {
+            // Create a map from key-value pairs
+            // MAP([key1, key2, ...], [value1, value2, ...]) or
+            // MAP_FROM_ENTRIES([[key1, value1], [key2, value2], ...])
+            match args {
+                [Value::List(keys), Value::List(values)] => {
+                    // MAP(keys, values) form
+                    let pairs: Vec<(Value, Value)> = keys.iter()
+                        .zip(values.iter())
+                        .map(|(k, v)| (k.clone(), v.clone()))
+                        .collect();
+                    Ok(Value::Map(pairs))
+                }
+                [Value::List(entries)] => {
+                    // MAP_FROM_ENTRIES form: list of [key, value] pairs
+                    let pairs: Vec<(Value, Value)> = entries.iter()
+                        .filter_map(|e| {
+                            if let Value::List(pair) = e {
+                                if pair.len() >= 2 {
+                                    return Some((pair[0].clone(), pair[1].clone()));
+                                }
+                            }
+                            None
+                        })
+                        .collect();
+                    Ok(Value::Map(pairs))
+                }
+                _ => Ok(Value::Map(vec![])),
+            }
+        }
+        "MAP_KEYS" => {
+            // Extract keys from a map as a list
+            match args.first() {
+                Some(Value::Map(pairs)) => {
+                    let keys: Vec<Value> = pairs.iter().map(|(k, _)| k.clone()).collect();
+                    Ok(Value::List(keys))
+                }
+                Some(Value::Null) => Ok(Value::Null),
+                _ => Ok(Value::List(vec![])),
+            }
+        }
+        "MAP_VALUES" => {
+            // Extract values from a map as a list
+            match args.first() {
+                Some(Value::Map(pairs)) => {
+                    let values: Vec<Value> = pairs.iter().map(|(_, v)| v.clone()).collect();
+                    Ok(Value::List(values))
+                }
+                Some(Value::Null) => Ok(Value::Null),
+                _ => Ok(Value::List(vec![])),
+            }
+        }
+        "MAP_ENTRIES" => {
+            // Convert map to list of [key, value] pairs
+            match args.first() {
+                Some(Value::Map(pairs)) => {
+                    let entries: Vec<Value> = pairs.iter()
+                        .map(|(k, v)| Value::List(vec![k.clone(), v.clone()]))
+                        .collect();
+                    Ok(Value::List(entries))
+                }
+                Some(Value::Null) => Ok(Value::Null),
+                _ => Ok(Value::List(vec![])),
+            }
+        }
+        "MAP_CONTAINS" | "MAP_HAS" => {
+            // Check if map contains a key
+            match (args.first(), args.get(1)) {
+                (Some(Value::Map(pairs)), Some(key)) => {
+                    let found = pairs.iter().any(|(k, _)| k == key);
+                    Ok(Value::Boolean(found))
+                }
+                (Some(Value::Null), _) | (_, Some(Value::Null)) => Ok(Value::Null),
+                _ => Ok(Value::Boolean(false)),
+            }
+        }
+        "MAP_EXTRACT" | "ELEMENT_AT" => {
+            // Extract value from map by key
+            match (args.first(), args.get(1)) {
+                (Some(Value::Map(pairs)), Some(key)) => {
+                    let value = pairs.iter()
+                        .find(|(k, _)| k == key)
+                        .map(|(_, v)| v.clone())
+                        .unwrap_or(Value::Null);
+                    Ok(value)
+                }
+                _ => Ok(Value::Null),
+            }
+        }
+        "CARDINALITY" => {
+            // Return number of elements in map or list
+            match args.first() {
+                Some(Value::Map(pairs)) => Ok(Value::BigInt(pairs.len() as i64)),
+                Some(Value::List(list)) => Ok(Value::BigInt(list.len() as i64)),
+                Some(Value::Null) => Ok(Value::Null),
+                _ => Ok(Value::BigInt(0)),
+            }
+        }
+
+        // Struct functions
+        "STRUCT" | "ROW" => {
+            // Create a struct from values
+            // STRUCT(val1, val2, ...) - creates an unnamed struct
+            let fields: Vec<(String, Value)> = args.iter().enumerate()
+                .map(|(i, v)| (format!("v{}", i + 1), v.clone()))
+                .collect();
+            Ok(Value::Struct(fields))
+        }
+        "STRUCT_PACK" => {
+            // Create a struct with named fields
+            // Called like STRUCT_PACK(a := 1, b := 2) which we receive as alternating name, value
+            let mut fields = Vec::new();
+            let mut i = 0;
+            while i + 1 < args.len() {
+                if let Value::Varchar(name) = &args[i] {
+                    fields.push((name.clone(), args[i + 1].clone()));
+                }
+                i += 2;
+            }
+            Ok(Value::Struct(fields))
+        }
+        "STRUCT_EXTRACT" => {
+            // Extract a field from a struct by name
+            match (args.first(), args.get(1)) {
+                (Some(Value::Struct(fields)), Some(Value::Varchar(name))) => {
+                    let value = fields.iter()
+                        .find(|(n, _)| n == name)
+                        .map(|(_, v)| v.clone())
+                        .unwrap_or(Value::Null);
+                    Ok(value)
+                }
+                _ => Ok(Value::Null),
+            }
+        }
+        "STRUCT_KEYS" => {
+            // Get field names from a struct
+            match args.first() {
+                Some(Value::Struct(fields)) => {
+                    let keys: Vec<Value> = fields.iter()
+                        .map(|(k, _)| Value::Varchar(k.clone()))
+                        .collect();
+                    Ok(Value::List(keys))
+                }
+                _ => Ok(Value::List(vec![])),
+            }
+        }
+        "STRUCT_VALUES" => {
+            // Get field values from a struct
+            match args.first() {
+                Some(Value::Struct(fields)) => {
+                    let values: Vec<Value> = fields.iter()
+                        .map(|(_, v)| v.clone())
+                        .collect();
+                    Ok(Value::List(values))
+                }
+                _ => Ok(Value::List(vec![])),
+            }
+        }
+
         // Numeric functions
         "ABS" => {
             let val = args.first().unwrap_or(&Value::Null);
@@ -1190,6 +1400,93 @@ fn evaluate_function(name: &str, args: &[Value]) -> Result<Value> {
                 Ok(Value::BigInt(result))
             }
         }
+        "EVEN" => {
+            // Round to nearest even number
+            let val = args.first().and_then(|v| v.as_f64()).unwrap_or(0.0);
+            let ceil = val.ceil();
+            let result = if ceil as i64 % 2 == 0 {
+                ceil
+            } else if val >= 0.0 {
+                ceil + 1.0
+            } else {
+                ceil - 1.0
+            };
+            Ok(Value::Double(result))
+        }
+        "ODD" => {
+            // Round to nearest odd number
+            let val = args.first().and_then(|v| v.as_f64()).unwrap_or(0.0);
+            let ceil = val.ceil();
+            let result = if ceil as i64 % 2 != 0 {
+                ceil
+            } else if val >= 0.0 {
+                ceil + 1.0
+            } else {
+                ceil - 1.0
+            };
+            Ok(Value::Double(result))
+        }
+        "DIV" => {
+            // Integer division
+            let a = args.first().and_then(|v| v.as_i64()).unwrap_or(0);
+            let b = args.get(1).and_then(|v| v.as_i64()).unwrap_or(1);
+            if b == 0 {
+                Ok(Value::Null)
+            } else {
+                Ok(Value::BigInt(a / b))
+            }
+        }
+        "ISNAN" => {
+            let val = args.first().and_then(|v| v.as_f64());
+            match val {
+                Some(f) => Ok(Value::Boolean(f.is_nan())),
+                None => Ok(Value::Null),
+            }
+        }
+        "ISINF" => {
+            let val = args.first().and_then(|v| v.as_f64());
+            match val {
+                Some(f) => Ok(Value::Boolean(f.is_infinite())),
+                None => Ok(Value::Null),
+            }
+        }
+        "ISFINITE" => {
+            let val = args.first().and_then(|v| v.as_f64());
+            match val {
+                Some(f) => Ok(Value::Boolean(f.is_finite())),
+                None => Ok(Value::Null),
+            }
+        }
+        "GAMMA" | "LGAMMA" => {
+            // Log gamma function (approximation using Stirling's formula)
+            let val = args.first().and_then(|v| v.as_f64()).unwrap_or(0.0);
+            if val <= 0.0 {
+                Ok(Value::Null)
+            } else {
+                // Using Stirling's approximation for log(Gamma(x))
+                let result = (val - 0.5) * val.ln() - val + 0.5 * (2.0 * std::f64::consts::PI).ln()
+                    + 1.0 / (12.0 * val);
+                Ok(Value::Double(result))
+            }
+        }
+        "NEXTAFTER" => {
+            // Return the next representable floating-point value after x towards y
+            let x = args.first().and_then(|v| v.as_f64()).unwrap_or(0.0);
+            let y = args.get(1).and_then(|v| v.as_f64()).unwrap_or(1.0);
+            if x == y {
+                Ok(Value::Double(y))
+            } else if y > x {
+                // Get next higher value
+                let bits = x.to_bits();
+                let next_bits = if x >= 0.0 { bits + 1 } else { bits - 1 };
+                Ok(Value::Double(f64::from_bits(next_bits)))
+            } else {
+                // Get next lower value
+                let bits = x.to_bits();
+                let next_bits = if x > 0.0 { bits - 1 } else { bits + 1 };
+                Ok(Value::Double(f64::from_bits(next_bits)))
+            }
+        }
 
         // UUID functions
         "GEN_RANDOM_UUID" | "UUID" => {
@@ -1221,7 +1518,7 @@ fn evaluate_function(name: &str, args: &[Value]) -> Result<Value> {
         }
 
         // Format function
-        "FORMAT" | "PRINTF" => {
+        "FORMAT" | "PRINTF" | "SPRINTF" => {
             // Simple format - just return the first string with replacements
             let template = args.first().and_then(|v| v.as_str()).unwrap_or("");
             let mut arg_idx = 1;
@@ -2000,6 +2297,89 @@ fn evaluate_function(name: &str, args: &[Value]) -> Result<Value> {
                     }
                 }
                 Some(Value::Null) => Ok(Value::Null),
+                _ => Ok(Value::Null),
+            }
+        }
+        "DAYNAME" => {
+            use chrono::Datelike;
+            let weekday = match args.first() {
+                Some(Value::Date(d)) => Some(d.weekday()),
+                Some(Value::Timestamp(dt)) => Some(dt.weekday()),
+                _ => None,
+            };
+            match weekday {
+                Some(chrono::Weekday::Mon) => Ok(Value::Varchar("Monday".to_string())),
+                Some(chrono::Weekday::Tue) => Ok(Value::Varchar("Tuesday".to_string())),
+                Some(chrono::Weekday::Wed) => Ok(Value::Varchar("Wednesday".to_string())),
+                Some(chrono::Weekday::Thu) => Ok(Value::Varchar("Thursday".to_string())),
+                Some(chrono::Weekday::Fri) => Ok(Value::Varchar("Friday".to_string())),
+                Some(chrono::Weekday::Sat) => Ok(Value::Varchar("Saturday".to_string())),
+                Some(chrono::Weekday::Sun) => Ok(Value::Varchar("Sunday".to_string())),
+                None => Ok(Value::Null),
+            }
+        }
+        "MONTHNAME" => {
+            use chrono::Datelike;
+            let month = match args.first() {
+                Some(Value::Date(d)) => Some(d.month()),
+                Some(Value::Timestamp(dt)) => Some(dt.month()),
+                _ => None,
+            };
+            let name = match month {
+                Some(1) => "January",
+                Some(2) => "February",
+                Some(3) => "March",
+                Some(4) => "April",
+                Some(5) => "May",
+                Some(6) => "June",
+                Some(7) => "July",
+                Some(8) => "August",
+                Some(9) => "September",
+                Some(10) => "October",
+                Some(11) => "November",
+                Some(12) => "December",
+                _ => return Ok(Value::Null),
+            };
+            Ok(Value::Varchar(name.to_string()))
+        }
+        "DAYOFWEEK" | "WEEKDAY" => {
+            use chrono::Datelike;
+            match args.first() {
+                Some(Value::Date(d)) => Ok(Value::Integer(d.weekday().num_days_from_sunday() as i32)),
+                Some(Value::Timestamp(dt)) => Ok(Value::Integer(dt.weekday().num_days_from_sunday() as i32)),
+                _ => Ok(Value::Null),
+            }
+        }
+        "DAYOFYEAR" | "DOY" => {
+            use chrono::Datelike;
+            match args.first() {
+                Some(Value::Date(d)) => Ok(Value::Integer(d.ordinal() as i32)),
+                Some(Value::Timestamp(dt)) => Ok(Value::Integer(dt.ordinal() as i32)),
+                _ => Ok(Value::Null),
+            }
+        }
+        "WEEKOFYEAR" | "WEEK" => {
+            use chrono::Datelike;
+            match args.first() {
+                Some(Value::Date(d)) => Ok(Value::Integer(d.iso_week().week() as i32)),
+                Some(Value::Timestamp(dt)) => Ok(Value::Integer(dt.iso_week().week() as i32)),
+                _ => Ok(Value::Null),
+            }
+        }
+        "QUARTER" => {
+            use chrono::Datelike;
+            match args.first() {
+                Some(Value::Date(d)) => Ok(Value::Integer(((d.month() - 1) / 3 + 1) as i32)),
+                Some(Value::Timestamp(dt)) => Ok(Value::Integer(((dt.month() - 1) / 3 + 1) as i32)),
+                _ => Ok(Value::Null),
+            }
+        }
+        "ISODOW" => {
+            // ISO day of week (Monday = 1, Sunday = 7)
+            use chrono::Datelike;
+            match args.first() {
+                Some(Value::Date(d)) => Ok(Value::Integer(d.weekday().num_days_from_monday() as i32 + 1)),
+                Some(Value::Timestamp(dt)) => Ok(Value::Integer(dt.weekday().num_days_from_monday() as i32 + 1)),
                 _ => Ok(Value::Null),
             }
         }
