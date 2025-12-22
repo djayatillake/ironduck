@@ -881,6 +881,24 @@ fn bind_function(
         "REGR_SXX" => (true, LogicalType::Double),
         "REGR_SYY" => (true, LogicalType::Double),
         "REGR_SXY" => (true, LogicalType::Double),
+        // Additional aggregate functions
+        "ANY_VALUE" | "ARBITRARY" => {
+            let arg_type = args.first().map(|a| a.return_type.clone()).unwrap_or(LogicalType::Unknown);
+            (true, arg_type)
+        }
+        "FSUM" | "KAHAN_SUM" => (true, LogicalType::Double),
+        "QUANTILE" | "APPROX_QUANTILE" => (true, LogicalType::Double),
+        "COUNT_IF" | "COUNTIF" => (true, LogicalType::BigInt),
+        "SUM_IF" | "SUMIF" => (true, LogicalType::BigInt),
+        "AVG_IF" | "AVGIF" => (true, LogicalType::Double),
+        "MIN_IF" | "MINIF" => {
+            let arg_type = args.first().map(|a| a.return_type.clone()).unwrap_or(LogicalType::Unknown);
+            (true, arg_type)
+        }
+        "MAX_IF" | "MAXIF" => {
+            let arg_type = args.first().map(|a| a.return_type.clone()).unwrap_or(LogicalType::Unknown);
+            (true, arg_type)
+        }
 
         // Scalar functions
         "LOWER" | "UPPER" | "TRIM" | "LTRIM" | "RTRIM" => (false, LogicalType::Varchar),

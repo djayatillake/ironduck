@@ -2542,6 +2542,99 @@ fn evaluate_function(name: &str, args: &[Value]) -> Result<Value> {
                 _ => Ok(Value::Null),
             }
         }
+        "EPOCH_US" => {
+            // Return epoch in microseconds
+            match args.first() {
+                Some(Value::Timestamp(dt)) => {
+                    let epoch_us = dt.and_utc().timestamp_micros();
+                    Ok(Value::BigInt(epoch_us))
+                }
+                Some(Value::Date(d)) => {
+                    let epoch_us = d.and_hms_opt(0, 0, 0).unwrap().and_utc().timestamp_micros();
+                    Ok(Value::BigInt(epoch_us))
+                }
+                Some(Value::Null) => Ok(Value::Null),
+                _ => Ok(Value::Null),
+            }
+        }
+        "EPOCH_NS" => {
+            // Return epoch in nanoseconds
+            match args.first() {
+                Some(Value::Timestamp(dt)) => {
+                    if let Some(epoch_ns) = dt.and_utc().timestamp_nanos_opt() {
+                        Ok(Value::BigInt(epoch_ns))
+                    } else {
+                        Ok(Value::Null) // Overflow
+                    }
+                }
+                Some(Value::Date(d)) => {
+                    if let Some(epoch_ns) = d.and_hms_opt(0, 0, 0).unwrap().and_utc().timestamp_nanos_opt() {
+                        Ok(Value::BigInt(epoch_ns))
+                    } else {
+                        Ok(Value::Null)
+                    }
+                }
+                Some(Value::Null) => Ok(Value::Null),
+                _ => Ok(Value::Null),
+            }
+        }
+        "TIME_BUCKET" => {
+            // TIME_BUCKET(bucket_width, timestamp) - truncate timestamp to bucket
+            use chrono::{Duration, Datelike, Timelike, NaiveDateTime};
+
+            let bucket_width = args.first();
+            let timestamp = args.get(1);
+
+            match (bucket_width, timestamp) {
+                (Some(Value::Interval(interval)), Some(Value::Timestamp(ts))) => {
+                    // Calculate bucket width in microseconds
+                    let bucket_micros = interval.micros
+                        + (interval.days as i64 * 24 * 60 * 60 * 1_000_000)
+                        + (interval.months as i64 * 30 * 24 * 60 * 60 * 1_000_000);
+
+                    if bucket_micros <= 0 {
+                        return Err(Error::Execution("TIME_BUCKET: bucket width must be positive".to_string()));
+                    }
+
+                    // Get timestamp as microseconds since epoch
+                    let ts_micros = ts.and_utc().timestamp_micros();
+
+                    // Truncate to bucket
+                    let bucket_start = (ts_micros / bucket_micros) * bucket_micros;
+
+                    // Convert back to timestamp
+                    let secs = bucket_start / 1_000_000;
+                    let nsecs = ((bucket_start % 1_000_000) * 1000) as u32;
+                    match chrono::DateTime::from_timestamp(secs, nsecs) {
+                        Some(dt) => Ok(Value::Timestamp(dt.naive_utc())),
+                        None => Ok(Value::Null),
+                    }
+                }
+                (Some(Value::Interval(interval)), Some(Value::Date(d))) => {
+                    // For dates, convert to timestamp at midnight
+                    let ts = d.and_hms_opt(0, 0, 0).unwrap();
+                    let bucket_micros = interval.micros
+                        + (interval.days as i64 * 24 * 60 * 60 * 1_000_000)
+                        + (interval.months as i64 * 30 * 24 * 60 * 60 * 1_000_000);
+
+                    if bucket_micros <= 0 {
+                        return Err(Error::Execution("TIME_BUCKET: bucket width must be positive".to_string()));
+                    }
+
+                    let ts_micros = ts.and_utc().timestamp_micros();
+                    let bucket_start = (ts_micros / bucket_micros) * bucket_micros;
+
+                    let secs = bucket_start / 1_000_000;
+                    let nsecs = ((bucket_start % 1_000_000) * 1000) as u32;
+                    match chrono::DateTime::from_timestamp(secs, nsecs) {
+                        Some(dt) => Ok(Value::Timestamp(dt.naive_utc())),
+                        None => Ok(Value::Null),
+                    }
+                }
+                (Some(Value::Null), _) | (_, Some(Value::Null)) => Ok(Value::Null),
+                _ => Ok(Value::Null),
+            }
+        }
         "TO_DATE" => {
             match args.first() {
                 Some(Value::Varchar(s)) => {

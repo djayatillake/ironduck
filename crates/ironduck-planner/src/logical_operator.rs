@@ -193,6 +193,15 @@ pub enum TableFunctionKind {
         stop: Expression,
         step: Expression,
     },
+    /// unnest(array) - expands an array into rows
+    Unnest {
+        array_expr: Expression,
+    },
+    /// generate_subscripts(array, dim) - generates subscripts for an array
+    GenerateSubscripts {
+        array_expr: Expression,
+        dim: i32,
+    },
 }
 
 /// Type of set operation
@@ -414,6 +423,15 @@ impl AggregateExpression {
                 | AggregateFunction::RegrAvgY | AggregateFunction::RegrSXX
                 | AggregateFunction::RegrSYY | AggregateFunction::RegrSXY => LogicalType::Double,
             AggregateFunction::RegrCount => LogicalType::BigInt,
+            // Additional aggregate functions
+            AggregateFunction::AnyValue | AggregateFunction::Arbitrary => LogicalType::Unknown,
+            AggregateFunction::ListAgg | AggregateFunction::GroupConcat => LogicalType::Varchar,
+            AggregateFunction::FSum => LogicalType::Double,
+            AggregateFunction::Quantile | AggregateFunction::ApproxQuantile => LogicalType::Double,
+            AggregateFunction::CountIf => LogicalType::BigInt,
+            AggregateFunction::SumIf => LogicalType::BigInt,
+            AggregateFunction::AvgIf => LogicalType::Double,
+            AggregateFunction::MinIf | AggregateFunction::MaxIf => LogicalType::Unknown,
         }
     }
 }
@@ -463,6 +481,19 @@ pub enum AggregateFunction {
     RegrSXX,       // Sum of squares of X
     RegrSYY,       // Sum of squares of Y
     RegrSXY,       // Sum of products of X and Y
+    // Additional aggregate functions
+    AnyValue,      // Returns any non-null value from the group
+    Arbitrary,     // Alias for AnyValue
+    ListAgg,       // List aggregation with separator
+    FSum,          // Exact sum using Kahan summation
+    Quantile,      // Quantile (alias for percentile)
+    ApproxQuantile, // Approximate quantile
+    GroupConcat,   // MySQL-style group concatenation
+    CountIf,       // Count with condition
+    SumIf,         // Sum with condition
+    AvgIf,         // Avg with condition
+    MinIf,         // Min with condition
+    MaxIf,         // Max with condition
 }
 
 #[derive(Debug, Clone)]

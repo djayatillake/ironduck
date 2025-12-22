@@ -549,6 +549,32 @@ fn build_table_ref_plan(table_ref: &BoundTableRef) -> Result<LogicalOperator> {
                         output_type: ironduck_common::LogicalType::BigInt,
                     })
                 }
+                ironduck_binder::TableFunctionType::Unnest { array_expr } => {
+                    let column_name = column_alias.clone().unwrap_or_else(|| "unnest".to_string());
+                    // Get element type from array expression
+                    let output_type = match &array_expr.return_type {
+                        ironduck_common::LogicalType::List(elem_type) => (**elem_type).clone(),
+                        _ => ironduck_common::LogicalType::Unknown,
+                    };
+                    Ok(LogicalOperator::TableFunction {
+                        function: super::TableFunctionKind::Unnest {
+                            array_expr: convert_expression(array_expr),
+                        },
+                        column_name,
+                        output_type,
+                    })
+                }
+                ironduck_binder::TableFunctionType::GenerateSubscripts { array_expr, dim } => {
+                    let column_name = column_alias.clone().unwrap_or_else(|| "generate_subscripts".to_string());
+                    Ok(LogicalOperator::TableFunction {
+                        function: super::TableFunctionKind::GenerateSubscripts {
+                            array_expr: convert_expression(array_expr),
+                            dim: *dim,
+                        },
+                        column_name,
+                        output_type: ironduck_common::LogicalType::BigInt,
+                    })
+                }
             }
         }
     }
@@ -971,6 +997,17 @@ fn extract_aggregate(expr: &BoundExpression) -> Option<super::AggregateExpressio
                 "REGR_SXX" => super::AggregateFunction::RegrSXX,
                 "REGR_SYY" => super::AggregateFunction::RegrSYY,
                 "REGR_SXY" => super::AggregateFunction::RegrSXY,
+                // Additional aggregate functions
+                "ANY_VALUE" | "ARBITRARY" => super::AggregateFunction::AnyValue,
+                "LISTAGG" => super::AggregateFunction::ListAgg,
+                "FSUM" | "KAHAN_SUM" => super::AggregateFunction::FSum,
+                "QUANTILE" => super::AggregateFunction::Quantile,
+                "APPROX_QUANTILE" => super::AggregateFunction::ApproxQuantile,
+                "COUNT_IF" | "COUNTIF" => super::AggregateFunction::CountIf,
+                "SUM_IF" | "SUMIF" => super::AggregateFunction::SumIf,
+                "AVG_IF" | "AVGIF" => super::AggregateFunction::AvgIf,
+                "MIN_IF" | "MINIF" => super::AggregateFunction::MinIf,
+                "MAX_IF" | "MAXIF" => super::AggregateFunction::MaxIf,
                 _ => return None,
             };
 

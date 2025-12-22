@@ -4,8 +4,9 @@ use super::expression_binder::{bind_data_type, bind_expression, ExpressionBinder
 use super::{
     BoundCTE, BoundColumnDef, BoundCreateSchema, BoundCreateSequence, BoundCreateTable,
     BoundCreateView, BoundDelete, BoundDrop, BoundExpression, BoundInsert, BoundJoinType,
-    BoundOrderBy, BoundSelect, BoundSetOperation, BoundStatement, BoundTableRef, BoundUpdate,
-    Binder, DistinctKind, DropObjectType, SetOperationType, TableFunctionType,
+    BoundOrderBy, BoundRecursiveCTE, BoundSelect, BoundSetOperation, BoundStatement,
+    BoundTableRef, BoundUpdate, Binder, DistinctKind, DropObjectType, SetOperationType,
+    TableFunctionType,
 };
 use ironduck_common::{Error, Result};
 use sqlparser::ast as sql;
@@ -176,10 +177,6 @@ fn bind_ctes(binder: &Binder, with: &Option<sql::With>) -> Result<Vec<BoundCTE>>
         return Ok(Vec::new());
     };
 
-    if with_clause.recursive {
-        return Err(Error::NotImplemented("Recursive CTEs".to_string()));
-    }
-
     let mut ctes = Vec::new();
 
     for cte in &with_clause.cte_tables {
@@ -189,17 +186,212 @@ fn bind_ctes(binder: &Binder, with: &Option<sql::With>) -> Result<Vec<BoundCTE>>
         // Get column aliases if any
         let column_aliases: Vec<String> = cte.alias.columns.iter().map(|c| c.name.value.clone()).collect();
 
-        // Bind the CTE query - CTEs can reference earlier CTEs in the same WITH clause
-        let query = bind_query_select_with_ctes(binder, &cte.query, &ctes)?;
+        if with_clause.recursive {
+            // For recursive CTEs, the body should be a UNION/UNION ALL
+            // with a base case and a recursive case
+            let bound_cte = bind_recursive_cte(binder, &name, &column_aliases, &cte.query, &ctes)?;
+            ctes.push(bound_cte);
+        } else {
+            // Bind the CTE query - CTEs can reference earlier CTEs in the same WITH clause
+            let query = bind_query_select_with_ctes(binder, &cte.query, &ctes)?;
 
-        ctes.push(BoundCTE {
-            name,
-            column_aliases,
-            query,
-        });
+            ctes.push(BoundCTE {
+                name,
+                column_aliases,
+                query,
+                is_recursive: false,
+            });
+        }
     }
 
     Ok(ctes)
+}
+
+/// Bind a recursive CTE
+fn bind_recursive_cte(
+    binder: &Binder,
+    name: &str,
+    column_aliases: &[String],
+    query: &sql::Query,
+    prior_ctes: &[BoundCTE],
+) -> Result<BoundCTE> {
+    // For recursive CTEs, the body should be a UNION/UNION ALL
+    let (left, right, all) = match query.body.as_ref() {
+        sql::SetExpr::SetOperation {
+            op: sql::SetOperator::Union,
+            set_quantifier,
+            left,
+            right,
+        } => {
+            let is_all = matches!(set_quantifier, sql::SetQuantifier::All);
+            (left, right, is_all)
+        }
+        _ => {
+            // Not a UNION, might be a simple recursive (self-referential) CTE
+            // Try to bind it with the CTE already visible (for simple recursion)
+            // For now, just treat as non-recursive
+            let query = bind_query_select_with_ctes(binder, query, prior_ctes)?;
+            return Ok(BoundCTE {
+                name: name.to_string(),
+                column_aliases: column_aliases.to_vec(),
+                query,
+                is_recursive: false,
+            });
+        }
+    };
+
+    // Determine which side is the base case (doesn't reference the CTE)
+    // and which is the recursive case (references the CTE)
+    let left_references_cte = set_expr_references_cte(left, name);
+    let right_references_cte = set_expr_references_cte(right, name);
+
+    let (base_expr, recursive_expr, union_all) = match (left_references_cte, right_references_cte) {
+        (false, true) => (left, right, all),
+        (true, false) => (right, left, all),
+        (false, false) => {
+            // Neither side references the CTE - not actually recursive
+            // Just bind as a regular UNION
+            let left_select = bind_set_expr_with_ctes(binder, left, prior_ctes)?;
+            let right_select = bind_set_expr_with_ctes(binder, right, prior_ctes)?;
+
+            // Combine as a set operation
+            let combined = BoundSelect {
+                select_list: left_select.select_list.clone(),
+                from: vec![BoundTableRef::Subquery {
+                    subquery: Box::new(left_select),
+                    alias: "union_left".to_string(),
+                }],
+                where_clause: None,
+                group_by: Vec::new(),
+                having: None,
+                order_by: Vec::new(),
+                limit: None,
+                offset: None,
+                distinct: if all { DistinctKind::None } else { DistinctKind::All },
+            };
+
+            return Ok(BoundCTE {
+                name: name.to_string(),
+                column_aliases: column_aliases.to_vec(),
+                query: combined,
+                is_recursive: false,
+            });
+        }
+        (true, true) => {
+            return Err(Error::InvalidArguments(
+                "Both sides of recursive CTE UNION reference the CTE".to_string(),
+            ));
+        }
+    };
+
+    // First, bind the base case without the CTE in scope
+    let base_case = bind_set_expr_with_ctes(binder, base_expr, prior_ctes)?;
+
+    // Determine the output column types from the base case
+    let column_types: Vec<_> = base_case.select_list.iter()
+        .map(|e| e.return_type.clone())
+        .collect();
+
+    // Get column names (either from aliases or from base case)
+    let column_names: Vec<String> = if column_aliases.is_empty() {
+        base_case.select_list.iter().map(|e| e.name()).collect()
+    } else {
+        column_aliases.to_vec()
+    };
+
+    // Create a temporary BoundCTE to allow the recursive case to reference it
+    let temp_cte = BoundCTE {
+        name: name.to_string(),
+        column_aliases: column_names.clone(),
+        query: base_case.clone(),
+        is_recursive: true,
+    };
+
+    // Create extended CTE list including this recursive CTE
+    let mut extended_ctes = prior_ctes.to_vec();
+    extended_ctes.push(temp_cte);
+
+    // Now bind the recursive case with the CTE in scope
+    let recursive_case = bind_set_expr_with_ctes(binder, recursive_expr, &extended_ctes)?;
+
+    // Create a combined result that represents the recursive structure
+    // We'll use a special marker in the select list to indicate recursion
+    let combined = BoundSelect {
+        select_list: base_case.select_list.clone(),
+        from: vec![BoundTableRef::Subquery {
+            subquery: Box::new(base_case.clone()),
+            alias: format!("{}_base", name),
+        }],
+        where_clause: None,
+        group_by: Vec::new(),
+        having: None,
+        order_by: Vec::new(),
+        limit: None,
+        offset: None,
+        distinct: DistinctKind::None, // We handle UNION vs UNION ALL in execution
+    };
+
+    Ok(BoundCTE {
+        name: name.to_string(),
+        column_aliases: column_names,
+        query: combined,
+        is_recursive: true,
+    })
+}
+
+/// Check if a set expression references a CTE by name
+fn set_expr_references_cte(set_expr: &sql::SetExpr, cte_name: &str) -> bool {
+    match set_expr {
+        sql::SetExpr::Select(select) => {
+            // Check FROM clause for references to the CTE
+            for table_with_joins in &select.from {
+                if table_factor_references_cte(&table_with_joins.relation, cte_name) {
+                    return true;
+                }
+                for join in &table_with_joins.joins {
+                    if table_factor_references_cte(&join.relation, cte_name) {
+                        return true;
+                    }
+                }
+            }
+            false
+        }
+        sql::SetExpr::Query(query) => set_expr_references_cte(&query.body, cte_name),
+        sql::SetExpr::SetOperation { left, right, .. } => {
+            set_expr_references_cte(left, cte_name) || set_expr_references_cte(right, cte_name)
+        }
+        _ => false,
+    }
+}
+
+/// Check if a table factor references a CTE by name
+fn table_factor_references_cte(factor: &sql::TableFactor, cte_name: &str) -> bool {
+    match factor {
+        sql::TableFactor::Table { name, .. } => {
+            // Check if this table name matches the CTE name
+            if name.0.len() == 1 {
+                let table_name = &name.0[0].value;
+                table_name.eq_ignore_ascii_case(cte_name)
+            } else {
+                false
+            }
+        }
+        sql::TableFactor::Derived { subquery, .. } => {
+            set_expr_references_cte(&subquery.body, cte_name)
+        }
+        sql::TableFactor::NestedJoin { table_with_joins, .. } => {
+            if table_factor_references_cte(&table_with_joins.relation, cte_name) {
+                return true;
+            }
+            for join in &table_with_joins.joins {
+                if table_factor_references_cte(&join.relation, cte_name) {
+                    return true;
+                }
+            }
+            false
+        }
+        _ => false,
+    }
 }
 
 /// Bind a set expression to a BoundSelect
@@ -558,7 +750,7 @@ fn bind_table_factor_with_ctes(
             if let Some(table_args) = args {
                 if parts.len() == 1 {
                     let func_name = parts[0].to_uppercase();
-                    if matches!(func_name.as_str(), "RANGE" | "GENERATE_SERIES") {
+                    if matches!(func_name.as_str(), "RANGE" | "GENERATE_SERIES" | "UNNEST" | "GENERATE_SUBSCRIPTS") {
                         // TableFunctionArgs.args is already Vec<FunctionArg>
                         return bind_table_function(binder, name, &table_args.args, alias);
                     }
@@ -752,6 +944,85 @@ fn bind_table_function(
 
             Ok(BoundTableRef::TableFunction {
                 function: TableFunctionType::Range { start, stop, step },
+                alias: table_alias,
+                column_alias,
+            })
+        }
+        "UNNEST" => {
+            // unnest(array) - expands an array into rows
+            let ctx = ExpressionBinderContext::new(&[]);
+
+            let bound_args: Vec<BoundExpression> = args
+                .iter()
+                .filter_map(|arg| {
+                    let expr_arg = match arg {
+                        sql::FunctionArg::Unnamed(expr) => Some(expr),
+                        sql::FunctionArg::Named { arg, .. } => Some(arg),
+                        _ => None,
+                    };
+                    expr_arg.and_then(|expr| match expr {
+                        sql::FunctionArgExpr::Expr(e) => bind_expression(binder, e, &ctx).ok(),
+                        _ => None,
+                    })
+                })
+                .collect();
+
+            if bound_args.is_empty() {
+                return Err(Error::InvalidArguments("unnest() requires an array argument".to_string()));
+            }
+
+            let array_expr = bound_args.into_iter().next().unwrap();
+
+            // Extract column alias from table alias if provided
+            let (table_alias, column_alias) = if let Some(a) = alias {
+                let col_alias = a.columns.first().map(|c| c.name.value.clone());
+                (Some(a.name.value.clone()), col_alias)
+            } else {
+                (None, None)
+            };
+
+            Ok(BoundTableRef::TableFunction {
+                function: TableFunctionType::Unnest { array_expr },
+                alias: table_alias,
+                column_alias,
+            })
+        }
+        "GENERATE_SUBSCRIPTS" => {
+            // generate_subscripts(array, dim) - generates subscripts for an array dimension
+            let ctx = ExpressionBinderContext::new(&[]);
+
+            let bound_args: Vec<BoundExpression> = args
+                .iter()
+                .filter_map(|arg| {
+                    let expr_arg = match arg {
+                        sql::FunctionArg::Unnamed(expr) => Some(expr),
+                        sql::FunctionArg::Named { arg, .. } => Some(arg),
+                        _ => None,
+                    };
+                    expr_arg.and_then(|expr| match expr {
+                        sql::FunctionArgExpr::Expr(e) => bind_expression(binder, e, &ctx).ok(),
+                        _ => None,
+                    })
+                })
+                .collect();
+
+            if bound_args.is_empty() {
+                return Err(Error::InvalidArguments("generate_subscripts() requires an array argument".to_string()));
+            }
+
+            let array_expr = bound_args.into_iter().next().unwrap();
+            let dim = 1; // Default dimension
+
+            // Extract column alias from table alias if provided
+            let (table_alias, column_alias) = if let Some(a) = alias {
+                let col_alias = a.columns.first().map(|c| c.name.value.clone());
+                (Some(a.name.value.clone()), col_alias)
+            } else {
+                (None, None)
+            };
+
+            Ok(BoundTableRef::TableFunction {
+                function: TableFunctionType::GenerateSubscripts { array_expr, dim },
                 alias: table_alias,
                 column_alias,
             })

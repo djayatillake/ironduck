@@ -1217,6 +1217,50 @@ impl Executor {
                             }
                         }
                     }
+
+                    TableFunctionKind::Unnest { array_expr } => {
+                        // Evaluate the array expression
+                        let array_val = evaluate(array_expr, &[])?;
+
+                        match array_val {
+                            Value::List(elements) => {
+                                // Expand each element into a row
+                                Ok(elements.into_iter().map(|elem| vec![elem]).collect())
+                            }
+                            Value::Null => {
+                                // NULL array produces empty result
+                                Ok(vec![])
+                            }
+                            _ => {
+                                // Non-array value produces single row
+                                Ok(vec![vec![array_val]])
+                            }
+                        }
+                    }
+
+                    TableFunctionKind::GenerateSubscripts { array_expr, dim } => {
+                        // Evaluate the array expression
+                        let array_val = evaluate(array_expr, &[])?;
+
+                        match array_val {
+                            Value::List(elements) => {
+                                // For dimension 1, generate 1-based indices for the array
+                                if *dim == 1 {
+                                    let len = elements.len() as i64;
+                                    Ok((1..=len).map(|i| vec![Value::BigInt(i)]).collect())
+                                } else {
+                                    // Higher dimensions not yet supported for simple arrays
+                                    Ok(vec![])
+                                }
+                            }
+                            Value::Null => {
+                                Ok(vec![])
+                            }
+                            _ => {
+                                Err(Error::Execution("generate_subscripts requires an array argument".to_string()))
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -1333,8 +1377,13 @@ fn format_plan(op: &LogicalOperator, indent: usize) -> String {
         LogicalOperator::NoOp => {
             format!("{}NoOp", prefix)
         }
-        LogicalOperator::TableFunction { column_name, .. } => {
-            format!("{}TableFunction: range() -> {}", prefix, column_name)
+        LogicalOperator::TableFunction { function, column_name, .. } => {
+            let func_name = match function {
+                TableFunctionKind::Range { .. } => "range",
+                TableFunctionKind::Unnest { .. } => "unnest",
+                TableFunctionKind::GenerateSubscripts { .. } => "generate_subscripts",
+            };
+            format!("{}TableFunction: {}() -> {}", prefix, func_name, column_name)
         }
     }
 }
@@ -2943,6 +2992,221 @@ fn compute_aggregate(
                 .sum();
 
             Ok(Value::Double(sxy))
+        }
+
+        // Additional aggregate functions
+        AnyValue | Arbitrary => {
+            // Return the first non-null value
+            for row in rows {
+                if !args.is_empty() {
+                    let val = evaluate(&args[0], row)?;
+                    if !val.is_null() {
+                        return Ok(val);
+                    }
+                }
+            }
+            Ok(Value::Null)
+        }
+
+        ListAgg | GroupConcat => {
+            // Like StringAgg - concatenate values with separator
+            let separator = if args.len() > 1 {
+                match evaluate(&args[1], &rows.first().cloned().unwrap_or_default())? {
+                    Value::Varchar(s) => s,
+                    _ => ",".to_string(),
+                }
+            } else {
+                ",".to_string()
+            };
+
+            let mut parts: Vec<String> = Vec::new();
+            for row in rows {
+                if !args.is_empty() {
+                    let val = evaluate(&args[0], row)?;
+                    if !val.is_null() {
+                        parts.push(format!("{}", val));
+                    }
+                }
+            }
+
+            if parts.is_empty() {
+                Ok(Value::Null)
+            } else {
+                Ok(Value::Varchar(parts.join(&separator)))
+            }
+        }
+
+        FSum => {
+            // Kahan summation for better precision with floats
+            let mut sum = 0.0f64;
+            let mut c = 0.0f64; // Compensation for lost low-order bits
+            let mut has_value = false;
+
+            for row in rows {
+                if !args.is_empty() {
+                    let val = evaluate(&args[0], row)?;
+                    if let Some(f) = val.as_f64() {
+                        has_value = true;
+                        let y = f - c;
+                        let t = sum + y;
+                        c = (t - sum) - y;
+                        sum = t;
+                    }
+                }
+            }
+
+            if has_value {
+                Ok(Value::Double(sum))
+            } else {
+                Ok(Value::Null)
+            }
+        }
+
+        Quantile | ApproxQuantile => {
+            // Quantile is an alias for percentile
+            // quantile(col, p) returns the p-th quantile (0-1)
+            let p = if args.len() > 1 {
+                match evaluate(&args[1], &rows.first().cloned().unwrap_or_default())? {
+                    Value::Float(f) => f as f64,
+                    Value::Double(f) => f,
+                    _ => 0.5,
+                }
+            } else {
+                0.5 // Default to median
+            };
+
+            let mut values: Vec<f64> = Vec::new();
+            for row in rows {
+                if !args.is_empty() {
+                    let val = evaluate(&args[0], row)?;
+                    if let Some(f) = val.as_f64() {
+                        values.push(f);
+                    }
+                }
+            }
+
+            if values.is_empty() {
+                return Ok(Value::Null);
+            }
+
+            values.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            let idx = ((values.len() - 1) as f64 * p).round() as usize;
+            Ok(Value::Double(values[idx.min(values.len() - 1)]))
+        }
+
+        CountIf => {
+            // COUNT_IF(condition) - count rows where condition is true
+            let mut count: i64 = 0;
+            for row in rows {
+                if !args.is_empty() {
+                    let val = evaluate(&args[0], row)?;
+                    if matches!(val, Value::Boolean(true)) {
+                        count += 1;
+                    }
+                }
+            }
+            Ok(Value::BigInt(count))
+        }
+
+        SumIf => {
+            // SUM_IF(value, condition) - sum values where condition is true
+            let mut sum: i128 = 0;
+            let mut float_sum: f64 = 0.0;
+            let mut has_float = false;
+            let mut has_value = false;
+
+            for row in rows {
+                if args.len() >= 2 {
+                    let cond = evaluate(&args[1], row)?;
+                    if matches!(cond, Value::Boolean(true)) {
+                        let val = evaluate(&args[0], row)?;
+                        match val {
+                            Value::Integer(i) => { has_value = true; sum += i as i128; }
+                            Value::BigInt(i) => { has_value = true; sum += i as i128; }
+                            Value::Float(f) => { has_value = true; has_float = true; float_sum += f as f64; }
+                            Value::Double(f) => { has_value = true; has_float = true; float_sum += f; }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+
+            if !has_value {
+                Ok(Value::Null)
+            } else if has_float {
+                Ok(Value::Double(float_sum + sum as f64))
+            } else {
+                Ok(Value::HugeInt(sum))
+            }
+        }
+
+        AvgIf => {
+            // AVG_IF(value, condition) - average values where condition is true
+            let mut sum: f64 = 0.0;
+            let mut count: i64 = 0;
+
+            for row in rows {
+                if args.len() >= 2 {
+                    let cond = evaluate(&args[1], row)?;
+                    if matches!(cond, Value::Boolean(true)) {
+                        let val = evaluate(&args[0], row)?;
+                        if let Some(f) = val.as_f64() {
+                            sum += f;
+                            count += 1;
+                        }
+                    }
+                }
+            }
+
+            if count == 0 {
+                Ok(Value::Null)
+            } else {
+                Ok(Value::Double(sum / count as f64))
+            }
+        }
+
+        MinIf => {
+            // MIN_IF(value, condition) - minimum value where condition is true
+            let mut min_val: Option<Value> = None;
+
+            for row in rows {
+                if args.len() >= 2 {
+                    let cond = evaluate(&args[1], row)?;
+                    if matches!(cond, Value::Boolean(true)) {
+                        let val = evaluate(&args[0], row)?;
+                        if !val.is_null() {
+                            min_val = Some(match min_val {
+                                None => val,
+                                Some(m) => if val < m { val } else { m },
+                            });
+                        }
+                    }
+                }
+            }
+
+            Ok(min_val.unwrap_or(Value::Null))
+        }
+
+        MaxIf => {
+            // MAX_IF(value, condition) - maximum value where condition is true
+            let mut max_val: Option<Value> = None;
+
+            for row in rows {
+                if args.len() >= 2 {
+                    let cond = evaluate(&args[1], row)?;
+                    if matches!(cond, Value::Boolean(true)) {
+                        let val = evaluate(&args[0], row)?;
+                        if !val.is_null() {
+                            max_val = Some(match max_val {
+                                None => val,
+                                Some(m) => if val > m { val } else { m },
+                            });
+                        }
+                    }
+                }
+            }
+
+            Ok(max_val.unwrap_or(Value::Null))
         }
     }
 }

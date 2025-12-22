@@ -152,6 +152,15 @@ pub enum TableFunctionType {
         stop: BoundExpression,
         step: BoundExpression,
     },
+    /// unnest(array) - expands an array into rows
+    Unnest {
+        array_expr: BoundExpression,
+    },
+    /// generate_subscripts(array, dim) - generates subscripts for an array dimension
+    GenerateSubscripts {
+        array_expr: BoundExpression,
+        dim: i32,
+    },
 }
 
 /// Join types
@@ -282,4 +291,21 @@ pub struct BoundCTE {
     pub column_aliases: Vec<String>,
     /// The bound query for this CTE
     pub query: BoundSelect,
+    /// Whether this is a recursive CTE
+    pub is_recursive: bool,
+}
+
+/// Bound Recursive CTE with separate base and recursive parts
+#[derive(Debug, Clone)]
+pub struct BoundRecursiveCTE {
+    /// Name of the CTE
+    pub name: String,
+    /// Column aliases (optional)
+    pub column_aliases: Vec<String>,
+    /// Base case query (non-recursive part)
+    pub base_case: BoundSelect,
+    /// Recursive case query (references the CTE)
+    pub recursive_case: BoundSelect,
+    /// Whether to use UNION ALL (true) or UNION (false) semantics
+    pub union_all: bool,
 }
