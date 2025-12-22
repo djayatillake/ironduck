@@ -3,7 +3,7 @@
 use crate::expression::{evaluate, evaluate_with_ctx, EvalContext};
 use ironduck_catalog::Catalog;
 use ironduck_common::{Error, LogicalType, Result, Value};
-use ironduck_planner::{Expression, LogicalOperator, LogicalPlan, TableFunctionKind, WindowFunction};
+use ironduck_planner::{Expression, LogicalOperator, LogicalPlan, TableFunctionKind, WindowFrame, WindowFrameBound, WindowFunction};
 use ironduck_storage::TableStorage;
 use std::cell::RefCell;
 use std::sync::Arc;
@@ -1130,10 +1130,139 @@ impl Executor {
                                     }
                                 }
                             }
-                            _ => {
-                                // For unsupported window functions, return NULL
-                                for (orig_idx, _) in &partition {
-                                    window_results[win_idx][*orig_idx] = Value::Null;
+                            WindowFunction::Sum => {
+                                // SUM as window function
+                                // By default (no frame), compute cumulative sum up to current row
+                                let mut running_sum: Option<f64> = None;
+                                for (idx, (orig_idx, row)) in partition.iter().enumerate() {
+                                    let (start, end) = get_frame_bounds(&win_expr.frame, idx, partition.len());
+
+                                    // For no frame or ROWS UNBOUNDED PRECEDING TO CURRENT ROW
+                                    // we use cumulative sum for efficiency
+                                    if win_expr.frame.is_none() && start == 0 {
+                                        // Cumulative sum
+                                        if let Some(arg) = win_expr.args.first() {
+                                            let val = evaluate(arg, row).unwrap_or(Value::Null);
+                                            if !val.is_null() {
+                                                let num = val.as_f64().unwrap_or(0.0);
+                                                running_sum = Some(running_sum.unwrap_or(0.0) + num);
+                                            }
+                                        }
+                                        window_results[win_idx][*orig_idx] = running_sum.map_or(Value::Null, Value::Double);
+                                    } else {
+                                        // Frame-aware sum
+                                        let mut sum: Option<f64> = None;
+                                        for i in start..=end.min(partition.len() - 1) {
+                                            if let Some(arg) = win_expr.args.first() {
+                                                let val = evaluate(arg, &partition[i].1).unwrap_or(Value::Null);
+                                                if !val.is_null() {
+                                                    let num = val.as_f64().unwrap_or(0.0);
+                                                    sum = Some(sum.unwrap_or(0.0) + num);
+                                                }
+                                            }
+                                        }
+                                        window_results[win_idx][*orig_idx] = sum.map_or(Value::Null, Value::Double);
+                                    }
+                                }
+                            }
+                            WindowFunction::Count => {
+                                // COUNT as window function
+                                for (idx, (orig_idx, row)) in partition.iter().enumerate() {
+                                    let (start, end) = get_frame_bounds(&win_expr.frame, idx, partition.len());
+
+                                    // Check if counting all (*) or specific expression
+                                    let count = if win_expr.args.is_empty() {
+                                        // COUNT(*) - count all rows in frame
+                                        (end.min(partition.len() - 1) - start + 1) as i64
+                                    } else {
+                                        // COUNT(expr) - count non-null values in frame
+                                        let mut cnt = 0i64;
+                                        for i in start..=end.min(partition.len() - 1) {
+                                            if let Some(arg) = win_expr.args.first() {
+                                                let val = evaluate(arg, &partition[i].1).unwrap_or(Value::Null);
+                                                if !val.is_null() {
+                                                    cnt += 1;
+                                                }
+                                            }
+                                        }
+                                        cnt
+                                    };
+                                    window_results[win_idx][*orig_idx] = Value::BigInt(count);
+                                }
+                            }
+                            WindowFunction::Avg => {
+                                // AVG as window function
+                                for (idx, (orig_idx, row)) in partition.iter().enumerate() {
+                                    let (start, end) = get_frame_bounds(&win_expr.frame, idx, partition.len());
+
+                                    let mut sum = 0.0;
+                                    let mut count = 0i64;
+                                    for i in start..=end.min(partition.len() - 1) {
+                                        if let Some(arg) = win_expr.args.first() {
+                                            let val = evaluate(arg, &partition[i].1).unwrap_or(Value::Null);
+                                            if !val.is_null() {
+                                                sum += val.as_f64().unwrap_or(0.0);
+                                                count += 1;
+                                            }
+                                        }
+                                    }
+                                    window_results[win_idx][*orig_idx] = if count > 0 {
+                                        Value::Double(sum / count as f64)
+                                    } else {
+                                        Value::Null
+                                    };
+                                }
+                            }
+                            WindowFunction::Min => {
+                                // MIN as window function
+                                for (idx, (orig_idx, row)) in partition.iter().enumerate() {
+                                    let (start, end) = get_frame_bounds(&win_expr.frame, idx, partition.len());
+
+                                    let mut min_val: Option<Value> = None;
+                                    for i in start..=end.min(partition.len() - 1) {
+                                        if let Some(arg) = win_expr.args.first() {
+                                            let val = evaluate(arg, &partition[i].1).unwrap_or(Value::Null);
+                                            if !val.is_null() {
+                                                min_val = Some(match &min_val {
+                                                    None => val,
+                                                    Some(current) => {
+                                                        if val.partial_cmp(current) == Some(std::cmp::Ordering::Less) {
+                                                            val
+                                                        } else {
+                                                            current.clone()
+                                                        }
+                                                    }
+                                                });
+                                            }
+                                        }
+                                    }
+                                    window_results[win_idx][*orig_idx] = min_val.unwrap_or(Value::Null);
+                                }
+                            }
+                            WindowFunction::Max => {
+                                // MAX as window function
+                                for (idx, (orig_idx, row)) in partition.iter().enumerate() {
+                                    let (start, end) = get_frame_bounds(&win_expr.frame, idx, partition.len());
+
+                                    let mut max_val: Option<Value> = None;
+                                    for i in start..=end.min(partition.len() - 1) {
+                                        if let Some(arg) = win_expr.args.first() {
+                                            let val = evaluate(arg, &partition[i].1).unwrap_or(Value::Null);
+                                            if !val.is_null() {
+                                                max_val = Some(match &max_val {
+                                                    None => val,
+                                                    Some(current) => {
+                                                        if val.partial_cmp(current) == Some(std::cmp::Ordering::Greater) {
+                                                            val
+                                                        } else {
+                                                            current.clone()
+                                                        }
+                                                    }
+                                                });
+                                            }
+                                        }
+                                    }
+                                    window_results[win_idx][*orig_idx] = max_val.unwrap_or(Value::Null);
                                 }
                             }
                         }
@@ -1314,6 +1443,65 @@ impl Executor {
                     }
                 }
             }
+        }
+    }
+}
+
+/// Get frame bounds for a window function at a given row index
+/// Returns (start_idx, end_idx) for the frame
+fn get_frame_bounds(frame: &Option<WindowFrame>, current_idx: usize, partition_len: usize) -> (usize, usize) {
+    match frame {
+        None => {
+            // Default frame: RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+            (0, current_idx)
+        }
+        Some(f) => {
+            let start = match &f.start {
+                WindowFrameBound::UnboundedPreceding => 0,
+                WindowFrameBound::CurrentRow => current_idx,
+                WindowFrameBound::Preceding(n) => {
+                    // n is an expression - evaluate it
+                    if let Expression::Constant(val) = n {
+                        let offset = val.as_i64().unwrap_or(0) as usize;
+                        current_idx.saturating_sub(offset)
+                    } else {
+                        current_idx
+                    }
+                }
+                WindowFrameBound::Following(n) => {
+                    if let Expression::Constant(val) = n {
+                        let offset = val.as_i64().unwrap_or(0) as usize;
+                        (current_idx + offset).min(partition_len - 1)
+                    } else {
+                        current_idx
+                    }
+                }
+                WindowFrameBound::UnboundedFollowing => partition_len - 1,
+            };
+
+            let end = match &f.end {
+                WindowFrameBound::UnboundedPreceding => 0,
+                WindowFrameBound::CurrentRow => current_idx,
+                WindowFrameBound::Preceding(n) => {
+                    if let Expression::Constant(val) = n {
+                        let offset = val.as_i64().unwrap_or(0) as usize;
+                        current_idx.saturating_sub(offset)
+                    } else {
+                        current_idx
+                    }
+                }
+                WindowFrameBound::Following(n) => {
+                    if let Expression::Constant(val) = n {
+                        let offset = val.as_i64().unwrap_or(0) as usize;
+                        (current_idx + offset).min(partition_len - 1)
+                    } else {
+                        current_idx
+                    }
+                }
+                WindowFrameBound::UnboundedFollowing => partition_len - 1,
+            };
+
+            (start, end)
         }
     }
 }
