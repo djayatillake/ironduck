@@ -2494,6 +2494,456 @@ fn compute_aggregate(
             let corr = covar / (std_x * std_y);
             Ok(Value::Double(corr))
         }
+
+        // New aggregate functions
+        ArgMax => {
+            // ARG_MAX(arg, val) - return arg value when val is maximum
+            if args.len() < 2 {
+                return Ok(Value::Null);
+            }
+
+            let mut max_val: Option<f64> = None;
+            let mut max_arg: Value = Value::Null;
+
+            for row in rows {
+                let arg = evaluate(&args[0], row)?;
+                let val = evaluate(&args[1], row)?;
+                if let Some(v) = val.as_f64() {
+                    if max_val.is_none() || v > max_val.unwrap() {
+                        max_val = Some(v);
+                        max_arg = arg;
+                    }
+                }
+            }
+
+            Ok(max_arg)
+        }
+
+        ArgMin => {
+            // ARG_MIN(arg, val) - return arg value when val is minimum
+            if args.len() < 2 {
+                return Ok(Value::Null);
+            }
+
+            let mut min_val: Option<f64> = None;
+            let mut min_arg: Value = Value::Null;
+
+            for row in rows {
+                let arg = evaluate(&args[0], row)?;
+                let val = evaluate(&args[1], row)?;
+                if let Some(v) = val.as_f64() {
+                    if min_val.is_none() || v < min_val.unwrap() {
+                        min_val = Some(v);
+                        min_arg = arg;
+                    }
+                }
+            }
+
+            Ok(min_arg)
+        }
+
+        Histogram => {
+            // HISTOGRAM(col) - returns a list of structs with value counts
+            let mut counts: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
+
+            for row in rows {
+                if args.is_empty() {
+                    continue;
+                }
+                let val = evaluate(&args[0], row)?;
+                if !val.is_null() {
+                    let key = format!("{}", val);
+                    *counts.entry(key).or_insert(0) += 1;
+                }
+            }
+
+            // Convert to list of structs (represented as nested lists)
+            let mut result: Vec<Value> = Vec::new();
+            for (key, count) in counts {
+                // Represent as a list [key, count]
+                result.push(Value::List(vec![Value::Varchar(key), Value::BigInt(count)]));
+            }
+            Ok(Value::List(result))
+        }
+
+        Entropy => {
+            // Information entropy: -sum(p * log2(p))
+            let mut counts: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
+            let mut total: i64 = 0;
+
+            for row in rows {
+                if args.is_empty() {
+                    continue;
+                }
+                let val = evaluate(&args[0], row)?;
+                if !val.is_null() {
+                    let key = format!("{:?}", val);
+                    *counts.entry(key).or_insert(0) += 1;
+                    total += 1;
+                }
+            }
+
+            if total == 0 {
+                return Ok(Value::Null);
+            }
+
+            let n = total as f64;
+            let entropy: f64 = counts.values()
+                .map(|&count| {
+                    let p = count as f64 / n;
+                    if p > 0.0 { -p * p.log2() } else { 0.0 }
+                })
+                .sum();
+
+            Ok(Value::Double(entropy))
+        }
+
+        Kurtosis => {
+            // Excess kurtosis: E[(X-μ)^4] / σ^4 - 3
+            let mut values: Vec<f64> = Vec::new();
+            for row in rows {
+                if args.is_empty() {
+                    continue;
+                }
+                let val = evaluate(&args[0], row)?;
+                if let Some(f) = val.as_f64() {
+                    values.push(f);
+                }
+            }
+
+            if values.len() < 4 {
+                return Ok(Value::Null);
+            }
+
+            let n = values.len() as f64;
+            let mean: f64 = values.iter().sum::<f64>() / n;
+            let variance: f64 = values.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / n;
+
+            if variance == 0.0 {
+                return Ok(Value::Null);
+            }
+
+            let std_dev = variance.sqrt();
+            let m4: f64 = values.iter().map(|x| ((x - mean) / std_dev).powi(4)).sum::<f64>() / n;
+            let kurtosis = m4 - 3.0;
+
+            Ok(Value::Double(kurtosis))
+        }
+
+        Skewness => {
+            // Skewness: E[(X-μ)^3] / σ^3
+            let mut values: Vec<f64> = Vec::new();
+            for row in rows {
+                if args.is_empty() {
+                    continue;
+                }
+                let val = evaluate(&args[0], row)?;
+                if let Some(f) = val.as_f64() {
+                    values.push(f);
+                }
+            }
+
+            if values.len() < 3 {
+                return Ok(Value::Null);
+            }
+
+            let n = values.len() as f64;
+            let mean: f64 = values.iter().sum::<f64>() / n;
+            let variance: f64 = values.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / n;
+
+            if variance == 0.0 {
+                return Ok(Value::Null);
+            }
+
+            let std_dev = variance.sqrt();
+            let m3: f64 = values.iter().map(|x| ((x - mean) / std_dev).powi(3)).sum::<f64>() / n;
+
+            Ok(Value::Double(m3))
+        }
+
+        ApproxCountDistinct => {
+            // Approximate count distinct using simple hash-based approach
+            // (A proper implementation would use HyperLogLog)
+            let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+            for row in rows {
+                if args.is_empty() {
+                    continue;
+                }
+                let val = evaluate(&args[0], row)?;
+                if !val.is_null() {
+                    seen.insert(format!("{:?}", val));
+                }
+            }
+
+            Ok(Value::BigInt(seen.len() as i64))
+        }
+
+        RegrSlope => {
+            // Linear regression slope: Cov(X,Y) / Var(X)
+            if args.len() < 2 {
+                return Ok(Value::Null);
+            }
+
+            let mut x_values: Vec<f64> = Vec::new();
+            let mut y_values: Vec<f64> = Vec::new();
+
+            for row in rows {
+                let y = evaluate(&args[0], row)?;
+                let x = evaluate(&args[1], row)?;
+                if let (Some(xf), Some(yf)) = (x.as_f64(), y.as_f64()) {
+                    x_values.push(xf);
+                    y_values.push(yf);
+                }
+            }
+
+            if x_values.len() < 2 {
+                return Ok(Value::Null);
+            }
+
+            let n = x_values.len() as f64;
+            let mean_x: f64 = x_values.iter().sum::<f64>() / n;
+            let mean_y: f64 = y_values.iter().sum::<f64>() / n;
+
+            let sxx: f64 = x_values.iter().map(|x| (x - mean_x).powi(2)).sum();
+            let sxy: f64 = x_values.iter().zip(y_values.iter())
+                .map(|(x, y)| (x - mean_x) * (y - mean_y))
+                .sum();
+
+            if sxx == 0.0 {
+                return Ok(Value::Null);
+            }
+
+            Ok(Value::Double(sxy / sxx))
+        }
+
+        RegrIntercept => {
+            // Linear regression intercept: mean(Y) - slope * mean(X)
+            if args.len() < 2 {
+                return Ok(Value::Null);
+            }
+
+            let mut x_values: Vec<f64> = Vec::new();
+            let mut y_values: Vec<f64> = Vec::new();
+
+            for row in rows {
+                let y = evaluate(&args[0], row)?;
+                let x = evaluate(&args[1], row)?;
+                if let (Some(xf), Some(yf)) = (x.as_f64(), y.as_f64()) {
+                    x_values.push(xf);
+                    y_values.push(yf);
+                }
+            }
+
+            if x_values.len() < 2 {
+                return Ok(Value::Null);
+            }
+
+            let n = x_values.len() as f64;
+            let mean_x: f64 = x_values.iter().sum::<f64>() / n;
+            let mean_y: f64 = y_values.iter().sum::<f64>() / n;
+
+            let sxx: f64 = x_values.iter().map(|x| (x - mean_x).powi(2)).sum();
+            let sxy: f64 = x_values.iter().zip(y_values.iter())
+                .map(|(x, y)| (x - mean_x) * (y - mean_y))
+                .sum();
+
+            if sxx == 0.0 {
+                return Ok(Value::Null);
+            }
+
+            let slope = sxy / sxx;
+            Ok(Value::Double(mean_y - slope * mean_x))
+        }
+
+        RegrCount => {
+            // Count of non-null pairs
+            if args.len() < 2 {
+                return Ok(Value::BigInt(0));
+            }
+
+            let mut count: i64 = 0;
+            for row in rows {
+                let y = evaluate(&args[0], row)?;
+                let x = evaluate(&args[1], row)?;
+                if !y.is_null() && !x.is_null() {
+                    count += 1;
+                }
+            }
+
+            Ok(Value::BigInt(count))
+        }
+
+        RegrR2 => {
+            // Coefficient of determination (R²)
+            if args.len() < 2 {
+                return Ok(Value::Null);
+            }
+
+            let mut x_values: Vec<f64> = Vec::new();
+            let mut y_values: Vec<f64> = Vec::new();
+
+            for row in rows {
+                let y = evaluate(&args[0], row)?;
+                let x = evaluate(&args[1], row)?;
+                if let (Some(xf), Some(yf)) = (x.as_f64(), y.as_f64()) {
+                    x_values.push(xf);
+                    y_values.push(yf);
+                }
+            }
+
+            if x_values.len() < 2 {
+                return Ok(Value::Null);
+            }
+
+            let n = x_values.len() as f64;
+            let mean_x: f64 = x_values.iter().sum::<f64>() / n;
+            let mean_y: f64 = y_values.iter().sum::<f64>() / n;
+
+            let sxx: f64 = x_values.iter().map(|x| (x - mean_x).powi(2)).sum();
+            let syy: f64 = y_values.iter().map(|y| (y - mean_y).powi(2)).sum();
+            let sxy: f64 = x_values.iter().zip(y_values.iter())
+                .map(|(x, y)| (x - mean_x) * (y - mean_y))
+                .sum();
+
+            if sxx == 0.0 || syy == 0.0 {
+                return Ok(Value::Null);
+            }
+
+            let r2 = (sxy * sxy) / (sxx * syy);
+            Ok(Value::Double(r2))
+        }
+
+        RegrAvgX => {
+            if args.len() < 2 {
+                return Ok(Value::Null);
+            }
+
+            let mut sum: f64 = 0.0;
+            let mut count: i64 = 0;
+
+            for row in rows {
+                let y = evaluate(&args[0], row)?;
+                let x = evaluate(&args[1], row)?;
+                if let (Some(xf), Some(_yf)) = (x.as_f64(), y.as_f64()) {
+                    sum += xf;
+                    count += 1;
+                }
+            }
+
+            if count == 0 {
+                return Ok(Value::Null);
+            }
+
+            Ok(Value::Double(sum / count as f64))
+        }
+
+        RegrAvgY => {
+            if args.len() < 2 {
+                return Ok(Value::Null);
+            }
+
+            let mut sum: f64 = 0.0;
+            let mut count: i64 = 0;
+
+            for row in rows {
+                let y = evaluate(&args[0], row)?;
+                let x = evaluate(&args[1], row)?;
+                if let (Some(_xf), Some(yf)) = (x.as_f64(), y.as_f64()) {
+                    sum += yf;
+                    count += 1;
+                }
+            }
+
+            if count == 0 {
+                return Ok(Value::Null);
+            }
+
+            Ok(Value::Double(sum / count as f64))
+        }
+
+        RegrSXX => {
+            if args.len() < 2 {
+                return Ok(Value::Null);
+            }
+
+            let mut x_values: Vec<f64> = Vec::new();
+
+            for row in rows {
+                let y = evaluate(&args[0], row)?;
+                let x = evaluate(&args[1], row)?;
+                if let (Some(xf), Some(_yf)) = (x.as_f64(), y.as_f64()) {
+                    x_values.push(xf);
+                }
+            }
+
+            if x_values.is_empty() {
+                return Ok(Value::Null);
+            }
+
+            let n = x_values.len() as f64;
+            let mean_x: f64 = x_values.iter().sum::<f64>() / n;
+            let sxx: f64 = x_values.iter().map(|x| (x - mean_x).powi(2)).sum();
+
+            Ok(Value::Double(sxx))
+        }
+
+        RegrSYY => {
+            if args.len() < 2 {
+                return Ok(Value::Null);
+            }
+
+            let mut y_values: Vec<f64> = Vec::new();
+
+            for row in rows {
+                let y = evaluate(&args[0], row)?;
+                let x = evaluate(&args[1], row)?;
+                if let (Some(_xf), Some(yf)) = (x.as_f64(), y.as_f64()) {
+                    y_values.push(yf);
+                }
+            }
+
+            if y_values.is_empty() {
+                return Ok(Value::Null);
+            }
+
+            let n = y_values.len() as f64;
+            let mean_y: f64 = y_values.iter().sum::<f64>() / n;
+            let syy: f64 = y_values.iter().map(|y| (y - mean_y).powi(2)).sum();
+
+            Ok(Value::Double(syy))
+        }
+
+        RegrSXY => {
+            if args.len() < 2 {
+                return Ok(Value::Null);
+            }
+
+            let mut x_values: Vec<f64> = Vec::new();
+            let mut y_values: Vec<f64> = Vec::new();
+
+            for row in rows {
+                let y = evaluate(&args[0], row)?;
+                let x = evaluate(&args[1], row)?;
+                if let (Some(xf), Some(yf)) = (x.as_f64(), y.as_f64()) {
+                    x_values.push(xf);
+                    y_values.push(yf);
+                }
+            }
+
+            if x_values.is_empty() {
+                return Ok(Value::Null);
+            }
+
+            let n = x_values.len() as f64;
+            let mean_x: f64 = x_values.iter().sum::<f64>() / n;
+            let mean_y: f64 = y_values.iter().sum::<f64>() / n;
+            let sxy: f64 = x_values.iter().zip(y_values.iter())
+                .map(|(x, y)| (x - mean_x) * (y - mean_y))
+                .sum();
+
+            Ok(Value::Double(sxy))
+        }
     }
 }
 

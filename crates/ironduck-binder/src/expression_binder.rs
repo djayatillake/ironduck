@@ -854,6 +854,33 @@ fn bind_function(
         }
         // Covariance and correlation
         "COVAR_POP" | "COVAR_SAMP" | "CORR" => (true, LogicalType::Double),
+        // ArgMax/ArgMin - returns value of first arg when second arg is max/min
+        "ARG_MAX" | "ARGMAX" | "MAX_BY" => {
+            let arg_type = args.first().map(|a| a.return_type.clone()).unwrap_or(LogicalType::Unknown);
+            (true, arg_type)
+        }
+        "ARG_MIN" | "ARGMIN" | "MIN_BY" => {
+            let arg_type = args.first().map(|a| a.return_type.clone()).unwrap_or(LogicalType::Unknown);
+            (true, arg_type)
+        }
+        // Statistical aggregates
+        "ENTROPY" => (true, LogicalType::Double),
+        "KURTOSIS" | "KURTOSIS_POP" => (true, LogicalType::Double),
+        "SKEWNESS" | "SKEW" => (true, LogicalType::Double),
+        // Approximate count distinct
+        "APPROX_COUNT_DISTINCT" | "APPROX_DISTINCT" => (true, LogicalType::BigInt),
+        // Histogram
+        "HISTOGRAM" => (true, LogicalType::Unknown), // Returns MAP
+        // Regression functions
+        "REGR_SLOPE" => (true, LogicalType::Double),
+        "REGR_INTERCEPT" => (true, LogicalType::Double),
+        "REGR_COUNT" => (true, LogicalType::BigInt),
+        "REGR_R2" => (true, LogicalType::Double),
+        "REGR_AVGX" => (true, LogicalType::Double),
+        "REGR_AVGY" => (true, LogicalType::Double),
+        "REGR_SXX" => (true, LogicalType::Double),
+        "REGR_SYY" => (true, LogicalType::Double),
+        "REGR_SXY" => (true, LogicalType::Double),
 
         // Scalar functions
         "LOWER" | "UPPER" | "TRIM" | "LTRIM" | "RTRIM" => (false, LogicalType::Varchar),

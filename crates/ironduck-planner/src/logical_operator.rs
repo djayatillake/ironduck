@@ -403,6 +403,17 @@ impl AggregateExpression {
             AggregateFunction::PercentileDisc => LogicalType::Unknown, // Same as input
             AggregateFunction::Mode => LogicalType::Unknown, // Same as input
             AggregateFunction::CovarPop | AggregateFunction::CovarSamp | AggregateFunction::Corr => LogicalType::Double,
+            // New aggregate functions
+            AggregateFunction::ArgMax | AggregateFunction::ArgMin => LogicalType::Unknown, // Same as first arg
+            AggregateFunction::Histogram => LogicalType::Unknown, // MAP type
+            AggregateFunction::Entropy => LogicalType::Double,
+            AggregateFunction::Kurtosis | AggregateFunction::Skewness => LogicalType::Double,
+            AggregateFunction::ApproxCountDistinct => LogicalType::BigInt,
+            AggregateFunction::RegrSlope | AggregateFunction::RegrIntercept
+                | AggregateFunction::RegrR2 | AggregateFunction::RegrAvgX
+                | AggregateFunction::RegrAvgY | AggregateFunction::RegrSXX
+                | AggregateFunction::RegrSYY | AggregateFunction::RegrSXY => LogicalType::Double,
+            AggregateFunction::RegrCount => LogicalType::BigInt,
         }
     }
 }
@@ -435,6 +446,23 @@ pub enum AggregateFunction {
     CovarPop,      // Population covariance
     CovarSamp,     // Sample covariance
     Corr,          // Correlation coefficient
+    // New aggregate functions
+    ArgMax,        // Value of arg column when val column is maximum
+    ArgMin,        // Value of arg column when val column is minimum
+    Histogram,     // Returns a MAP of value counts
+    Entropy,       // Information entropy
+    Kurtosis,      // Excess kurtosis (fourth moment)
+    Skewness,      // Skewness (third moment)
+    ApproxCountDistinct, // Approximate count distinct (HyperLogLog)
+    RegrSlope,     // Linear regression slope
+    RegrIntercept, // Linear regression intercept
+    RegrCount,     // Count of non-null pairs for regression
+    RegrR2,        // Coefficient of determination (R²)
+    RegrAvgX,      // Average of X values
+    RegrAvgY,      // Average of Y values
+    RegrSXX,       // Sum of squares of X
+    RegrSYY,       // Sum of squares of Y
+    RegrSXY,       // Sum of products of X and Y
 }
 
 #[derive(Debug, Clone)]

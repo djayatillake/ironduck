@@ -828,6 +828,48 @@ fn wrap_aggregate_reference(bound_expr: &BoundExpression, agg_ref: super::Expres
                 right: Box::new(right_expr),
             }
         }
+        // If this is a Case expression containing an aggregate, recursively handle it
+        BoundExpressionKind::Case { operand, when_clauses, else_result } => {
+            let converted_operand = operand.as_ref().map(|op| {
+                if has_aggregate(op) {
+                    Box::new(wrap_aggregate_reference(op, agg_ref.clone()))
+                } else {
+                    Box::new(convert_expression(op))
+                }
+            });
+
+            let mut conditions = Vec::new();
+            let mut results = Vec::new();
+            for (cond, result) in when_clauses {
+                let c = if has_aggregate(cond) {
+                    wrap_aggregate_reference(cond, agg_ref.clone())
+                } else {
+                    convert_expression(cond)
+                };
+                let r = if has_aggregate(result) {
+                    wrap_aggregate_reference(result, agg_ref.clone())
+                } else {
+                    convert_expression(result)
+                };
+                conditions.push(c);
+                results.push(r);
+            }
+
+            let converted_else = else_result.as_ref().map(|e| {
+                if has_aggregate(e) {
+                    Box::new(wrap_aggregate_reference(e, agg_ref))
+                } else {
+                    Box::new(convert_expression(e))
+                }
+            });
+
+            super::Expression::Case {
+                operand: converted_operand,
+                conditions,
+                results,
+                else_result: converted_else,
+            }
+        }
         // For other cases, just convert normally (shouldn't happen if has_aggregate was true)
         _ => convert_expression(bound_expr),
     }
@@ -852,6 +894,32 @@ fn extract_aggregate(expr: &BoundExpression) -> Option<super::AggregateExpressio
     match &expr.expr {
         // Handle Cast expressions - look inside them for aggregates
         BoundExpressionKind::Cast { expr, .. } => extract_aggregate(expr),
+        // Handle BinaryOp - check both sides for aggregates
+        BoundExpressionKind::BinaryOp { left, right, .. } => {
+            extract_aggregate(left).or_else(|| extract_aggregate(right))
+        }
+        // Handle Case - check all parts for aggregates
+        BoundExpressionKind::Case { operand, when_clauses, else_result } => {
+            if let Some(op) = operand {
+                if let Some(agg) = extract_aggregate(op) {
+                    return Some(agg);
+                }
+            }
+            for (cond, result) in when_clauses {
+                if let Some(agg) = extract_aggregate(cond) {
+                    return Some(agg);
+                }
+                if let Some(agg) = extract_aggregate(result) {
+                    return Some(agg);
+                }
+            }
+            if let Some(else_expr) = else_result {
+                if let Some(agg) = extract_aggregate(else_expr) {
+                    return Some(agg);
+                }
+            }
+            None
+        }
         BoundExpressionKind::Function {
             name,
             args,
@@ -886,6 +954,23 @@ fn extract_aggregate(expr: &BoundExpression) -> Option<super::AggregateExpressio
                 "COVAR_POP" => super::AggregateFunction::CovarPop,
                 "COVAR_SAMP" => super::AggregateFunction::CovarSamp,
                 "CORR" => super::AggregateFunction::Corr,
+                // New aggregate functions
+                "ARG_MAX" | "ARGMAX" | "MAX_BY" => super::AggregateFunction::ArgMax,
+                "ARG_MIN" | "ARGMIN" | "MIN_BY" => super::AggregateFunction::ArgMin,
+                "HISTOGRAM" => super::AggregateFunction::Histogram,
+                "ENTROPY" => super::AggregateFunction::Entropy,
+                "KURTOSIS" | "KURTOSIS_POP" => super::AggregateFunction::Kurtosis,
+                "SKEWNESS" | "SKEW" => super::AggregateFunction::Skewness,
+                "APPROX_COUNT_DISTINCT" | "APPROX_DISTINCT" => super::AggregateFunction::ApproxCountDistinct,
+                "REGR_SLOPE" => super::AggregateFunction::RegrSlope,
+                "REGR_INTERCEPT" => super::AggregateFunction::RegrIntercept,
+                "REGR_COUNT" => super::AggregateFunction::RegrCount,
+                "REGR_R2" => super::AggregateFunction::RegrR2,
+                "REGR_AVGX" => super::AggregateFunction::RegrAvgX,
+                "REGR_AVGY" => super::AggregateFunction::RegrAvgY,
+                "REGR_SXX" => super::AggregateFunction::RegrSXX,
+                "REGR_SYY" => super::AggregateFunction::RegrSYY,
+                "REGR_SXY" => super::AggregateFunction::RegrSXY,
                 _ => return None,
             };
 
