@@ -1,0 +1,58 @@
+# Test recursive CTEs and set operations
+
+# Simple recursive CTE - counting
+query I
+WITH RECURSIVE cnt(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM cnt WHERE x < 5) SELECT * FROM cnt;
+----
+1
+2
+3
+4
+5
+
+# Recursive CTE with UNION (deduplication)
+query I
+WITH RECURSIVE nums(n) AS (SELECT 1 UNION SELECT n+1 FROM nums WHERE n < 3) SELECT * FROM nums ORDER BY n;
+----
+1
+2
+3
+
+# Nested set operations
+query I
+(SELECT 1 UNION SELECT 2) INTERSECT (SELECT 2 UNION SELECT 3);
+----
+2
+
+# Nested UNION with EXCEPT
+query I
+(SELECT 1 UNION SELECT 2 UNION SELECT 3) EXCEPT (SELECT 2);
+----
+1
+3
+
+# Set operation in subquery
+query I
+SELECT * FROM (SELECT 1 AS x UNION SELECT 2 UNION SELECT 3) AS t ORDER BY x;
+----
+1
+2
+3
+
+# Set operation subquery with aggregation
+query T
+SELECT STRING_AGG(x::VARCHAR, ',' ORDER BY x DESC) FROM (SELECT 1 AS x UNION ALL SELECT 2 UNION ALL SELECT 3) AS t;
+----
+3,2,1
+
+# Multiple CTEs
+query II
+WITH a AS (SELECT 1 AS x), b AS (SELECT 2 AS y) SELECT * FROM a, b;
+----
+1	2
+
+# CTE used multiple times
+query II
+WITH vals AS (SELECT 1 AS v) SELECT a.v, b.v FROM vals a, vals b;
+----
+1	1

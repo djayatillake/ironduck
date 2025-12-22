@@ -75,15 +75,16 @@ DuckDB has 400+ built-in functions. Categories include:
 
 #### Features to Implement
 
-- [ ] All aggregate functions with DISTINCT, ORDER BY, FILTER
-- [ ] Window functions with PARTITION BY, ORDER BY, frame clauses
-- [ ] Common Table Expressions (CTEs), including recursive
+- [x] All aggregate functions with DISTINCT, ORDER BY, FILTER
+- [x] Window functions with PARTITION BY, ORDER BY, frame clauses
+- [x] Common Table Expressions (CTEs), including recursive
 - [ ] Correlated subqueries
-- [ ] All JOIN types (INNER, LEFT, RIGHT, FULL, CROSS, SEMI, ANTI)
-- [ ] SET operations (UNION, INTERSECT, EXCEPT)
-- [ ] Complex types (LIST, STRUCT, MAP)
-- [ ] Sequences (CREATE SEQUENCE, NEXTVAL)
-- [ ] Views (CREATE VIEW, materialized views)
+- [x] All JOIN types (INNER, LEFT, RIGHT, FULL, CROSS, SEMI, ANTI)
+- [x] SET operations (UNION, INTERSECT, EXCEPT) - including nested operations
+- [x] Complex types (LIST, STRUCT, MAP) - partial support
+- [x] Sequences (CREATE SEQUENCE, NEXTVAL)
+- [x] Views (CREATE VIEW)
+- [ ] Materialized views
 - [ ] Indexes
 - [ ] Transactions (BEGIN, COMMIT, ROLLBACK)
 - [ ] External file formats (Parquet, CSV, JSON)
@@ -111,10 +112,10 @@ ironduck/
 
 Features not yet implemented:
 
-- **Recursive CTEs**: WITH RECURSIVE queries
 - **Some INTERVAL syntax**: `INTERVAL 7 MINUTES` (use `INTERVAL '7' MINUTE`)
 - **Persistent storage**: Currently in-memory only
 - **Transactions**: BEGIN, COMMIT, ROLLBACK
+- **Correlated subqueries**: Complex correlated subquery patterns
 
 ## Contributing
 
