@@ -643,6 +643,8 @@ fn bind_from_with_ctes(
                 sql::JoinOperator::RightOuter(_) => BoundJoinType::Right,
                 sql::JoinOperator::FullOuter(_) => BoundJoinType::Full,
                 sql::JoinOperator::CrossJoin => BoundJoinType::Cross,
+                sql::JoinOperator::LeftSemi(_) => BoundJoinType::Semi,
+                sql::JoinOperator::LeftAnti(_) => BoundJoinType::Anti,
                 _ => return Err(Error::NotImplemented("Join type".to_string())),
             };
 
@@ -650,7 +652,9 @@ fn bind_from_with_ctes(
                 sql::JoinOperator::Inner(constraint)
                 | sql::JoinOperator::LeftOuter(constraint)
                 | sql::JoinOperator::RightOuter(constraint)
-                | sql::JoinOperator::FullOuter(constraint) => {
+                | sql::JoinOperator::FullOuter(constraint)
+                | sql::JoinOperator::LeftSemi(constraint)
+                | sql::JoinOperator::LeftAnti(constraint) => {
                     match constraint {
                         sql::JoinConstraint::On(expr) => {
                             // Build context with both left and right tables

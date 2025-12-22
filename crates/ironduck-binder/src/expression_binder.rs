@@ -313,6 +313,7 @@ pub fn bind_expression(
                     is_aggregate: false,
                     distinct: false,
                     order_by: vec![],
+                    filter: None,
                 },
                 LogicalType::Varchar,
             ))
@@ -337,6 +338,7 @@ pub fn bind_expression(
                     is_aggregate: false,
                     distinct: false,
                     order_by: vec![],
+                    filter: None,
                 },
                 LogicalType::Varchar,
             ))
@@ -354,6 +356,7 @@ pub fn bind_expression(
                     is_aggregate: false,
                     distinct: false,
                     order_by: vec![],
+                    filter: None,
                 },
                 LogicalType::Integer,
             ))
@@ -369,6 +372,7 @@ pub fn bind_expression(
                     is_aggregate: false,
                     distinct: false,
                     order_by: vec![],
+                    filter: None,
                 },
                 LogicalType::Double,
             ))
@@ -384,6 +388,7 @@ pub fn bind_expression(
                     is_aggregate: false,
                     distinct: false,
                     order_by: vec![],
+                    filter: None,
                 },
                 LogicalType::Double,
             ))
@@ -406,6 +411,7 @@ pub fn bind_expression(
                     is_aggregate: false,
                     distinct: false,
                     order_by: vec![],
+                    filter: None,
                 },
                 LogicalType::BigInt,
             ))
@@ -772,6 +778,12 @@ fn bind_function(
         _ => vec![],
     };
 
+    // Extract FILTER clause for aggregates (e.g., SUM(x) FILTER (WHERE y > 0))
+    let filter: Option<Box<BoundExpression>> = match &func.filter {
+        Some(filter_expr) => Some(Box::new(bind_expression(binder, filter_expr, ctx)?)),
+        None => None,
+    };
+
     // Validate argument count for functions that require specific numbers
     match name.as_str() {
         // Single-argument aggregate functions
@@ -942,6 +954,7 @@ fn bind_function(
             is_aggregate,
             distinct,
             order_by,
+            filter,
         },
         return_type,
     ))

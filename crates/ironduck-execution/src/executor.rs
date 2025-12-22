@@ -461,7 +461,58 @@ impl Executor {
                             }
                         }
                     }
-                    _ => return Err(Error::NotImplemented(format!("Join type: {:?}", join_type))),
+                    ironduck_planner::JoinType::Semi => {
+                        // SEMI JOIN - return left rows that have at least one match in right
+                        // Only returns columns from the left side
+                        for l in &left_rows {
+                            let mut has_match = false;
+                            for r in &right_rows {
+                                let mut combined = l.clone();
+                                combined.extend(r.clone());
+
+                                let matches = match condition {
+                                    Some(cond) => {
+                                        matches!(evaluate(cond, &combined)?, Value::Boolean(true))
+                                    }
+                                    None => true,
+                                };
+
+                                if matches {
+                                    has_match = true;
+                                    break; // Only need to find one match
+                                }
+                            }
+                            if has_match {
+                                result.push(l.clone()); // Only left side columns
+                            }
+                        }
+                    }
+                    ironduck_planner::JoinType::Anti => {
+                        // ANTI JOIN - return left rows that have NO match in right
+                        // Only returns columns from the left side
+                        for l in &left_rows {
+                            let mut has_match = false;
+                            for r in &right_rows {
+                                let mut combined = l.clone();
+                                combined.extend(r.clone());
+
+                                let matches = match condition {
+                                    Some(cond) => {
+                                        matches!(evaluate(cond, &combined)?, Value::Boolean(true))
+                                    }
+                                    None => true,
+                                };
+
+                                if matches {
+                                    has_match = true;
+                                    break;
+                                }
+                            }
+                            if !has_match {
+                                result.push(l.clone()); // Only left side columns
+                            }
+                        }
+                    }
                 }
 
                 Ok(result)
@@ -1633,6 +1684,24 @@ fn compute_aggregate(
 
     let args = &agg.args;
     let distinct = agg.distinct;
+
+    // Apply FILTER clause if present - filter out rows that don't match
+    let filtered_rows: Vec<Vec<Value>>;
+    let rows = if let Some(filter) = &agg.filter {
+        filtered_rows = rows
+            .iter()
+            .filter(|row| {
+                match eval_with_catalog(filter, row) {
+                    Ok(Value::Boolean(true)) => true,
+                    _ => false, // NULL or false means exclude the row
+                }
+            })
+            .cloned()
+            .collect();
+        &filtered_rows[..]
+    } else {
+        rows
+    };
 
     // If there's an ORDER BY clause, sort the rows first
     let sorted_rows: Vec<Vec<Value>>;

@@ -523,6 +523,8 @@ fn build_table_ref_plan(table_ref: &BoundTableRef) -> Result<LogicalOperator> {
                 ironduck_binder::BoundJoinType::Right => super::JoinType::Right,
                 ironduck_binder::BoundJoinType::Full => super::JoinType::Full,
                 ironduck_binder::BoundJoinType::Cross => super::JoinType::Cross,
+                ironduck_binder::BoundJoinType::Semi => super::JoinType::Semi,
+                ironduck_binder::BoundJoinType::Anti => super::JoinType::Anti,
             };
 
             Ok(LogicalOperator::Join {
@@ -648,6 +650,7 @@ fn convert_expression(expr: &BoundExpression) -> super::Expression {
             is_aggregate: _,
             distinct: _, // distinct is handled in extract_aggregate
             order_by: _, // order_by is handled in extract_aggregate
+            filter: _,   // filter is handled in extract_aggregate
         } => {
             // Return function expression - aggregates are handled specially in Aggregate operator
             super::Expression::Function {
@@ -952,6 +955,7 @@ fn extract_aggregate(expr: &BoundExpression) -> Option<super::AggregateExpressio
             is_aggregate,
             distinct,
             order_by,
+            filter,
         } if *is_aggregate => {
             let func = match name.as_str() {
                 "COUNT" => super::AggregateFunction::Count,
@@ -1030,11 +1034,14 @@ fn extract_aggregate(expr: &BoundExpression) -> Option<super::AggregateExpressio
                 })
                 .collect();
 
+            // Convert filter expression if present
+            let converted_filter = filter.as_ref().map(|f| convert_expression(f));
+
             Some(super::AggregateExpression {
                 function: func,
                 args: converted_args,
                 distinct: *distinct,
-                filter: None,
+                filter: converted_filter,
                 order_by: converted_order_by,
             })
         }

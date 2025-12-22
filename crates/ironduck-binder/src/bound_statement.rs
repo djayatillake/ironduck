@@ -171,6 +171,10 @@ pub enum BoundJoinType {
     Right,
     Full,
     Cross,
+    /// Semi join - returns rows from left that have a match in right
+    Semi,
+    /// Anti join - returns rows from left that have no match in right
+    Anti,
 }
 
 /// ORDER BY expression

@@ -87,6 +87,8 @@ pub enum BoundExpressionKind {
         /// ORDER BY clause for ordered aggregates (e.g., SUM(x ORDER BY y))
         /// Each tuple is (expression, ascending, nulls_first)
         order_by: Vec<(BoundExpression, bool, bool)>,
+        /// FILTER clause for aggregates (e.g., SUM(x) FILTER (WHERE y > 0))
+        filter: Option<Box<BoundExpression>>,
     },
 
     /// Type cast
