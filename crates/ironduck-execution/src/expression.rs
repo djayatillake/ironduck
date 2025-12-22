@@ -919,6 +919,81 @@ fn evaluate_function(name: &str, args: &[Value]) -> Result<Value> {
                 _ => Ok(Value::Null),
             }
         }
+        "LIST_PRODUCT" | "ARRAY_PRODUCT" => {
+            match args.first() {
+                Some(Value::List(list)) => {
+                    let product = list.iter()
+                        .filter(|v| !v.is_null())
+                        .try_fold(1.0f64, |acc, v| {
+                            v.as_f64().map(|f| acc * f)
+                        });
+                    match product {
+                        Some(p) => Ok(Value::Double(p)),
+                        None => Ok(Value::Null),
+                    }
+                }
+                Some(Value::Null) => Ok(Value::Null),
+                _ => Ok(Value::Null),
+            }
+        }
+        "LIST_ANY" | "ARRAY_ANY" | "LIST_BOOL_OR" => {
+            // Returns TRUE if any element is TRUE
+            match args.first() {
+                Some(Value::List(list)) => {
+                    let any_true = list.iter().any(|v| {
+                        matches!(v, Value::Boolean(true))
+                    });
+                    Ok(Value::Boolean(any_true))
+                }
+                Some(Value::Null) => Ok(Value::Null),
+                _ => Ok(Value::Null),
+            }
+        }
+        "LIST_ALL" | "ARRAY_ALL" | "LIST_BOOL_AND" => {
+            // Returns TRUE if all elements are TRUE
+            match args.first() {
+                Some(Value::List(list)) => {
+                    if list.is_empty() {
+                        return Ok(Value::Boolean(true));
+                    }
+                    let all_true = list.iter().all(|v| {
+                        matches!(v, Value::Boolean(true))
+                    });
+                    Ok(Value::Boolean(all_true))
+                }
+                Some(Value::Null) => Ok(Value::Null),
+                _ => Ok(Value::Null),
+            }
+        }
+        "LIST_COUNT" | "ARRAY_COUNT" => {
+            // Count non-null elements in a list
+            match args.first() {
+                Some(Value::List(list)) => {
+                    let count = list.iter().filter(|v| !v.is_null()).count();
+                    Ok(Value::BigInt(count as i64))
+                }
+                Some(Value::Null) => Ok(Value::Null),
+                _ => Ok(Value::Null),
+            }
+        }
+        "LIST_STRING_AGG" | "ARRAY_STRING_AGG" => {
+            // Concatenate list elements with separator
+            let list = match args.first() {
+                Some(Value::List(list)) => list,
+                Some(Value::Null) => return Ok(Value::Null),
+                _ => return Ok(Value::Null),
+            };
+            let separator = args.get(1)
+                .and_then(|v| v.as_str())
+                .unwrap_or(",");
+
+            let result: String = list.iter()
+                .filter(|v| !v.is_null())
+                .map(|v| value_to_string(v))
+                .collect::<Vec<_>>()
+                .join(separator);
+            Ok(Value::Varchar(result))
+        }
         "FLATTEN" => {
             // Flatten nested lists one level
             match args.first() {
