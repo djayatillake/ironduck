@@ -2,10 +2,10 @@
 
 use super::expression_binder::{bind_data_type, bind_expression, ExpressionBinderContext};
 use super::{
-    BoundCTE, BoundColumnDef, BoundCreateSchema, BoundCreateTable, BoundCreateView, BoundDelete,
-    BoundDrop, BoundExpression, BoundInsert, BoundJoinType, BoundOrderBy, BoundSelect,
-    BoundSetOperation, BoundStatement, BoundTableRef, BoundUpdate, Binder, DistinctKind,
-    DropObjectType, SetOperationType, TableFunctionType,
+    BoundCTE, BoundColumnDef, BoundCreateSchema, BoundCreateSequence, BoundCreateTable,
+    BoundCreateView, BoundDelete, BoundDrop, BoundExpression, BoundInsert, BoundJoinType,
+    BoundOrderBy, BoundSelect, BoundSetOperation, BoundStatement, BoundTableRef, BoundUpdate,
+    Binder, DistinctKind, DropObjectType, SetOperationType, TableFunctionType,
 };
 use ironduck_common::{Error, Result};
 use sqlparser::ast as sql;
@@ -83,6 +83,15 @@ pub fn bind_statement(binder: &Binder, stmt: &sql::Statement) -> Result<BoundSta
 
         sql::Statement::CreateView { name, query, or_replace, .. } => {
             bind_create_view(binder, name, query, *or_replace)
+        }
+
+        sql::Statement::CreateSequence {
+            name,
+            if_not_exists,
+            sequence_options,
+            ..
+        } => {
+            bind_create_sequence(binder, name, *if_not_exists, sequence_options)
         }
 
         _ => Err(Error::NotImplemented(format!("Statement: {:?}", stmt))),
@@ -1341,4 +1350,66 @@ fn expand_wildcard_rec_with_skip(
         }
         BoundTableRef::Empty => {}
     }
+}
+
+/// Bind CREATE SEQUENCE
+fn bind_create_sequence(
+    binder: &Binder,
+    name: &sql::ObjectName,
+    if_not_exists: bool,
+    options: &[sql::SequenceOptions],
+) -> Result<BoundStatement> {
+    let parts: Vec<_> = name.0.iter().map(|i| i.value.clone()).collect();
+    let (schema, seq_name) = if parts.len() == 2 {
+        (parts[0].clone(), parts[1].clone())
+    } else {
+        (binder.current_schema().to_string(), parts[0].clone())
+    };
+
+    // Parse sequence options
+    let mut start: i64 = 1;
+    let mut increment: i64 = 1;
+    let mut min_value: i64 = 1;
+    let mut max_value: i64 = i64::MAX;
+    let mut cycle = false;
+
+    for opt in options {
+        match opt {
+            sql::SequenceOptions::StartWith(val, _) => {
+                if let sql::Expr::Value(sql::Value::Number(n, _)) = val {
+                    start = n.parse().unwrap_or(1);
+                }
+            }
+            sql::SequenceOptions::IncrementBy(val, _) => {
+                if let sql::Expr::Value(sql::Value::Number(n, _)) = val {
+                    increment = n.parse().unwrap_or(1);
+                }
+            }
+            sql::SequenceOptions::MinValue(Some(val)) => {
+                if let sql::Expr::Value(sql::Value::Number(n, _)) = val {
+                    min_value = n.parse().unwrap_or(1);
+                }
+            }
+            sql::SequenceOptions::MaxValue(Some(val)) => {
+                if let sql::Expr::Value(sql::Value::Number(n, _)) = val {
+                    max_value = n.parse().unwrap_or(i64::MAX);
+                }
+            }
+            sql::SequenceOptions::Cycle(is_cycle) => {
+                cycle = *is_cycle;
+            }
+            _ => {}
+        }
+    }
+
+    Ok(BoundStatement::CreateSequence(BoundCreateSequence {
+        schema,
+        name: seq_name,
+        start,
+        increment,
+        min_value,
+        max_value,
+        cycle,
+        if_not_exists,
+    }))
 }

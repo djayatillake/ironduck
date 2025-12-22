@@ -5,7 +5,37 @@ use ironduck_catalog::Catalog;
 use ironduck_common::{Error, LogicalType, Result, Value};
 use ironduck_planner::{Expression, LogicalOperator, LogicalPlan, TableFunctionKind, WindowFunction};
 use ironduck_storage::TableStorage;
+use std::cell::RefCell;
 use std::sync::Arc;
+
+// Thread-local catalog reference for expression evaluation in functions like compute_aggregate
+thread_local! {
+    static CURRENT_CATALOG: RefCell<Option<Arc<Catalog>>> = const { RefCell::new(None) };
+}
+
+/// Set the catalog for the current thread during execution
+fn with_catalog<T>(catalog: Arc<Catalog>, f: impl FnOnce() -> T) -> T {
+    CURRENT_CATALOG.with(|c| {
+        let old = c.borrow_mut().replace(catalog);
+        let result = f();
+        *c.borrow_mut() = old;
+        result
+    })
+}
+
+/// Get the current thread's catalog (for expression evaluation)
+fn current_catalog() -> Option<Arc<Catalog>> {
+    CURRENT_CATALOG.with(|c| c.borrow().clone())
+}
+
+/// Evaluate expression using the thread-local catalog if available
+fn eval_with_catalog(expr: &Expression, row: &[Value]) -> Result<Value> {
+    if let Some(catalog) = current_catalog() {
+        evaluate_with_ctx(expr, row, &EvalContext::with_catalog(catalog))
+    } else {
+        evaluate(expr, row)
+    }
+}
 
 /// The main query executor
 pub struct Executor {
@@ -31,9 +61,21 @@ impl Executor {
         &self.storage
     }
 
+    /// Get evaluation context with catalog access
+    fn eval_ctx(&self) -> EvalContext {
+        EvalContext::with_catalog(self.catalog.clone())
+    }
+
+    /// Evaluate expression with catalog access (for NEXTVAL, etc.)
+    fn eval(&self, expr: &Expression, row: &[Value]) -> Result<Value> {
+        evaluate_with_ctx(expr, row, &self.eval_ctx())
+    }
+
     /// Execute a logical plan and return results
     pub fn execute(&self, plan: &LogicalPlan) -> Result<QueryResult> {
-        let rows = self.execute_operator(&plan.root)?;
+        // Set the catalog for the current thread so aggregate functions can access it
+        let catalog = self.catalog.clone();
+        let rows = with_catalog(catalog, || self.execute_operator(&plan.root))?;
 
         Ok(QueryResult {
             columns: plan.output_names.clone(),
@@ -499,6 +541,37 @@ impl Executor {
                     *or_replace,
                 )?;
                 Ok(vec![vec![Value::Varchar(format!("Created view {}", name))]])
+            }
+
+            LogicalOperator::CreateSequence {
+                schema,
+                name,
+                start,
+                increment,
+                min_value,
+                max_value,
+                cycle,
+                if_not_exists,
+            } => {
+                // Check if sequence exists
+                if self.catalog.get_sequence(schema, name).is_some() {
+                    if *if_not_exists {
+                        return Ok(vec![vec![Value::Varchar("Sequence already exists".to_string())]]);
+                    } else {
+                        return Err(Error::SequenceAlreadyExists(name.clone()));
+                    }
+                }
+
+                self.catalog.create_sequence(
+                    schema,
+                    name,
+                    *start,
+                    *increment,
+                    *min_value,
+                    *max_value,
+                    *cycle,
+                )?;
+                Ok(vec![vec![Value::Varchar(format!("Created sequence {}", name))]])
             }
 
             LogicalOperator::Insert {
@@ -1221,6 +1294,9 @@ fn format_plan(op: &LogicalOperator, indent: usize) -> String {
         LogicalOperator::CreateView { name, .. } => {
             format!("{}CreateView: {}", prefix, name)
         }
+        LogicalOperator::CreateSequence { name, .. } => {
+            format!("{}CreateSequence: {}", prefix, name)
+        }
         LogicalOperator::Insert { table, .. } => {
             format!("{}Insert: {}", prefix, table)
         }
@@ -1454,7 +1530,7 @@ fn compute_aggregate(
                 // COUNT(DISTINCT expr) - count distinct non-NULL values
                 let mut seen = std::collections::HashSet::new();
                 for row in rows {
-                    let val = evaluate(&args[0], row)?;
+                    let val = eval_with_catalog(&args[0], row)?;
                     if !val.is_null() {
                         seen.insert(format!("{:?}", val));
                     }
@@ -1464,7 +1540,7 @@ fn compute_aggregate(
                 // COUNT(expr) - count non-NULL values
                 let mut count = 0i64;
                 for row in rows {
-                    let val = evaluate(&args[0], row)?;
+                    let val = eval_with_catalog(&args[0], row)?;
                     if !val.is_null() {
                         count += 1;
                     }
@@ -1484,7 +1560,7 @@ fn compute_aggregate(
                 if args.is_empty() {
                     continue;
                 }
-                let val = evaluate(&args[0], row)?;
+                let val = eval_with_catalog(&args[0], row)?;
                 match val {
                     Value::TinyInt(i) => {
                         has_value = true;
@@ -1554,6 +1630,7 @@ fn compute_aggregate(
                 Timestamp,
                 Date,
                 Time,
+                TimeTz,
                 TimestampTz,
                 Interval,
             }
@@ -1566,7 +1643,7 @@ fn compute_aggregate(
                 if args.is_empty() {
                     continue;
                 }
-                let val = evaluate(&args[0], row)?;
+                let val = eval_with_catalog(&args[0], row)?;
                 if val.is_null() {
                     continue;
                 }
@@ -1653,6 +1730,14 @@ fn compute_aggregate(
                         sum += nanos as f64;
                         count += 1;
                     }
+                    Value::TimeTz(t, _offset) => {
+                        avg_type.get_or_insert(AvgType::TimeTz);
+                        // Convert to nanoseconds since midnight (ignoring offset for avg)
+                        let nanos = t.num_seconds_from_midnight() as i64 * 1_000_000_000
+                            + t.nanosecond() as i64;
+                        sum += nanos as f64;
+                        count += 1;
+                    }
                     Value::TimestampTz(ts) => {
                         avg_type.get_or_insert(AvgType::TimestampTz);
                         let micros = ts.timestamp_micros();
@@ -1708,6 +1793,15 @@ fn compute_aggregate(
                         let time = NaiveTime::from_num_seconds_from_midnight_opt(secs, nanos)
                             .unwrap_or_else(|| NaiveTime::from_hms_opt(0, 0, 0).unwrap());
                         Ok(Value::Time(time))
+                    }
+                    Some(AvgType::TimeTz) => {
+                        let avg_nanos = (sum / count as f64) as i64;
+                        let secs = (avg_nanos / 1_000_000_000) as u32;
+                        let nanos = (avg_nanos % 1_000_000_000) as u32;
+                        let time = NaiveTime::from_num_seconds_from_midnight_opt(secs, nanos)
+                            .unwrap_or_else(|| NaiveTime::from_hms_opt(0, 0, 0).unwrap());
+                        // Return with UTC offset (0)
+                        Ok(Value::TimeTz(time, 0))
                     }
                     Some(AvgType::TimestampTz) => {
                         let avg_micros = (sum / count as f64) as i64;
@@ -2370,12 +2464,17 @@ fn coerce_value(value: Value, target_type: &LogicalType) -> Result<Value> {
         (Value::Timestamp(_), LogicalType::Timestamp) => Ok(value),
         (Value::Date(_), LogicalType::Date) => Ok(value),
         (Value::Time(_), LogicalType::Time) => Ok(value),
+        (Value::TimeTz(_, _), LogicalType::TimeTz) => Ok(value),
         (Value::TimestampTz(_), LogicalType::TimestampTz) => Ok(value),
         (Value::Integer(_), LogicalType::Integer) => Ok(value),
         (Value::BigInt(_), LogicalType::BigInt) => Ok(value),
         (Value::Double(_), LogicalType::Double) => Ok(value),
         (Value::Varchar(_), LogicalType::Varchar) => Ok(value),
         (Value::Boolean(_), LogicalType::Boolean) => Ok(value),
+        // String to TimeTz conversion
+        (Value::Varchar(s), LogicalType::TimeTz) => {
+            parse_timetz(&s).map(|(time, offset)| Value::TimeTz(time, offset))
+        }
         // For other types, just return the value (may need more conversions later)
         _ => Ok(value),
     }
@@ -2460,4 +2559,63 @@ fn parse_interval(s: &str) -> Result<ironduck_common::value::Interval> {
     }
 
     Ok(Interval::new(months, days, micros))
+}
+
+/// Parse a TIMETZ string like "00:00:00+1559" or "12:30:45-0500"
+fn parse_timetz(s: &str) -> Result<(chrono::NaiveTime, i32)> {
+    use chrono::NaiveTime;
+
+    let s = s.trim();
+
+    // Find the timezone offset (+ or -)
+    let (time_part, offset_secs) = if let Some(pos) = s.rfind('+') {
+        let time_str = &s[..pos];
+        let offset_str = &s[pos + 1..];
+        let offset = parse_tz_offset_str(offset_str);
+        (time_str, offset)
+    } else if let Some(pos) = s.rfind('-') {
+        // Make sure we don't split on something that's not a timezone
+        if pos > 5 {
+            let time_str = &s[..pos];
+            let offset_str = &s[pos + 1..];
+            let offset = -parse_tz_offset_str(offset_str);
+            (time_str, offset)
+        } else {
+            (s, 0)
+        }
+    } else {
+        (s, 0)
+    };
+
+    // Handle 24:00:00 which is valid in SQL but not in chrono
+    // It represents midnight at the end of the day (same as 00:00:00 the next day)
+    let time_part_owned: String;
+    let time_part_ref = if time_part.starts_with("24:") {
+        time_part_owned = time_part.replacen("24:", "00:", 1);
+        time_part_owned.as_str()
+    } else {
+        time_part
+    };
+
+    let time = NaiveTime::parse_from_str(time_part_ref, "%H:%M:%S")
+        .or_else(|_| NaiveTime::parse_from_str(time_part_ref, "%H:%M:%S%.f"))
+        .or_else(|_| NaiveTime::parse_from_str(time_part_ref, "%H:%M"))
+        .map_err(|_| Error::Parse(format!("Invalid TIMETZ format: {}", s)))?;
+
+    Ok((time, offset_secs))
+}
+
+/// Parse a timezone offset string like "0530" or "05:30" or "1559" to seconds
+fn parse_tz_offset_str(s: &str) -> i32 {
+    let s = s.replace(':', "");
+    if s.len() >= 4 {
+        let hours: i32 = s[..2].parse().unwrap_or(0);
+        let mins: i32 = s[2..4].parse().unwrap_or(0);
+        hours * 3600 + mins * 60
+    } else if s.len() >= 2 {
+        let hours: i32 = s[..2].parse().unwrap_or(0);
+        hours * 3600
+    } else {
+        0
+    }
 }

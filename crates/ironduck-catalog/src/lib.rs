@@ -10,12 +10,14 @@ use std::sync::Arc;
 mod column;
 mod function;
 mod schema;
+mod sequence;
 mod table;
 mod view;
 
 pub use column::{Column, ColumnId};
 pub use function::{Function, FunctionId};
 pub use schema::{Schema, SchemaId};
+pub use sequence::{Sequence, SequenceId};
 pub use table::{Table, TableId};
 pub use view::{View, ViewId};
 
@@ -143,6 +145,42 @@ impl Catalog {
     pub fn get_view(&self, schema_name: &str, view_name: &str) -> Option<Arc<View>> {
         let schema = self.get_schema(schema_name)?;
         schema.get_view(view_name)
+    }
+
+    /// Create a sequence in the given schema
+    pub fn create_sequence(
+        &self,
+        schema_name: &str,
+        sequence_name: &str,
+        start: i64,
+        increment: i64,
+        min_value: i64,
+        max_value: i64,
+        cycle: bool,
+    ) -> Result<SequenceId> {
+        let schema = self
+            .get_schema(schema_name)
+            .ok_or_else(|| Error::SchemaNotFound(schema_name.to_string()))?;
+
+        let sequence_id = self.next_id();
+        let sequence = Sequence::new(
+            sequence_id,
+            sequence_name.to_string(),
+            start,
+            increment,
+            min_value,
+            max_value,
+            cycle,
+        );
+        schema.add_sequence(sequence)?;
+
+        Ok(sequence_id)
+    }
+
+    /// Get a sequence by schema and sequence name
+    pub fn get_sequence(&self, schema_name: &str, sequence_name: &str) -> Option<Arc<Sequence>> {
+        let schema = self.get_schema(schema_name)?;
+        schema.get_sequence(sequence_name)
     }
 
     /// List all schema names

@@ -1,14 +1,27 @@
 //! Expression evaluation
 
+use ironduck_catalog::Catalog;
 use ironduck_common::{Error, LogicalType, Result, Value};
 use ironduck_planner::{BinaryOperator, Expression, UnaryOperator};
 use std::cmp::Ordering;
+use std::sync::Arc;
 
 /// Context for expression evaluation
-#[derive(Debug, Clone, Default)]
+#[derive(Clone, Default)]
 pub struct EvalContext {
     /// Row indices for each table (for rowid pseudo-column)
     pub row_indices: Vec<i64>,
+    /// Optional catalog reference for functions like NEXTVAL
+    catalog: Option<Arc<Catalog>>,
+}
+
+impl std::fmt::Debug for EvalContext {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EvalContext")
+            .field("row_indices", &self.row_indices)
+            .field("has_catalog", &self.catalog.is_some())
+            .finish()
+    }
 }
 
 impl EvalContext {
@@ -19,7 +32,19 @@ impl EvalContext {
     pub fn with_row_index(row_idx: i64) -> Self {
         Self {
             row_indices: vec![row_idx],
+            catalog: None,
         }
+    }
+
+    pub fn with_catalog(catalog: Arc<Catalog>) -> Self {
+        Self {
+            row_indices: Vec::new(),
+            catalog: Some(catalog),
+        }
+    }
+
+    pub fn catalog(&self) -> Option<&Catalog> {
+        self.catalog.as_deref()
     }
 }
 
@@ -51,6 +76,35 @@ pub fn evaluate_with_ctx(expr: &Expression, row: &[Value], ctx: &EvalContext) ->
         }
 
         Expression::Function { name, args } => {
+            let name_upper = name.to_uppercase();
+
+            // Handle NEXTVAL/CURRVAL specially - they need catalog access
+            if name_upper == "NEXTVAL" || name_upper == "CURRVAL" {
+                if args.is_empty() {
+                    return Err(Error::InvalidArguments(format!("{} requires a sequence name", name_upper)));
+                }
+                let seq_name = evaluate_with_ctx(&args[0], row, ctx)?;
+                let seq_name_str = match seq_name {
+                    Value::Varchar(s) => s,
+                    _ => return Err(Error::InvalidArguments("Sequence name must be a string".to_string())),
+                };
+
+                // Get catalog from context
+                let catalog = ctx.catalog().ok_or_else(|| {
+                    Error::NotImplemented(format!("Function: {}", name_upper))
+                })?;
+
+                // Look up the sequence (try main schema)
+                let sequence = catalog.get_sequence("main", &seq_name_str)
+                    .ok_or_else(|| Error::SequenceNotFound(seq_name_str.clone()))?;
+
+                if name_upper == "NEXTVAL" {
+                    return Ok(Value::BigInt(sequence.nextval()));
+                } else {
+                    return Ok(Value::BigInt(sequence.currval()));
+                }
+            }
+
             let arg_values: Result<Vec<_>> = args.iter().map(|a| evaluate_with_ctx(a, row, ctx)).collect();
             evaluate_function(name, &arg_values?)
         }
@@ -2210,6 +2264,21 @@ fn value_to_json_string(val: &Value) -> String {
     }
 }
 
+/// Parse a timezone offset string like "0530" or "05:30" to seconds
+fn parse_tz_offset(s: &str) -> i32 {
+    let s = s.replace(':', "");
+    if s.len() >= 4 {
+        let hours: i32 = s[..2].parse().unwrap_or(0);
+        let mins: i32 = s[2..4].parse().unwrap_or(0);
+        hours * 3600 + mins * 60
+    } else if s.len() >= 2 {
+        let hours: i32 = s[..2].parse().unwrap_or(0);
+        hours * 3600
+    } else {
+        0
+    }
+}
+
 /// Cast a value to a target type
 fn cast_value(val: &Value, target: &LogicalType) -> Result<Value> {
     if val.is_null() {
@@ -2420,6 +2489,52 @@ fn cast_value(val: &Value, target: &LogicalType) -> Result<Value> {
                 }),
             };
             Ok(Value::Time(t))
+        }
+        LogicalType::TimeTz => {
+            use chrono::NaiveTime;
+            let (time, offset) = match val {
+                Value::TimeTz(t, off) => (*t, *off),
+                Value::Time(t) => (*t, 0), // Assume UTC for plain time
+                Value::Timestamp(ts) => (ts.time(), 0),
+                Value::TimestampTz(ts) => (ts.time(), 0), // Already UTC
+                Value::Varchar(s) => {
+                    // Parse TIMETZ format like "00:00:00+1559" or "12:30:45-0500"
+                    let s = s.trim();
+                    // Find the timezone offset (+ or -)
+                    let (time_part, offset_secs) = if let Some(pos) = s.rfind('+') {
+                        let time_str = &s[..pos];
+                        let offset_str = &s[pos + 1..];
+                        let offset = parse_tz_offset(offset_str);
+                        (time_str, offset)
+                    } else if let Some(pos) = s.rfind('-') {
+                        // Make sure we don't split on a date separator
+                        if pos > 5 { // Likely timezone, not date
+                            let time_str = &s[..pos];
+                            let offset_str = &s[pos + 1..];
+                            let offset = -parse_tz_offset(offset_str);
+                            (time_str, offset)
+                        } else {
+                            (s, 0)
+                        }
+                    } else {
+                        (s, 0)
+                    };
+
+                    let time = NaiveTime::parse_from_str(time_part, "%H:%M:%S")
+                        .or_else(|_| NaiveTime::parse_from_str(time_part, "%H:%M:%S%.f"))
+                        .or_else(|_| NaiveTime::parse_from_str(time_part, "%H:%M"))
+                        .map_err(|_| Error::InvalidCast {
+                            from: "VARCHAR".to_string(),
+                            to: "TIMETZ".to_string(),
+                        })?;
+                    (time, offset_secs)
+                }
+                _ => return Err(Error::InvalidCast {
+                    from: val.logical_type().to_string(),
+                    to: target.to_string(),
+                }),
+            };
+            Ok(Value::TimeTz(time, offset))
         }
         LogicalType::TimestampTz => {
             use chrono::{DateTime, Utc, NaiveDateTime, NaiveDate};

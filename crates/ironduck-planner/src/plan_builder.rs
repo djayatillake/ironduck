@@ -78,6 +78,19 @@ pub fn build_plan(statement: &BoundStatement) -> Result<LogicalPlan> {
             },
             vec!["Success".to_string()],
         )),
+        BoundStatement::CreateSequence(seq) => Ok(LogicalPlan::new(
+            LogicalOperator::CreateSequence {
+                schema: seq.schema.clone(),
+                name: seq.name.clone(),
+                start: seq.start,
+                increment: seq.increment,
+                min_value: seq.min_value,
+                max_value: seq.max_value,
+                cycle: seq.cycle,
+                if_not_exists: seq.if_not_exists,
+            },
+            vec!["Success".to_string()],
+        )),
         BoundStatement::Drop(drop) => Ok(LogicalPlan::new(
             LogicalOperator::Drop {
                 object_type: format!("{:?}", drop.object_type),

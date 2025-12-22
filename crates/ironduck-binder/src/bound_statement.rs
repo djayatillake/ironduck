@@ -14,6 +14,7 @@ pub enum BoundStatement {
     CreateTable(BoundCreateTable),
     CreateSchema(BoundCreateSchema),
     CreateView(BoundCreateView),
+    CreateSequence(BoundCreateSequence),
     Drop(BoundDrop),
     Explain(Box<BoundStatement>),
     /// No-op statement (PRAGMA, SET, etc.)
@@ -241,6 +242,19 @@ pub struct BoundCreateView {
     pub column_names: Vec<String>,
     /// Whether to replace if exists
     pub or_replace: bool,
+}
+
+/// Bound CREATE SEQUENCE statement
+#[derive(Debug, Clone)]
+pub struct BoundCreateSequence {
+    pub schema: String,
+    pub name: String,
+    pub start: i64,
+    pub increment: i64,
+    pub min_value: i64,
+    pub max_value: i64,
+    pub cycle: bool,
+    pub if_not_exists: bool,
 }
 
 /// Bound DROP statement

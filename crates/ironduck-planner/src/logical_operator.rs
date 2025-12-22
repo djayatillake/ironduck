@@ -99,6 +99,18 @@ pub enum LogicalOperator {
         or_replace: bool,
     },
 
+    /// CREATE SEQUENCE
+    CreateSequence {
+        schema: String,
+        name: String,
+        start: i64,
+        increment: i64,
+        min_value: i64,
+        max_value: i64,
+        cycle: bool,
+        if_not_exists: bool,
+    },
+
     /// INSERT
     Insert {
         schema: String,
@@ -227,6 +239,7 @@ impl LogicalOperator {
             LogicalOperator::CreateTable { .. } => vec![LogicalType::Varchar],
             LogicalOperator::CreateSchema { .. } => vec![LogicalType::Varchar],
             LogicalOperator::CreateView { .. } => vec![LogicalType::Varchar],
+            LogicalOperator::CreateSequence { .. } => vec![LogicalType::Varchar],
             LogicalOperator::Insert { .. } => vec![LogicalType::BigInt],
             LogicalOperator::Delete { .. } => vec![LogicalType::BigInt],
             LogicalOperator::Update { .. } => vec![LogicalType::BigInt],

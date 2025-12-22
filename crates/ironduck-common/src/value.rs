@@ -8,7 +8,7 @@
 //! - Row values during non-vectorized operations
 
 use crate::types::LogicalType;
-use chrono::{DateTime, NaiveDate, NaiveDateTime, NaiveTime, Utc};
+use chrono::{DateTime, NaiveDate, NaiveDateTime, NaiveTime, Timelike, Utc};
 use rust_decimal::Decimal;
 use std::cmp::Ordering;
 use std::fmt;
@@ -91,6 +91,8 @@ pub enum Value {
     Date(NaiveDate),
     /// Time value
     Time(NaiveTime),
+    /// Time with timezone (time, offset in seconds)
+    TimeTz(NaiveTime, i32),
     /// Timestamp without timezone
     Timestamp(NaiveDateTime),
     /// Timestamp with timezone (stored as UTC)
@@ -135,6 +137,7 @@ impl Value {
             Value::Blob(_) => LogicalType::Blob,
             Value::Date(_) => LogicalType::Date,
             Value::Time(_) => LogicalType::Time,
+            Value::TimeTz(_, _) => LogicalType::TimeTz,
             Value::Timestamp(_) => LogicalType::Timestamp,
             Value::TimestampTz(_) => LogicalType::TimestampTz,
             Value::Interval(_) => LogicalType::Interval,
@@ -350,6 +353,21 @@ impl fmt::Display for Value {
             Value::Blob(b) => write!(f, "<blob {} bytes>", b.len()),
             Value::Date(d) => write!(f, "{}", d),
             Value::Time(t) => write!(f, "{}", t),
+            Value::TimeTz(t, offset_secs) => {
+                // Format as "HH:MM:SS.microseconds+HH" (DuckDB format)
+                let sign = if *offset_secs >= 0 { '+' } else { '-' };
+                let abs_offset = offset_secs.abs();
+                let offset_hours = abs_offset / 3600;
+                // Include microseconds if non-zero
+                let nanos = t.nanosecond();
+                if nanos > 0 {
+                    // Convert nanos to micros for display
+                    let micros = nanos / 1000;
+                    write!(f, "{}.{:06}{}{:02}", t.format("%H:%M:%S"), micros, sign, offset_hours)
+                } else {
+                    write!(f, "{}{}{:02}", t.format("%H:%M:%S"), sign, offset_hours)
+                }
+            }
             Value::Timestamp(ts) => write!(f, "{}", ts),
             Value::TimestampTz(ts) => {
                 // Format as "2024-11-15 12:00:00+00" (DuckDB format)

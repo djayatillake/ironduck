@@ -77,6 +77,8 @@ pub enum LogicalType {
     Date,
     /// Time of day (hour, minute, second, microsecond)
     Time,
+    /// Time of day with timezone offset
+    TimeTz,
     /// Timestamp without timezone
     Timestamp,
     /// Timestamp with timezone (stored as UTC)
@@ -203,6 +205,7 @@ impl LogicalType {
             self,
             LogicalType::Date
                 | LogicalType::Time
+                | LogicalType::TimeTz
                 | LogicalType::Timestamp
                 | LogicalType::TimestampTz
                 | LogicalType::Interval
@@ -220,6 +223,7 @@ impl LogicalType {
             LogicalType::HugeInt | LogicalType::UHugeInt | LogicalType::Uuid => Some(16),
             LogicalType::Date => Some(4),
             LogicalType::Time => Some(8),
+            LogicalType::TimeTz => Some(12), // 8 bytes time + 4 bytes offset
             LogicalType::Timestamp | LogicalType::TimestampTz => Some(8),
             LogicalType::Interval => Some(16),
             LogicalType::Decimal { width, .. } => {
@@ -331,6 +335,7 @@ impl fmt::Display for LogicalType {
             LogicalType::Blob => write!(f, "BLOB"),
             LogicalType::Date => write!(f, "DATE"),
             LogicalType::Time => write!(f, "TIME"),
+            LogicalType::TimeTz => write!(f, "TIMETZ"),
             LogicalType::Timestamp => write!(f, "TIMESTAMP"),
             LogicalType::TimestampTz => write!(f, "TIMESTAMPTZ"),
             LogicalType::Interval => write!(f, "INTERVAL"),

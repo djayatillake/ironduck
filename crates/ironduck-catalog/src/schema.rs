@@ -1,6 +1,6 @@
 //! Schema management
 
-use super::{CatalogId, Table, TableId, View};
+use super::{CatalogId, Sequence, Table, TableId, View};
 use hashbrown::HashMap;
 use ironduck_common::{Error, Result};
 use parking_lot::RwLock;
@@ -18,6 +18,8 @@ pub struct Schema {
     tables: RwLock<HashMap<String, Arc<Table>>>,
     /// Views in this schema
     views: RwLock<HashMap<String, Arc<View>>>,
+    /// Sequences in this schema
+    sequences: RwLock<HashMap<String, Arc<Sequence>>>,
 }
 
 impl Schema {
@@ -27,6 +29,7 @@ impl Schema {
             name,
             tables: RwLock::new(HashMap::new()),
             views: RwLock::new(HashMap::new()),
+            sequences: RwLock::new(HashMap::new()),
         }
     }
 
@@ -93,6 +96,33 @@ impl Schema {
         let name_lower = name.to_lowercase();
         if views.remove(&name_lower).is_none() {
             return Err(Error::ViewNotFound(name.to_string()));
+        }
+        Ok(())
+    }
+
+    /// Add a sequence to this schema (name is normalized to lowercase)
+    pub fn add_sequence(&self, sequence: Sequence) -> Result<()> {
+        let mut sequences = self.sequences.write();
+        let name_lower = sequence.name.to_lowercase();
+        if sequences.contains_key(&name_lower) {
+            return Err(Error::SequenceAlreadyExists(sequence.name.clone()));
+        }
+        sequences.insert(name_lower, Arc::new(sequence));
+        Ok(())
+    }
+
+    /// Get a sequence by name (case-insensitive)
+    pub fn get_sequence(&self, name: &str) -> Option<Arc<Sequence>> {
+        let name_lower = name.to_lowercase();
+        self.sequences.read().get(&name_lower).cloned()
+    }
+
+    /// Remove a sequence by name (case-insensitive)
+    pub fn drop_sequence(&self, name: &str) -> Result<()> {
+        let mut sequences = self.sequences.write();
+        let name_lower = name.to_lowercase();
+        if sequences.remove(&name_lower).is_none() {
+            return Err(Error::SequenceNotFound(name.to_string()));
         }
         Ok(())
     }

@@ -899,6 +899,9 @@ pub fn bind_data_type(data_type: &sql::DataType) -> Result<LogicalType> {
         }
         sql::DataType::Blob(_) | sql::DataType::Bytea => Ok(LogicalType::Blob),
         sql::DataType::Date => Ok(LogicalType::Date),
+        // TimeTz (time with timezone) - must come before generic Time
+        sql::DataType::Time(_, sql::TimezoneInfo::Tz)
+        | sql::DataType::Time(_, sql::TimezoneInfo::WithTimeZone) => Ok(LogicalType::TimeTz),
         sql::DataType::Time(_, _) => Ok(LogicalType::Time),
         // TimestampTz (timestamp with timezone) - must come before generic Timestamp
         sql::DataType::Timestamp(_, sql::TimezoneInfo::Tz)
@@ -932,7 +935,7 @@ pub fn bind_data_type(data_type: &sql::DataType) -> Result<LogicalType> {
                 "UINTEGER" => Ok(LogicalType::UInteger),
                 "UBIGINT" => Ok(LogicalType::UBigInt),
                 "TIMESTAMPTZ" => Ok(LogicalType::TimestampTz),
-                "TIMETZ" => Ok(LogicalType::Time), // We don't have TimeTz yet, fallback to Time
+                "TIMETZ" => Ok(LogicalType::TimeTz),
                 _ => Err(Error::NotImplemented(format!("Data type: {}", type_name))),
             }
         }
