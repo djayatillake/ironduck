@@ -696,6 +696,9 @@ fn collect_base_tables_rec(table_ref: &BoundTableRef, result: &mut Vec<(String, 
             let table_name = alias.clone().unwrap_or_else(|| "range".to_string());
             result.push((table_name.clone(), alias.clone(), vec![col_name], vec![LogicalType::BigInt]));
         }
+        BoundTableRef::RecursiveCTERef { cte_name, alias, column_names, column_types } => {
+            result.push((cte_name.clone(), Some(alias.clone()), column_names.clone(), column_types.clone()));
+        }
         BoundTableRef::Empty => {}
     }
 }

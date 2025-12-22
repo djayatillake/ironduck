@@ -1288,6 +1288,57 @@ impl Executor {
                 Ok(vec![vec![Value::Varchar(plan_str)]])
             }
 
+            LogicalOperator::RecursiveCTE {
+                name: _,
+                base_case,
+                recursive_case,
+                output_names: _,
+                output_types: _,
+                union_all,
+            } => {
+                // Execute the recursive CTE using iterative fixpoint computation
+                // 1. Execute the base case (anchor)
+                let mut result = self.execute_operator(base_case)?;
+
+                // 2. Iteratively execute the recursive case until no new rows are produced
+                let max_iterations = 1000; // Prevent infinite loops
+                let mut iteration = 0;
+
+                loop {
+                    if iteration >= max_iterations {
+                        return Err(Error::NotImplemented(
+                            "Recursive CTE exceeded maximum iteration limit".to_string()
+                        ));
+                    }
+                    iteration += 1;
+
+                    // Execute the recursive part with current result as input
+                    // The recursive case references the CTE, which should read from result
+                    // For now, we use a simplified approach: execute recursive_case
+                    // and check if it produces new rows
+                    let new_rows = self.execute_operator(recursive_case)?;
+
+                    if new_rows.is_empty() {
+                        break;
+                    }
+
+                    // Add new rows to result
+                    if *union_all {
+                        // UNION ALL: just append all rows
+                        result.extend(new_rows);
+                    } else {
+                        // UNION: deduplicate
+                        for row in new_rows {
+                            if !result.contains(&row) {
+                                result.push(row);
+                            }
+                        }
+                    }
+                }
+
+                Ok(result)
+            }
+
             LogicalOperator::NoOp => {
                 // No-op statements return empty result
                 Ok(vec![vec![Value::Varchar("OK".to_string())]])
@@ -1442,6 +1493,16 @@ impl Executor {
                         }
                     }
                 }
+            }
+
+            LogicalOperator::RecursiveCTEScan { cte_name, .. } => {
+                // RecursiveCTEScan is used within the recursive case of a RecursiveCTE
+                // It should read from the working table, which is handled by the parent RecursiveCTE operator
+                // This branch should not be executed directly - it's a placeholder for the recursive reference
+                Err(Error::NotImplemented(format!(
+                    "RecursiveCTEScan for '{}' should be handled by parent RecursiveCTE operator",
+                    cte_name
+                )))
             }
         }
     }
@@ -1613,6 +1674,17 @@ fn format_plan(op: &LogicalOperator, indent: usize) -> String {
         LogicalOperator::Explain { input } => {
             format!("{}Explain\n{}", prefix, format_plan(input, indent + 1))
         }
+        LogicalOperator::RecursiveCTE { name, base_case, recursive_case, .. } => {
+            format!(
+                "{}RecursiveCTE: {}\n{}Base:\n{}\n{}Recursive:\n{}",
+                prefix,
+                name,
+                prefix,
+                format_plan(base_case, indent + 1),
+                prefix,
+                format_plan(recursive_case, indent + 1)
+            )
+        }
         LogicalOperator::NoOp => {
             format!("{}NoOp", prefix)
         }
@@ -1623,6 +1695,9 @@ fn format_plan(op: &LogicalOperator, indent: usize) -> String {
                 TableFunctionKind::GenerateSubscripts { .. } => "generate_subscripts",
             };
             format!("{}TableFunction: {}() -> {}", prefix, func_name, column_name)
+        }
+        LogicalOperator::RecursiveCTEScan { cte_name, .. } => {
+            format!("{}RecursiveCTEScan: {}", prefix, cte_name)
         }
     }
 }

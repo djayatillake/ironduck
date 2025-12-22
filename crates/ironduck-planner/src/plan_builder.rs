@@ -594,6 +594,17 @@ fn build_table_ref_plan(table_ref: &BoundTableRef) -> Result<LogicalOperator> {
                 }
             }
         }
+
+        BoundTableRef::RecursiveCTERef {
+            cte_name,
+            column_names,
+            column_types,
+            ..
+        } => Ok(LogicalOperator::RecursiveCTEScan {
+            cte_name: cte_name.clone(),
+            column_names: column_names.clone(),
+            output_types: column_types.clone(),
+        }),
     }
 }
 

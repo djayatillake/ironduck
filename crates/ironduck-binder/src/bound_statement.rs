@@ -142,6 +142,17 @@ pub enum BoundTableRef {
         alias: Option<String>,
         column_alias: Option<String>,
     },
+    /// Recursive CTE reference (self-reference within a recursive CTE)
+    RecursiveCTERef {
+        /// Name of the CTE being referenced
+        cte_name: String,
+        /// Alias for this reference
+        alias: String,
+        /// Column names from the CTE
+        column_names: Vec<String>,
+        /// Column types from the CTE
+        column_types: Vec<LogicalType>,
+    },
     /// Empty (for SELECT without FROM)
     Empty,
 }
@@ -296,10 +307,14 @@ pub struct BoundCTE {
     pub name: String,
     /// Column aliases (optional)
     pub column_aliases: Vec<String>,
-    /// The bound query for this CTE
+    /// The bound query for this CTE (base case for recursive CTEs)
     pub query: BoundSelect,
     /// Whether this is a recursive CTE
     pub is_recursive: bool,
+    /// Recursive case query (only set for recursive CTEs)
+    pub recursive_query: Option<BoundSelect>,
+    /// Whether to use UNION ALL (true) or UNION (false) for recursive CTEs
+    pub union_all: bool,
 }
 
 /// Bound Recursive CTE with separate base and recursive parts

@@ -173,8 +173,34 @@ pub enum LogicalOperator {
         input: Box<LogicalOperator>,
     },
 
+    /// Recursive CTE execution
+    RecursiveCTE {
+        /// Name of the CTE
+        name: String,
+        /// Base case query (anchor)
+        base_case: Box<LogicalOperator>,
+        /// Recursive case query (references the CTE)
+        recursive_case: Box<LogicalOperator>,
+        /// Output column names
+        output_names: Vec<String>,
+        /// Output column types
+        output_types: Vec<LogicalType>,
+        /// Whether to use UNION ALL (true) or UNION (false) semantics
+        union_all: bool,
+    },
+
     /// No-op - for PRAGMA, SET, and other configuration statements
     NoOp,
+
+    /// Scan of recursive CTE working table (used within recursive case)
+    RecursiveCTEScan {
+        /// Name of the CTE being referenced
+        cte_name: String,
+        /// Column names
+        column_names: Vec<String>,
+        /// Column types
+        output_types: Vec<LogicalType>,
+    },
 
     /// Table-valued function (e.g., range(), generate_series())
     TableFunction {
@@ -256,6 +282,8 @@ impl LogicalOperator {
             LogicalOperator::SetOperation { left, .. } => left.output_types(),
             LogicalOperator::Window { output_types, .. } => output_types.clone(),
             LogicalOperator::Explain { .. } => vec![LogicalType::Varchar],
+            LogicalOperator::RecursiveCTE { output_types, .. } => output_types.clone(),
+            LogicalOperator::RecursiveCTEScan { output_types, .. } => output_types.clone(),
             LogicalOperator::NoOp => vec![LogicalType::Varchar],
             LogicalOperator::TableFunction { output_type, .. } => vec![output_type.clone()],
         }

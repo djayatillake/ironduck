@@ -200,6 +200,8 @@ fn bind_ctes(binder: &Binder, with: &Option<sql::With>) -> Result<Vec<BoundCTE>>
                 column_aliases,
                 query,
                 is_recursive: false,
+                recursive_query: None,
+                union_all: false,
             });
         }
     }
@@ -236,6 +238,8 @@ fn bind_recursive_cte(
                 column_aliases: column_aliases.to_vec(),
                 query,
                 is_recursive: false,
+                recursive_query: None,
+                union_all: false,
             });
         }
     };
@@ -276,6 +280,8 @@ fn bind_recursive_cte(
                 column_aliases: column_aliases.to_vec(),
                 query: combined,
                 is_recursive: false,
+                recursive_query: None,
+                union_all: false,
             });
         }
         (true, true) => {
@@ -306,6 +312,8 @@ fn bind_recursive_cte(
         column_aliases: column_names.clone(),
         query: base_case.clone(),
         is_recursive: true,
+        recursive_query: None,
+        union_all: all,
     };
 
     // Create extended CTE list including this recursive CTE
@@ -315,29 +323,14 @@ fn bind_recursive_cte(
     // Now bind the recursive case with the CTE in scope
     let recursive_case = bind_set_expr_with_ctes(binder, recursive_expr, &extended_ctes)?;
 
-    // Create a combined result that represents the recursive structure
-    // We'll use a special marker in the select list to indicate recursion
-    let combined = BoundSelect {
-        select_list: base_case.select_list.clone(),
-        from: vec![BoundTableRef::Subquery {
-            subquery: Box::new(base_case.clone()),
-            alias: format!("{}_base", name),
-        }],
-        where_clause: None,
-        group_by: Vec::new(),
-        having: None,
-        qualify: None,
-        order_by: Vec::new(),
-        limit: None,
-        offset: None,
-        distinct: DistinctKind::None, // We handle UNION vs UNION ALL in execution
-    };
-
+    // Return the recursive CTE with both base and recursive parts
     Ok(BoundCTE {
         name: name.to_string(),
         column_aliases: column_names,
-        query: combined,
+        query: base_case,
         is_recursive: true,
+        recursive_query: Some(recursive_case),
+        union_all: all,
     })
 }
 
@@ -666,6 +659,7 @@ fn collect_tables_from_ref(table_ref: &BoundTableRef) -> Vec<BoundTableRef> {
         }
         BoundTableRef::Subquery { .. } => vec![table_ref.clone()],
         BoundTableRef::TableFunction { .. } => vec![table_ref.clone()],
+        BoundTableRef::RecursiveCTERef { .. } => vec![table_ref.clone()],
         BoundTableRef::Empty => vec![],
     }
 }
@@ -883,6 +877,18 @@ fn bind_table_factor_with_ctes(
                         .as_ref()
                         .map(|a| a.name.value.clone())
                         .unwrap_or_else(|| cte.name.clone());
+
+                    // For recursive CTEs, return a special reference marker
+                    if cte.is_recursive {
+                        let column_names = cte.query.output_names();
+                        let column_types = cte.query.output_types();
+                        return Ok(BoundTableRef::RecursiveCTERef {
+                            cte_name: cte.name.clone(),
+                            alias: alias_name,
+                            column_names,
+                            column_types,
+                        });
+                    }
 
                     // Return the CTE as a subquery reference
                     return Ok(BoundTableRef::Subquery {
@@ -1507,6 +1513,25 @@ fn expand_qualified_wildcard(
             *col_offset += 1;
             matches
         }
+        BoundTableRef::RecursiveCTERef { cte_name, alias, column_names, column_types } => {
+            let matches = alias.eq_ignore_ascii_case(target_name)
+                || cte_name.eq_ignore_ascii_case(target_name);
+
+            if matches {
+                for (idx, (col_name, typ)) in column_names.iter().zip(column_types.iter()).enumerate() {
+                    select_list.push(BoundExpression::new(
+                        super::BoundExpressionKind::ColumnRef {
+                            table_idx,
+                            column_idx: *col_offset + idx,
+                            name: col_name.clone(),
+                        },
+                        typ.clone(),
+                    ));
+                }
+            }
+            *col_offset += column_names.len();
+            matches
+        }
         BoundTableRef::Empty => false,
     }
 }
@@ -1610,6 +1635,26 @@ fn expand_qualified_wildcard_with_skip(
             if !should_skip {
                 *col_offset += 1;
             }
+            matches
+        }
+        BoundTableRef::RecursiveCTERef { cte_name, alias, column_names, column_types } => {
+            let matches = alias.eq_ignore_ascii_case(target_name)
+                || cte_name.eq_ignore_ascii_case(target_name);
+
+            for (idx, (col_name, typ)) in column_names.iter().zip(column_types.iter()).enumerate() {
+                let should_skip = skip_columns.iter().any(|sc| sc.eq_ignore_ascii_case(col_name));
+                if matches && !should_skip {
+                    select_list.push(BoundExpression::new(
+                        super::BoundExpressionKind::ColumnRef {
+                            table_idx,
+                            column_idx: *col_offset + idx,
+                            name: col_name.clone(),
+                        },
+                        typ.clone(),
+                    ));
+                }
+            }
+            *col_offset += column_names.len();
             matches
         }
         BoundTableRef::Empty => false,
@@ -1717,6 +1762,32 @@ fn expand_qualified_wildcard_with_options(
             *col_offset += 1;
             matches
         }
+        BoundTableRef::RecursiveCTERef { cte_name, alias, column_names, column_types } => {
+            let matches = alias.eq_ignore_ascii_case(target_name)
+                || cte_name.eq_ignore_ascii_case(target_name);
+
+            for (idx, (col_name, typ)) in column_names.iter().zip(column_types.iter()).enumerate() {
+                let should_exclude = exclude_columns.iter().any(|ec| ec.eq_ignore_ascii_case(col_name));
+                if matches && !should_exclude {
+                    if let Some(replacement) = replace_map.get(&col_name.to_uppercase()) {
+                        let mut replaced = replacement.clone();
+                        replaced.alias = Some(col_name.clone());
+                        select_list.push(replaced);
+                    } else {
+                        select_list.push(BoundExpression::new(
+                            super::BoundExpressionKind::ColumnRef {
+                                table_idx,
+                                column_idx: *col_offset + idx,
+                                name: col_name.clone(),
+                            },
+                            typ.clone(),
+                        ));
+                    }
+                }
+            }
+            *col_offset += column_names.len();
+            matches
+        }
         BoundTableRef::Empty => false,
     }
 }
@@ -1736,6 +1807,9 @@ fn matches_table_name(table_ref: &BoundTableRef, name: &str) -> bool {
         }
         BoundTableRef::TableFunction { alias, .. } => {
             alias.as_ref().map(|a| a.eq_ignore_ascii_case(name)).unwrap_or(false)
+        }
+        BoundTableRef::RecursiveCTERef { cte_name, alias, .. } => {
+            alias.eq_ignore_ascii_case(name) || cte_name.eq_ignore_ascii_case(name)
         }
         BoundTableRef::Empty => false,
     }
@@ -1855,6 +1929,28 @@ fn expand_wildcard_with_options(
             }
             *col_offset += 1;
         }
+        BoundTableRef::RecursiveCTERef { column_names, column_types, .. } => {
+            for (idx, (name, typ)) in column_names.iter().zip(column_types.iter()).enumerate() {
+                let should_exclude = exclude_columns.iter().any(|ec| ec.eq_ignore_ascii_case(name));
+                if !should_exclude {
+                    if let Some(replacement) = replace_map.get(&name.to_uppercase()) {
+                        let mut replaced = replacement.clone();
+                        replaced.alias = Some(name.clone());
+                        select_list.push(replaced);
+                    } else {
+                        select_list.push(BoundExpression::new(
+                            super::BoundExpressionKind::ColumnRef {
+                                table_idx,
+                                column_idx: *col_offset + idx,
+                                name: name.clone(),
+                            },
+                            typ.clone(),
+                        ));
+                    }
+                }
+            }
+            *col_offset += column_names.len();
+        }
         BoundTableRef::Empty => {}
     }
 }
@@ -1929,6 +2025,24 @@ fn expand_wildcard_rec_with_skip(
                 ));
                 *col_offset += 1;
             }
+        }
+        BoundTableRef::RecursiveCTERef { column_names, column_types, .. } => {
+            let mut local_col_idx = 0;
+            for (name, typ) in column_names.iter().zip(column_types.iter()) {
+                let should_skip = skip_columns.iter().any(|sc| sc.eq_ignore_ascii_case(name));
+                if !should_skip {
+                    select_list.push(BoundExpression::new(
+                        super::BoundExpressionKind::ColumnRef {
+                            table_idx,
+                            column_idx: *col_offset + local_col_idx,
+                            name: name.clone(),
+                        },
+                        typ.clone(),
+                    ));
+                    local_col_idx += 1;
+                }
+            }
+            *col_offset += local_col_idx;
         }
         BoundTableRef::Empty => {}
     }
@@ -2011,6 +2125,7 @@ fn get_table_ref_columns(table_ref: &BoundTableRef) -> Vec<String> {
         BoundTableRef::TableFunction { column_alias, .. } => {
             vec![column_alias.clone().unwrap_or_else(|| "column".to_string())]
         }
+        BoundTableRef::RecursiveCTERef { column_names, .. } => column_names.clone(),
         BoundTableRef::Empty => vec![],
     }
 }
