@@ -486,10 +486,10 @@ fn bind_select_with_ctes(
     // First, bind FROM clause to know available columns
     let from = bind_from_with_ctes(binder, &select.from, ctes)?;
 
-    // Bind SELECT list
+    // Bind SELECT list (with named windows from WINDOW clause)
     let mut select_list = Vec::new();
     {
-        let ctx = ExpressionBinderContext::new(&from);
+        let ctx = ExpressionBinderContext::with_named_windows(&from, &select.named_window);
         for item in &select.projection {
             match item {
                 sql::SelectItem::UnnamedExpr(expr) => {

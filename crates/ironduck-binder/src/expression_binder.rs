@@ -8,15 +8,21 @@ use sqlparser::ast as sql;
 pub struct ExpressionBinderContext<'a> {
     /// Available tables for column resolution
     pub tables: &'a [BoundTableRef],
+    /// Named window definitions from WINDOW clause
+    pub named_windows: &'a [sql::NamedWindowDefinition],
 }
 
 impl<'a> ExpressionBinderContext<'a> {
     pub fn empty() -> Self {
-        ExpressionBinderContext { tables: &[] }
+        ExpressionBinderContext { tables: &[], named_windows: &[] }
     }
 
     pub fn new(tables: &'a [BoundTableRef]) -> Self {
-        ExpressionBinderContext { tables }
+        ExpressionBinderContext { tables, named_windows: &[] }
+    }
+
+    pub fn with_named_windows(tables: &'a [BoundTableRef], named_windows: &'a [sql::NamedWindowDefinition]) -> Self {
+        ExpressionBinderContext { tables, named_windows }
     }
 }
 
@@ -1038,38 +1044,35 @@ fn bind_window_function(
     // Extract window specification
     let (partition_by, order_by, frame) = match over {
         sql::WindowType::WindowSpec(spec) => {
-            // Bind PARTITION BY
-            let partition_by: Result<Vec<_>> = spec
-                .partition_by
-                .iter()
-                .map(|e| bind_expression(binder, e, ctx))
-                .collect();
-            let partition_by = partition_by?;
-
-            // Bind ORDER BY
-            let order_by: Result<Vec<_>> = spec
-                .order_by
-                .iter()
-                .map(|o| {
-                    let expr = bind_expression(binder, &o.expr, ctx)?;
-                    let ascending = o.asc.unwrap_or(true);
-                    let nulls_first = o.nulls_first.unwrap_or(false);
-                    Ok((expr, ascending, nulls_first))
-                })
-                .collect();
-            let order_by = order_by?;
-
-            // Bind window frame if present
-            let frame = if let Some(window_frame) = &spec.window_frame {
-                Some(bind_window_frame(binder, window_frame, ctx)?)
-            } else {
-                None
-            };
-
-            (partition_by, order_by, frame)
+            bind_window_spec(binder, spec, ctx)?
         }
-        sql::WindowType::NamedWindow(_) => {
-            return Err(Error::NotImplemented("Named window references".to_string()));
+        sql::WindowType::NamedWindow(name) => {
+            // Look up the named window definition
+            let window_name = name.value.to_uppercase();
+            let named_def = ctx.named_windows.iter().find(|def| {
+                def.0.value.to_uppercase() == window_name
+            }).ok_or_else(|| Error::InvalidArguments(format!("Unknown window: {}", name.value)))?;
+
+            // Resolve the window spec from the definition
+            match &named_def.1 {
+                sql::NamedWindowExpr::WindowSpec(spec) => {
+                    bind_window_spec(binder, spec, ctx)?
+                }
+                sql::NamedWindowExpr::NamedWindow(ref_name) => {
+                    // Recursive reference to another named window
+                    let ref_window_name = ref_name.value.to_uppercase();
+                    let ref_def = ctx.named_windows.iter().find(|def| {
+                        def.0.value.to_uppercase() == ref_window_name
+                    }).ok_or_else(|| Error::InvalidArguments(format!("Unknown window: {}", ref_name.value)))?;
+
+                    match &ref_def.1 {
+                        sql::NamedWindowExpr::WindowSpec(spec) => {
+                            bind_window_spec(binder, spec, ctx)?
+                        }
+                        _ => return Err(Error::NotImplemented("Nested named window references".to_string())),
+                    }
+                }
+            }
         }
     };
 
@@ -1105,6 +1108,43 @@ fn bind_window_function(
         },
         return_type,
     ))
+}
+
+/// Bind a window specification (shared between inline and named windows)
+fn bind_window_spec(
+    binder: &Binder,
+    spec: &sql::WindowSpec,
+    ctx: &ExpressionBinderContext,
+) -> Result<(Vec<BoundExpression>, Vec<(BoundExpression, bool, bool)>, Option<super::WindowFrame>)> {
+    // Bind PARTITION BY
+    let partition_by: Result<Vec<_>> = spec
+        .partition_by
+        .iter()
+        .map(|e| bind_expression(binder, e, ctx))
+        .collect();
+    let partition_by = partition_by?;
+
+    // Bind ORDER BY
+    let order_by: Result<Vec<_>> = spec
+        .order_by
+        .iter()
+        .map(|o| {
+            let expr = bind_expression(binder, &o.expr, ctx)?;
+            let ascending = o.asc.unwrap_or(true);
+            let nulls_first = o.nulls_first.unwrap_or(false);
+            Ok((expr, ascending, nulls_first))
+        })
+        .collect();
+    let order_by = order_by?;
+
+    // Bind window frame if present
+    let frame = if let Some(window_frame) = &spec.window_frame {
+        Some(bind_window_frame(binder, window_frame, ctx)?)
+    } else {
+        None
+    };
+
+    Ok((partition_by, order_by, frame))
 }
 
 /// Bind a window frame specification
