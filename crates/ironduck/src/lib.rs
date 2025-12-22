@@ -22,6 +22,7 @@
 pub use ironduck_catalog as catalog;
 pub use ironduck_common as common;
 pub use ironduck_execution as execution;
+pub use ironduck_optimizer as optimizer;
 pub use ironduck_parser as parser;
 pub use ironduck_planner as planner;
 pub use ironduck_storage as storage;
@@ -67,6 +68,9 @@ impl Database {
         // Plan
         let plan = planner::create_logical_plan(&bound)?;
 
+        // Optimize
+        let plan = optimizer::optimize(plan)?;
+
         // Execute
         let exec_result = self.executor.execute(&plan)?;
 
@@ -85,6 +89,7 @@ impl Database {
             let binder = Binder::new(self.catalog.clone());
             let bound = binder.bind(statement)?;
             let plan = planner::create_logical_plan(&bound)?;
+            let plan = optimizer::optimize(plan)?;
             let exec_result = self.executor.execute(&plan)?;
 
             results.push(QueryResult {
