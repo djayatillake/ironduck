@@ -17,7 +17,7 @@ IronDuck is a **complete replication of DuckDB written in pure Rust**. The goal 
 
 We validate correctness by running DuckDB's official SQLLogicTest suite against IronDuck.
 
-**Current Status**: 100% (122/122 tests passing)
+**Current Status**: 100% (152/152 tests passing)
 
 #### What are SQLLogicTests?
 
@@ -84,10 +84,20 @@ DuckDB has 400+ built-in functions. Categories include:
 - [x] Complex types (LIST, STRUCT, MAP) - partial support
 - [x] Sequences (CREATE SEQUENCE, NEXTVAL)
 - [x] Views (CREATE VIEW)
+- [x] Query optimizer with multiple optimization rules
 - [ ] Materialized views
 - [ ] Indexes
 - [ ] Transactions (BEGIN, COMMIT, ROLLBACK)
 - [ ] External file formats (Parquet, CSV, JSON)
+
+### Query Optimizer
+
+The query optimizer applies multiple rules in order:
+
+1. **Constant Folding**: Evaluates constant expressions at compile time (e.g., `1 + 2` → `3`)
+2. **Predicate Simplification**: Simplifies boolean logic (e.g., `TRUE AND x` → `x`)
+3. **Filter Pushdown**: Pushes filters closer to data sources to reduce processing
+4. **Projection Pushdown**: Eliminates unused columns early to reduce memory usage
 
 ## Crate Architecture
 
