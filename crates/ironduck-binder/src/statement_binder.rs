@@ -512,10 +512,23 @@ fn bind_select_with_ctes(
                         None => vec![],
                     };
 
+                    // Handle REPLACE clause if present
+                    let replace_map: std::collections::HashMap<String, BoundExpression> = match &options.opt_replace {
+                        Some(replace_item) => {
+                            let mut map = std::collections::HashMap::new();
+                            for elem in &replace_item.items {
+                                let bound_expr = bind_expression(binder, &elem.expr, &ctx)?;
+                                map.insert(elem.column_name.value.to_uppercase(), bound_expr);
+                            }
+                            map
+                        }
+                        None => std::collections::HashMap::new(),
+                    };
+
                     // Track global column offset across all tables in FROM
                     let mut global_col_offset = 0;
                     for (table_idx, table_ref) in from.iter().enumerate() {
-                        expand_wildcard_with_exclude(table_ref, table_idx, &mut global_col_offset, &mut select_list, &exclude_cols);
+                        expand_wildcard_with_options(table_ref, table_idx, &mut global_col_offset, &mut select_list, &exclude_cols, &replace_map);
                     }
                 }
                 sql::SelectItem::QualifiedWildcard(name, options) => {
@@ -533,10 +546,23 @@ fn bind_select_with_ctes(
                         None => vec![],
                     };
 
+                    // Handle REPLACE clause if present
+                    let replace_map: std::collections::HashMap<String, BoundExpression> = match &options.opt_replace {
+                        Some(replace_item) => {
+                            let mut map = std::collections::HashMap::new();
+                            for elem in &replace_item.items {
+                                let bound_expr = bind_expression(binder, &elem.expr, &ctx)?;
+                                map.insert(elem.column_name.value.to_uppercase(), bound_expr);
+                            }
+                            map
+                        }
+                        None => std::collections::HashMap::new(),
+                    };
+
                     let mut found = false;
                     let mut global_col_offset = 0;
                     for (table_idx, table_ref) in from.iter().enumerate() {
-                        if expand_qualified_wildcard_with_exclude(table_ref, &table_name, table_idx, &mut global_col_offset, &mut select_list, &exclude_cols) {
+                        if expand_qualified_wildcard_with_options(table_ref, &table_name, table_idx, &mut global_col_offset, &mut select_list, &exclude_cols, &replace_map) {
                             found = true;
                             // Don't break - we need to continue counting columns for proper offset
                         }
@@ -1590,16 +1616,15 @@ fn expand_qualified_wildcard_with_skip(
     }
 }
 
-/// Expand qualified wildcard with EXCLUDE support
-/// Unlike expand_qualified_wildcard_with_skip (for USING), this still counts all columns
-/// in the offset but only adds non-excluded columns to the select list
-fn expand_qualified_wildcard_with_exclude(
+/// Expand qualified wildcard with EXCLUDE and REPLACE support
+fn expand_qualified_wildcard_with_options(
     table_ref: &BoundTableRef,
     target_name: &str,
     table_idx: usize,
     col_offset: &mut usize,
     select_list: &mut Vec<BoundExpression>,
     exclude_columns: &[String],
+    replace_map: &std::collections::HashMap<String, BoundExpression>,
 ) -> bool {
     match table_ref {
         BoundTableRef::BaseTable {
@@ -1616,14 +1641,20 @@ fn expand_qualified_wildcard_with_exclude(
                 for (idx, (col_name, typ)) in column_names.iter().zip(column_types.iter()).enumerate() {
                     let should_exclude = exclude_columns.iter().any(|ec| ec.eq_ignore_ascii_case(col_name));
                     if !should_exclude {
-                        select_list.push(BoundExpression::new(
-                            super::BoundExpressionKind::ColumnRef {
-                                table_idx,
-                                column_idx: *col_offset + idx,
-                                name: col_name.clone(),
-                            },
-                            typ.clone(),
-                        ));
+                        if let Some(replacement) = replace_map.get(&col_name.to_uppercase()) {
+                            let mut replaced = replacement.clone();
+                            replaced.alias = Some(col_name.clone());
+                            select_list.push(replaced);
+                        } else {
+                            select_list.push(BoundExpression::new(
+                                super::BoundExpressionKind::ColumnRef {
+                                    table_idx,
+                                    column_idx: *col_offset + idx,
+                                    name: col_name.clone(),
+                                },
+                                typ.clone(),
+                            ));
+                        }
                     }
                 }
             }
@@ -1638,14 +1669,20 @@ fn expand_qualified_wildcard_with_exclude(
                     let col_name = expr.name();
                     let should_exclude = exclude_columns.iter().any(|ec| ec.eq_ignore_ascii_case(&col_name));
                     if !should_exclude {
-                        select_list.push(BoundExpression::new(
-                            super::BoundExpressionKind::ColumnRef {
-                                table_idx,
-                                column_idx: *col_offset + idx,
-                                name: col_name,
-                            },
-                            expr.return_type.clone(),
-                        ));
+                        if let Some(replacement) = replace_map.get(&col_name.to_uppercase()) {
+                            let mut replaced = replacement.clone();
+                            replaced.alias = Some(col_name);
+                            select_list.push(replaced);
+                        } else {
+                            select_list.push(BoundExpression::new(
+                                super::BoundExpressionKind::ColumnRef {
+                                    table_idx,
+                                    column_idx: *col_offset + idx,
+                                    name: col_name,
+                                },
+                                expr.return_type.clone(),
+                            ));
+                        }
                     }
                 }
             }
@@ -1653,8 +1690,8 @@ fn expand_qualified_wildcard_with_exclude(
             matches
         }
         BoundTableRef::Join { left, right, .. } => {
-            let left_matched = expand_qualified_wildcard_with_exclude(left, target_name, table_idx, col_offset, select_list, exclude_columns);
-            let right_matched = expand_qualified_wildcard_with_exclude(right, target_name, table_idx, col_offset, select_list, exclude_columns);
+            let left_matched = expand_qualified_wildcard_with_options(left, target_name, table_idx, col_offset, select_list, exclude_columns, replace_map);
+            let right_matched = expand_qualified_wildcard_with_options(right, target_name, table_idx, col_offset, select_list, exclude_columns, replace_map);
             left_matched || right_matched
         }
         BoundTableRef::TableFunction { alias, column_alias, .. } => {
@@ -1662,14 +1699,20 @@ fn expand_qualified_wildcard_with_exclude(
             let col_name = column_alias.clone().unwrap_or_else(|| "range".to_string());
             let should_exclude = exclude_columns.iter().any(|ec| ec.eq_ignore_ascii_case(&col_name));
             if matches && !should_exclude {
-                select_list.push(BoundExpression::new(
-                    super::BoundExpressionKind::ColumnRef {
-                        table_idx,
-                        column_idx: *col_offset,
-                        name: col_name,
-                    },
-                    ironduck_common::LogicalType::BigInt,
-                ));
+                if let Some(replacement) = replace_map.get(&col_name.to_uppercase()) {
+                    let mut replaced = replacement.clone();
+                    replaced.alias = Some(col_name);
+                    select_list.push(replaced);
+                } else {
+                    select_list.push(BoundExpression::new(
+                        super::BoundExpressionKind::ColumnRef {
+                            table_idx,
+                            column_idx: *col_offset,
+                            name: col_name,
+                        },
+                        ironduck_common::LogicalType::BigInt,
+                    ));
+                }
             }
             *col_offset += 1;
             matches
@@ -1727,15 +1770,14 @@ fn expand_wildcard_rec(
     expand_wildcard_rec_with_skip(table_ref, table_idx, col_offset, select_list, &[]);
 }
 
-/// Expand wildcard with EXCLUDE support
-/// Unlike expand_wildcard_rec_with_skip (for USING), this still counts all columns
-/// in the offset but only adds non-excluded columns to the select list
-fn expand_wildcard_with_exclude(
+/// Expand wildcard with EXCLUDE and REPLACE support
+fn expand_wildcard_with_options(
     table_ref: &BoundTableRef,
     table_idx: usize,
     col_offset: &mut usize,
     select_list: &mut Vec<BoundExpression>,
     exclude_columns: &[String],
+    replace_map: &std::collections::HashMap<String, BoundExpression>,
 ) {
     match table_ref {
         BoundTableRef::BaseTable {
@@ -1746,14 +1788,21 @@ fn expand_wildcard_with_exclude(
             for (idx, (name, typ)) in column_names.iter().zip(column_types.iter()).enumerate() {
                 let should_exclude = exclude_columns.iter().any(|ec| ec.eq_ignore_ascii_case(name));
                 if !should_exclude {
-                    select_list.push(BoundExpression::new(
-                        super::BoundExpressionKind::ColumnRef {
-                            table_idx,
-                            column_idx: *col_offset + idx,
-                            name: name.clone(),
-                        },
-                        typ.clone(),
-                    ));
+                    // Check if this column should be replaced
+                    if let Some(replacement) = replace_map.get(&name.to_uppercase()) {
+                        let mut replaced = replacement.clone();
+                        replaced.alias = Some(name.clone());
+                        select_list.push(replaced);
+                    } else {
+                        select_list.push(BoundExpression::new(
+                            super::BoundExpressionKind::ColumnRef {
+                                table_idx,
+                                column_idx: *col_offset + idx,
+                                name: name.clone(),
+                            },
+                            typ.clone(),
+                        ));
+                    }
                 }
             }
             *col_offset += column_names.len();
@@ -1763,34 +1812,46 @@ fn expand_wildcard_with_exclude(
                 let col_name = expr.name();
                 let should_exclude = exclude_columns.iter().any(|ec| ec.eq_ignore_ascii_case(&col_name));
                 if !should_exclude {
-                    select_list.push(BoundExpression::new(
-                        super::BoundExpressionKind::ColumnRef {
-                            table_idx,
-                            column_idx: *col_offset + idx,
-                            name: col_name,
-                        },
-                        expr.return_type.clone(),
-                    ));
+                    if let Some(replacement) = replace_map.get(&col_name.to_uppercase()) {
+                        let mut replaced = replacement.clone();
+                        replaced.alias = Some(col_name);
+                        select_list.push(replaced);
+                    } else {
+                        select_list.push(BoundExpression::new(
+                            super::BoundExpressionKind::ColumnRef {
+                                table_idx,
+                                column_idx: *col_offset + idx,
+                                name: col_name,
+                            },
+                            expr.return_type.clone(),
+                        ));
+                    }
                 }
             }
             *col_offset += subquery.select_list.len();
         }
         BoundTableRef::Join { left, right, .. } => {
-            expand_wildcard_with_exclude(left, table_idx, col_offset, select_list, exclude_columns);
-            expand_wildcard_with_exclude(right, table_idx, col_offset, select_list, exclude_columns);
+            expand_wildcard_with_options(left, table_idx, col_offset, select_list, exclude_columns, replace_map);
+            expand_wildcard_with_options(right, table_idx, col_offset, select_list, exclude_columns, replace_map);
         }
         BoundTableRef::TableFunction { column_alias, .. } => {
             let col_name = column_alias.clone().unwrap_or_else(|| "range".to_string());
             let should_exclude = exclude_columns.iter().any(|ec| ec.eq_ignore_ascii_case(&col_name));
             if !should_exclude {
-                select_list.push(BoundExpression::new(
-                    super::BoundExpressionKind::ColumnRef {
-                        table_idx,
-                        column_idx: *col_offset,
-                        name: col_name,
-                    },
-                    ironduck_common::LogicalType::BigInt,
-                ));
+                if let Some(replacement) = replace_map.get(&col_name.to_uppercase()) {
+                    let mut replaced = replacement.clone();
+                    replaced.alias = Some(col_name);
+                    select_list.push(replaced);
+                } else {
+                    select_list.push(BoundExpression::new(
+                        super::BoundExpressionKind::ColumnRef {
+                            table_idx,
+                            column_idx: *col_offset,
+                            name: col_name,
+                        },
+                        ironduck_common::LogicalType::BigInt,
+                    ));
+                }
             }
             *col_offset += 1;
         }
