@@ -178,16 +178,16 @@ CREATE TABLE integers(i INTEGER, g INTEGER)
 statement ok
 INSERT INTO integers VALUES (12, 0), (22, 1), (NULL, 0), (14, 1)
 
-query IIIIR
+query IIIII
 SELECT COUNT(*), COUNT(i), MIN(i), MAX(i), SUM(i) FROM integers
 ----
 4
 3
 12
 22
-48.000000
+48
 
-query IIIIR
+query IIIII
 SELECT COUNT(*), COUNT(i), MIN(i), MAX(i), SUM(i) FROM INTEGERS WHERE i IS NULL
 ----
 1
@@ -196,7 +196,7 @@ NULL
 NULL
 NULL
 
-query IIIIIR
+query IIIIII
 SELECT g, COUNT(*), COUNT(i), MIN(i), MAX(i), SUM(i) FROM integers GROUP BY g ORDER BY g
 ----
 0
@@ -204,15 +204,15 @@ SELECT g, COUNT(*), COUNT(i), MIN(i), MAX(i), SUM(i) FROM integers GROUP BY g OR
 1
 12
 12
-12.000000
+12
 1
 2
 2
 14
 22
-36.000000
+36
 
-query IIIIIR
+query IIIIII
 SELECT g, COUNT(*), COUNT(i), MIN(i), MAX(i), SUM(i) FROM integers WHERE i IS NULL OR i > 15 GROUP BY g ORDER BY g
 ----
 0
@@ -226,5 +226,5 @@ NULL
 1
 22
 22
-22.000000
+22
 

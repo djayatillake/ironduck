@@ -1,6 +1,6 @@
 //! Schema management
 
-use super::{CatalogId, Table, TableId};
+use super::{CatalogId, Table, TableId, View};
 use hashbrown::HashMap;
 use ironduck_common::{Error, Result};
 use parking_lot::RwLock;
@@ -16,6 +16,8 @@ pub struct Schema {
     pub name: String,
     /// Tables in this schema
     tables: RwLock<HashMap<String, Arc<Table>>>,
+    /// Views in this schema
+    views: RwLock<HashMap<String, Arc<View>>>,
 }
 
 impl Schema {
@@ -24,6 +26,7 @@ impl Schema {
             id,
             name,
             tables: RwLock::new(HashMap::new()),
+            views: RwLock::new(HashMap::new()),
         }
     }
 
@@ -56,6 +59,40 @@ impl Schema {
         let name_lower = name.to_lowercase();
         if tables.remove(&name_lower).is_none() {
             return Err(Error::TableNotFound(name.to_string()));
+        }
+        Ok(())
+    }
+
+    /// Add a view to this schema (name is normalized to lowercase)
+    pub fn add_view(&self, mut view: View) -> Result<()> {
+        let mut views = self.views.write();
+        view.name = view.name.to_lowercase();
+        if views.contains_key(&view.name) {
+            return Err(Error::ViewAlreadyExists(view.name.clone()));
+        }
+        views.insert(view.name.clone(), Arc::new(view));
+        Ok(())
+    }
+
+    /// Add or replace a view (for CREATE OR REPLACE VIEW)
+    pub fn add_or_replace_view(&self, mut view: View) {
+        let mut views = self.views.write();
+        view.name = view.name.to_lowercase();
+        views.insert(view.name.clone(), Arc::new(view));
+    }
+
+    /// Get a view by name (case-insensitive)
+    pub fn get_view(&self, name: &str) -> Option<Arc<View>> {
+        let name_lower = name.to_lowercase();
+        self.views.read().get(&name_lower).cloned()
+    }
+
+    /// Remove a view by name (case-insensitive)
+    pub fn drop_view(&self, name: &str) -> Result<()> {
+        let mut views = self.views.write();
+        let name_lower = name.to_lowercase();
+        if views.remove(&name_lower).is_none() {
+            return Err(Error::ViewNotFound(name.to_string()));
         }
         Ok(())
     }

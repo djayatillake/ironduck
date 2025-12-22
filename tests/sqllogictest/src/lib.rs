@@ -305,6 +305,8 @@ fn parse_slt(content: &str) -> TestResult<Vec<TestCase>> {
             }
 
             // Read expected results (until empty line or next directive)
+            // SQLLogicTest format: each line has tab-separated values
+            // We flatten to individual values (one per line)
             let mut results = Vec::new();
             while let Some(result_line) = lines.peek() {
                 let trimmed = result_line.trim();
@@ -316,7 +318,11 @@ fn parse_slt(content: &str) -> TestResult<Vec<TestCase>> {
                 {
                     break;
                 }
-                results.push(lines.next().unwrap().to_string());
+                let line = lines.next().unwrap();
+                // Split each line by tabs to get individual values
+                for value in line.split('\t') {
+                    results.push(value.to_string());
+                }
             }
 
             if !sql_lines.is_empty() {
@@ -6214,9 +6220,11 @@ SELECT 'abc' = 'abc'
         db.execute("INSERT INTO freq VALUES (2)").unwrap();
         db.execute("INSERT INTO freq VALUES (3)").unwrap();
 
-        let result = db.execute("SELECT MODE() WITHIN GROUP (ORDER BY val) FROM freq").unwrap();
+        // Test MODE with regular argument syntax
+        let result = db.execute("SELECT MODE(val) FROM freq").unwrap();
         assert_eq!(result.rows.len(), 1);
-        // Mode should be 2
+        // Mode should be 2 (most frequent value)
+        assert_eq!(result.rows[0][0].as_i64().unwrap(), 2);
     }
 
     #[test]

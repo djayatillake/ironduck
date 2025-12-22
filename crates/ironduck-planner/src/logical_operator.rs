@@ -80,12 +80,23 @@ pub enum LogicalOperator {
         name: String,
         columns: Vec<(String, LogicalType)>,
         if_not_exists: bool,
+        /// For CREATE TABLE ... AS SELECT ...
+        source: Option<Box<LogicalOperator>>,
     },
 
     /// CREATE SCHEMA
     CreateSchema {
         name: String,
         if_not_exists: bool,
+    },
+
+    /// CREATE VIEW
+    CreateView {
+        schema: String,
+        name: String,
+        sql: String,
+        column_names: Vec<String>,
+        or_replace: bool,
     },
 
     /// INSERT
@@ -152,6 +163,24 @@ pub enum LogicalOperator {
 
     /// No-op - for PRAGMA, SET, and other configuration statements
     NoOp,
+
+    /// Table-valued function (e.g., range(), generate_series())
+    TableFunction {
+        function: TableFunctionKind,
+        column_name: String,
+        output_type: LogicalType,
+    },
+}
+
+/// Types of table-valued functions
+#[derive(Debug, Clone)]
+pub enum TableFunctionKind {
+    /// range(start, stop, step) - generates a sequence of integers
+    Range {
+        start: Expression,
+        stop: Expression,
+        step: Expression,
+    },
 }
 
 /// Type of set operation
@@ -197,6 +226,7 @@ impl LogicalOperator {
             LogicalOperator::Values { output_types, .. } => output_types.clone(),
             LogicalOperator::CreateTable { .. } => vec![LogicalType::Varchar],
             LogicalOperator::CreateSchema { .. } => vec![LogicalType::Varchar],
+            LogicalOperator::CreateView { .. } => vec![LogicalType::Varchar],
             LogicalOperator::Insert { .. } => vec![LogicalType::BigInt],
             LogicalOperator::Delete { .. } => vec![LogicalType::BigInt],
             LogicalOperator::Update { .. } => vec![LogicalType::BigInt],
@@ -205,6 +235,7 @@ impl LogicalOperator {
             LogicalOperator::Window { output_types, .. } => output_types.clone(),
             LogicalOperator::Explain { .. } => vec![LogicalType::Varchar],
             LogicalOperator::NoOp => vec![LogicalType::Varchar],
+            LogicalOperator::TableFunction { output_type, .. } => vec![output_type.clone()],
         }
     }
 }
@@ -282,6 +313,10 @@ pub enum Expression {
     },
     /// Scalar subquery
     Subquery(Box<LogicalOperator>),
+    /// Row ID pseudo-column
+    RowId {
+        table_index: TableIndex,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

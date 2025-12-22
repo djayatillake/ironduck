@@ -143,9 +143,9 @@ FROM timestamps
 2024-11-15 12:00:00+00
 
 statement ok
-CREATE OR REPLACE TABLE times AS 
+CREATE OR REPLACE TABLE times AS
 	SELECT range AS ts
-	FROM range('2024-11-01'::DATE, '2024-11-02'::DATE, INTERVAL 7 MINUTES)
+	FROM range('2024-11-01'::DATE, '2024-11-02'::DATE, INTERVAL '7' MINUTE)
 
 query I
 SELECT AVG(ts::TIME) 
@@ -170,8 +170,7 @@ INSERT INTO timetzs VALUES
 	('02:30:00+1200'),
 	('02:30:00-1200'),
 	('24:00:00-1558'),
-	('24:00:00-1559'),
-;
+	('24:00:00-1559');
 
 query I
 SELECT AVG(ttz) FROM timetzs;

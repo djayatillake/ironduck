@@ -18,9 +18,14 @@ impl TableStorage {
         }
     }
 
+    /// Create a normalized key for case-insensitive lookups
+    fn make_key(schema: &str, table: &str) -> String {
+        format!("{}.{}", schema.to_lowercase(), table.to_lowercase())
+    }
+
     /// Get or create table data
     pub fn get_or_create(&self, schema: &str, table: &str, columns: &[LogicalType]) -> Arc<TableData> {
-        let key = format!("{}.{}", schema, table);
+        let key = Self::make_key(schema, table);
 
         {
             let tables = self.tables.read();
@@ -38,13 +43,13 @@ impl TableStorage {
 
     /// Get table data if it exists
     pub fn get(&self, schema: &str, table: &str) -> Option<Arc<TableData>> {
-        let key = format!("{}.{}", schema, table);
+        let key = Self::make_key(schema, table);
         self.tables.read().get(&key).cloned()
     }
 
     /// Drop a table
     pub fn drop_table(&self, schema: &str, table: &str) -> bool {
-        let key = format!("{}.{}", schema, table);
+        let key = Self::make_key(schema, table);
         self.tables.write().remove(&key).is_some()
     }
 }

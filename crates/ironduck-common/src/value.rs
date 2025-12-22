@@ -190,9 +190,11 @@ impl Value {
             Value::SmallInt(i) => Some(*i as i64),
             Value::Integer(i) => Some(*i as i64),
             Value::BigInt(i) => Some(*i),
+            Value::HugeInt(i) => i64::try_from(*i).ok(),
             Value::UTinyInt(i) => Some(*i as i64),
             Value::USmallInt(i) => Some(*i as i64),
             Value::UInteger(i) => Some(*i as i64),
+            Value::UBigInt(i) => i64::try_from(*i).ok(),
             _ => None,
         }
     }
@@ -206,6 +208,12 @@ impl Value {
             Value::SmallInt(i) => Some(*i as f64),
             Value::Integer(i) => Some(*i as f64),
             Value::BigInt(i) => Some(*i as f64),
+            Value::HugeInt(i) => Some(*i as f64),
+            Value::UTinyInt(i) => Some(*i as f64),
+            Value::USmallInt(i) => Some(*i as f64),
+            Value::UInteger(i) => Some(*i as f64),
+            Value::UBigInt(i) => Some(*i as f64),
+            Value::UHugeInt(i) => Some(*i as f64),
             Value::Decimal(d) => d.to_string().parse().ok(),
             _ => None,
         }
@@ -300,6 +308,20 @@ impl PartialOrd for Value {
             (Value::Float(a), Value::Double(b)) => (*a as f64).partial_cmp(b),
             (Value::Double(a), Value::Float(b)) => a.partial_cmp(&(*b as f64)),
 
+            // HugeInt cross-type comparisons
+            (Value::HugeInt(a), Value::Integer(b)) => a.partial_cmp(&(*b as i128)),
+            (Value::Integer(a), Value::HugeInt(b)) => (*a as i128).partial_cmp(b),
+            (Value::HugeInt(a), Value::BigInt(b)) => a.partial_cmp(&(*b as i128)),
+            (Value::BigInt(a), Value::HugeInt(b)) => (*a as i128).partial_cmp(b),
+            (Value::HugeInt(a), Value::TinyInt(b)) => a.partial_cmp(&(*b as i128)),
+            (Value::TinyInt(a), Value::HugeInt(b)) => (*a as i128).partial_cmp(b),
+            (Value::HugeInt(a), Value::SmallInt(b)) => a.partial_cmp(&(*b as i128)),
+            (Value::SmallInt(a), Value::HugeInt(b)) => (*a as i128).partial_cmp(b),
+            (Value::HugeInt(a), Value::Double(b)) => (*a as f64).partial_cmp(b),
+            (Value::Double(a), Value::HugeInt(b)) => a.partial_cmp(&(*b as f64)),
+            (Value::HugeInt(a), Value::Float(b)) => (*a as f64).partial_cmp(&(*b as f64)),
+            (Value::Float(a), Value::HugeInt(b)) => (*a as f64).partial_cmp(&(*b as f64)),
+
             _ => None,
         }
     }
@@ -329,8 +351,49 @@ impl fmt::Display for Value {
             Value::Date(d) => write!(f, "{}", d),
             Value::Time(t) => write!(f, "{}", t),
             Value::Timestamp(ts) => write!(f, "{}", ts),
-            Value::TimestampTz(ts) => write!(f, "{}", ts),
-            Value::Interval(i) => write!(f, "{} months {} days {} us", i.months, i.days, i.micros),
+            Value::TimestampTz(ts) => {
+                // Format as "2024-11-15 12:00:00+00" (DuckDB format)
+                write!(f, "{}+00", ts.format("%Y-%m-%d %H:%M:%S"))
+            }
+            Value::Interval(i) => {
+                let mut parts = Vec::new();
+
+                // Years and months
+                let years = i.months / 12;
+                let months = i.months % 12;
+                if years != 0 {
+                    parts.push(format!("{} year{}", years, if years.abs() == 1 { "" } else { "s" }));
+                }
+                if months != 0 {
+                    parts.push(format!("{} month{}", months, if months.abs() == 1 { "" } else { "s" }));
+                }
+
+                // Days
+                if i.days != 0 {
+                    parts.push(format!("{} day{}", i.days, if i.days.abs() == 1 { "" } else { "s" }));
+                }
+
+                // Time component (hours:minutes:seconds)
+                if i.micros != 0 {
+                    let total_secs = i.micros.abs() / 1_000_000;
+                    let hours = total_secs / 3600;
+                    let mins = (total_secs % 3600) / 60;
+                    let secs = total_secs % 60;
+                    let micros = (i.micros.abs() % 1_000_000) as u32;
+
+                    if micros == 0 {
+                        parts.push(format!("{:02}:{:02}:{:02}", hours, mins, secs));
+                    } else {
+                        parts.push(format!("{:02}:{:02}:{:02}.{:06}", hours, mins, secs, micros));
+                    }
+                }
+
+                if parts.is_empty() {
+                    write!(f, "00:00:00")
+                } else {
+                    write!(f, "{}", parts.join(" "))
+                }
+            }
             Value::Uuid(u) => write!(f, "{}", u),
             Value::List(items) => {
                 write!(f, "[")?;

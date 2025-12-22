@@ -4,8 +4,32 @@ use ironduck_common::{Error, LogicalType, Result, Value};
 use ironduck_planner::{BinaryOperator, Expression, UnaryOperator};
 use std::cmp::Ordering;
 
+/// Context for expression evaluation
+#[derive(Debug, Clone, Default)]
+pub struct EvalContext {
+    /// Row indices for each table (for rowid pseudo-column)
+    pub row_indices: Vec<i64>,
+}
+
+impl EvalContext {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn with_row_index(row_idx: i64) -> Self {
+        Self {
+            row_indices: vec![row_idx],
+        }
+    }
+}
+
 /// Evaluate an expression against a row of values
 pub fn evaluate(expr: &Expression, row: &[Value]) -> Result<Value> {
+    evaluate_with_ctx(expr, row, &EvalContext::new())
+}
+
+/// Evaluate an expression with context (for rowid support)
+pub fn evaluate_with_ctx(expr: &Expression, row: &[Value], ctx: &EvalContext) -> Result<Value> {
     match expr {
         Expression::Constant(value) => Ok(value.clone()),
 
@@ -16,33 +40,33 @@ pub fn evaluate(expr: &Expression, row: &[Value]) -> Result<Value> {
         }
 
         Expression::BinaryOp { left, op, right } => {
-            let left_val = evaluate(left, row)?;
-            let right_val = evaluate(right, row)?;
+            let left_val = evaluate_with_ctx(left, row, ctx)?;
+            let right_val = evaluate_with_ctx(right, row, ctx)?;
             evaluate_binary_op(&left_val, *op, &right_val)
         }
 
         Expression::UnaryOp { op, expr } => {
-            let val = evaluate(expr, row)?;
+            let val = evaluate_with_ctx(expr, row, ctx)?;
             evaluate_unary_op(*op, &val)
         }
 
         Expression::Function { name, args } => {
-            let arg_values: Result<Vec<_>> = args.iter().map(|a| evaluate(a, row)).collect();
+            let arg_values: Result<Vec<_>> = args.iter().map(|a| evaluate_with_ctx(a, row, ctx)).collect();
             evaluate_function(name, &arg_values?)
         }
 
         Expression::Cast { expr, target_type } => {
-            let val = evaluate(expr, row)?;
+            let val = evaluate_with_ctx(expr, row, ctx)?;
             cast_value(&val, target_type)
         }
 
         Expression::IsNull(expr) => {
-            let val = evaluate(expr, row)?;
+            let val = evaluate_with_ctx(expr, row, ctx)?;
             Ok(Value::Boolean(val.is_null()))
         }
 
         Expression::IsNotNull(expr) => {
-            let val = evaluate(expr, row)?;
+            let val = evaluate_with_ctx(expr, row, ctx)?;
             Ok(Value::Boolean(!val.is_null()))
         }
 
@@ -52,10 +76,10 @@ pub fn evaluate(expr: &Expression, row: &[Value]) -> Result<Value> {
             results,
             else_result,
         } => {
-            let operand_val = operand.as_ref().map(|e| evaluate(e, row)).transpose()?;
+            let operand_val = operand.as_ref().map(|e| evaluate_with_ctx(e, row, ctx)).transpose()?;
 
             for (cond, result) in conditions.iter().zip(results.iter()) {
-                let cond_val = evaluate(cond, row)?;
+                let cond_val = evaluate_with_ctx(cond, row, ctx)?;
 
                 let matches = match &operand_val {
                     Some(op_val) => {
@@ -72,26 +96,26 @@ pub fn evaluate(expr: &Expression, row: &[Value]) -> Result<Value> {
                 };
 
                 if matches {
-                    return evaluate(result, row);
+                    return evaluate_with_ctx(result, row, ctx);
                 }
             }
 
             // No condition matched, return ELSE or NULL
             match else_result {
-                Some(else_expr) => evaluate(else_expr, row),
+                Some(else_expr) => evaluate_with_ctx(else_expr, row, ctx),
                 None => Ok(Value::Null),
             }
         }
 
         Expression::InList { expr, list, negated } => {
-            let val = evaluate(expr, row)?;
+            let val = evaluate_with_ctx(expr, row, ctx)?;
             if val.is_null() {
                 return Ok(Value::Null);
             }
 
             let mut found = false;
             for item in list {
-                let item_val = evaluate(item, row)?;
+                let item_val = evaluate_with_ctx(item, row, ctx)?;
                 if !item_val.is_null() {
                     if let Value::Boolean(true) = evaluate_binary_op(&val, BinaryOperator::Equal, &item_val)? {
                         found = true;
@@ -107,6 +131,14 @@ pub fn evaluate(expr: &Expression, row: &[Value]) -> Result<Value> {
         Expression::InSubquery { .. } | Expression::Exists { .. } | Expression::Subquery(_) => {
             // Subqueries need executor access - handled separately in executor
             Err(Error::NotImplemented("Subquery in simple expression evaluation".to_string()))
+        }
+
+        Expression::RowId { table_index } => {
+            // Return the row index for the specified table
+            ctx.row_indices
+                .get(*table_index)
+                .map(|&idx| Value::BigInt(idx))
+                .ok_or_else(|| Error::Internal(format!("No row index for table {}", table_index)))
         }
     }
 }
@@ -2315,6 +2347,113 @@ fn cast_value(val: &Value, target: &LogicalType) -> Result<Value> {
                 }),
             };
             Ok(Value::Float(f))
+        }
+        LogicalType::Date => {
+            use chrono::NaiveDate;
+            let d = match val {
+                Value::Date(d) => *d,
+                Value::Timestamp(ts) => ts.date(),
+                Value::TimestampTz(ts) => ts.date_naive(),
+                Value::Varchar(s) => {
+                    // Try parsing common date formats
+                    NaiveDate::parse_from_str(s.trim(), "%Y-%m-%d")
+                        .or_else(|_| NaiveDate::parse_from_str(s.trim(), "%Y/%m/%d"))
+                        .or_else(|_| NaiveDate::parse_from_str(s.trim(), "%d-%m-%Y"))
+                        .map_err(|_| Error::InvalidCast {
+                            from: "VARCHAR".to_string(),
+                            to: "DATE".to_string(),
+                        })?
+                }
+                _ => return Err(Error::InvalidCast {
+                    from: val.logical_type().to_string(),
+                    to: target.to_string(),
+                }),
+            };
+            Ok(Value::Date(d))
+        }
+        LogicalType::Timestamp => {
+            use chrono::{NaiveDateTime, NaiveDate};
+            let ts = match val {
+                Value::Timestamp(ts) => *ts,
+                Value::Date(d) => d.and_hms_opt(0, 0, 0).unwrap(),
+                Value::TimestampTz(ts) => ts.naive_utc(),
+                Value::Varchar(s) => {
+                    // Try parsing common timestamp formats
+                    NaiveDateTime::parse_from_str(s.trim(), "%Y-%m-%d %H:%M:%S")
+                        .or_else(|_| NaiveDateTime::parse_from_str(s.trim(), "%Y-%m-%d %H:%M:%S%.f"))
+                        .or_else(|_| NaiveDateTime::parse_from_str(s.trim(), "%Y-%m-%dT%H:%M:%S"))
+                        .or_else(|_| {
+                            // Try as date only
+                            NaiveDate::parse_from_str(s.trim(), "%Y-%m-%d")
+                                .map(|d| d.and_hms_opt(0, 0, 0).unwrap())
+                        })
+                        .map_err(|_| Error::InvalidCast {
+                            from: "VARCHAR".to_string(),
+                            to: "TIMESTAMP".to_string(),
+                        })?
+                }
+                _ => return Err(Error::InvalidCast {
+                    from: val.logical_type().to_string(),
+                    to: target.to_string(),
+                }),
+            };
+            Ok(Value::Timestamp(ts))
+        }
+        LogicalType::Time => {
+            use chrono::NaiveTime;
+            let t = match val {
+                Value::Time(t) => *t,
+                Value::Timestamp(ts) => ts.time(),
+                Value::TimestampTz(ts) => ts.time(),
+                Value::Varchar(s) => {
+                    NaiveTime::parse_from_str(s.trim(), "%H:%M:%S")
+                        .or_else(|_| NaiveTime::parse_from_str(s.trim(), "%H:%M:%S%.f"))
+                        .or_else(|_| NaiveTime::parse_from_str(s.trim(), "%H:%M"))
+                        .map_err(|_| Error::InvalidCast {
+                            from: "VARCHAR".to_string(),
+                            to: "TIME".to_string(),
+                        })?
+                }
+                _ => return Err(Error::InvalidCast {
+                    from: val.logical_type().to_string(),
+                    to: target.to_string(),
+                }),
+            };
+            Ok(Value::Time(t))
+        }
+        LogicalType::TimestampTz => {
+            use chrono::{DateTime, Utc, NaiveDateTime, NaiveDate};
+            let ts = match val {
+                Value::TimestampTz(ts) => *ts,
+                Value::Timestamp(ts) => DateTime::from_naive_utc_and_offset(*ts, Utc),
+                Value::Date(d) => {
+                    let naive = d.and_hms_opt(0, 0, 0).unwrap();
+                    DateTime::from_naive_utc_and_offset(naive, Utc)
+                }
+                Value::Varchar(s) => {
+                    // Try parsing with timezone
+                    DateTime::parse_from_rfc3339(s.trim())
+                        .map(|dt| dt.with_timezone(&Utc))
+                        .or_else(|_| {
+                            // Try as naive timestamp and assume UTC
+                            NaiveDateTime::parse_from_str(s.trim(), "%Y-%m-%d %H:%M:%S")
+                                .map(|dt| DateTime::from_naive_utc_and_offset(dt, Utc))
+                        })
+                        .or_else(|_| {
+                            NaiveDate::parse_from_str(s.trim(), "%Y-%m-%d")
+                                .map(|d| DateTime::from_naive_utc_and_offset(d.and_hms_opt(0, 0, 0).unwrap(), Utc))
+                        })
+                        .map_err(|_| Error::InvalidCast {
+                            from: "VARCHAR".to_string(),
+                            to: "TIMESTAMPTZ".to_string(),
+                        })?
+                }
+                _ => return Err(Error::InvalidCast {
+                    from: val.logical_type().to_string(),
+                    to: target.to_string(),
+                }),
+            };
+            Ok(Value::TimestampTz(ts))
         }
         _ => Err(Error::NotImplemented(format!("Cast to {:?}", target))),
     }

@@ -13,6 +13,7 @@ pub enum BoundStatement {
     Update(BoundUpdate),
     CreateTable(BoundCreateTable),
     CreateSchema(BoundCreateSchema),
+    CreateView(BoundCreateView),
     Drop(BoundDrop),
     Explain(Box<BoundStatement>),
     /// No-op statement (PRAGMA, SET, etc.)
@@ -128,9 +129,28 @@ pub enum BoundTableRef {
         right: Box<BoundTableRef>,
         join_type: BoundJoinType,
         condition: Option<BoundExpression>,
+        /// Column names from USING clause that are deduplicated (excluded from right side in wildcards)
+        using_columns: Vec<String>,
+    },
+    /// Table-valued function (e.g., range(), generate_series())
+    TableFunction {
+        function: TableFunctionType,
+        alias: Option<String>,
+        column_alias: Option<String>,
     },
     /// Empty (for SELECT without FROM)
     Empty,
+}
+
+/// Types of table-valued functions
+#[derive(Debug, Clone)]
+pub enum TableFunctionType {
+    /// range(start, stop, step) or range(stop) - generates a sequence of integers
+    Range {
+        start: BoundExpression,
+        stop: BoundExpression,
+        step: BoundExpression,
+    },
 }
 
 /// Join types
@@ -190,6 +210,8 @@ pub struct BoundCreateTable {
     pub name: String,
     pub columns: Vec<BoundColumnDef>,
     pub if_not_exists: bool,
+    /// For CREATE TABLE ... AS SELECT ...
+    pub source_query: Option<Box<BoundSelect>>,
 }
 
 /// Column definition
@@ -206,6 +228,19 @@ pub struct BoundColumnDef {
 pub struct BoundCreateSchema {
     pub name: String,
     pub if_not_exists: bool,
+}
+
+/// Bound CREATE VIEW statement
+#[derive(Debug, Clone)]
+pub struct BoundCreateView {
+    pub schema: String,
+    pub name: String,
+    /// The SQL query that defines the view
+    pub sql: String,
+    /// Column names derived from the query
+    pub column_names: Vec<String>,
+    /// Whether to replace if exists
+    pub or_replace: bool,
 }
 
 /// Bound DROP statement

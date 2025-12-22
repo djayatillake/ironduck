@@ -432,11 +432,113 @@ pub fn bind_expression(
             }
         }
 
+        // Interval expressions: INTERVAL '1 day', INTERVAL '1' DAY, etc.
+        sql::Expr::Interval(interval_expr) => {
+            use ironduck_common::value::Interval as IronInterval;
+
+            // Get the interval value string
+            let value_str = match &*interval_expr.value {
+                sql::Expr::Value(sql::Value::SingleQuotedString(s)) => s.clone(),
+                sql::Expr::Value(sql::Value::Number(n, _)) => n.clone(),
+                _ => return Err(Error::NotImplemented(format!("Interval expression type: {:?}", interval_expr.value))),
+            };
+
+            // Parse the interval based on leading_field or the string content
+            let interval = if let Some(field) = &interval_expr.leading_field {
+                // INTERVAL '1' DAY form
+                let num: i64 = value_str.parse()
+                    .map_err(|_| Error::Parse(format!("Invalid interval number: {}", value_str)))?;
+
+                match field {
+                    sql::DateTimeField::Year => IronInterval { months: num as i32 * 12, days: 0, micros: 0 },
+                    sql::DateTimeField::Month => IronInterval { months: num as i32, days: 0, micros: 0 },
+                    sql::DateTimeField::Day => IronInterval { months: 0, days: num as i32, micros: 0 },
+                    sql::DateTimeField::Hour => IronInterval { months: 0, days: 0, micros: num * 60 * 60 * 1_000_000 },
+                    sql::DateTimeField::Minute => IronInterval { months: 0, days: 0, micros: num * 60 * 1_000_000 },
+                    sql::DateTimeField::Second => IronInterval { months: 0, days: 0, micros: num * 1_000_000 },
+                    _ => return Err(Error::NotImplemented(format!("Interval field: {:?}", field))),
+                }
+            } else {
+                // INTERVAL '1 day' form - parse the string
+                parse_interval_string(&value_str)?
+            };
+
+            Ok(BoundExpression::new(
+                BoundExpressionKind::Constant(Value::Interval(interval)),
+                LogicalType::Interval,
+            ))
+        }
+
         _ => Err(Error::NotImplemented(format!(
             "Expression type: {:?}",
             expr
         ))),
     }
+}
+
+/// Parse an interval string like "1 day", "2 hours 30 minutes", etc.
+fn parse_interval_string(s: &str) -> Result<ironduck_common::value::Interval> {
+    use ironduck_common::value::Interval;
+
+    let s = s.trim().to_lowercase();
+    let mut months = 0i32;
+    let mut days = 0i32;
+    let mut micros = 0i64;
+
+    // Handle PostgreSQL @ prefix
+    let s = s.strip_prefix('@').unwrap_or(&s).trim();
+
+    // Split by spaces and parse pairs
+    let parts: Vec<&str> = s.split_whitespace().collect();
+    let mut i = 0;
+
+    while i < parts.len() {
+        // Try to get a number
+        if let Ok(num) = parts[i].parse::<i64>() {
+            // Get the unit (next part or combined like "1day")
+            if i + 1 < parts.len() {
+                let unit = parts[i + 1].trim_end_matches('s'); // Remove plural 's'
+                match unit {
+                    "year" => months += (num * 12) as i32,
+                    "month" | "mon" => months += num as i32,
+                    "week" => days += (num * 7) as i32,
+                    "day" => days += num as i32,
+                    "hour" => micros += num * 60 * 60 * 1_000_000,
+                    "minute" | "min" => micros += num * 60 * 1_000_000,
+                    "second" | "sec" => micros += num * 1_000_000,
+                    "millisecond" | "ms" => micros += num * 1_000,
+                    "microsecond" | "us" => micros += num,
+                    _ => {}
+                }
+                i += 2;
+            } else {
+                // Just a number, assume days
+                days += num as i32;
+                i += 1;
+            }
+        } else {
+            // Try parsing "1day" combined form
+            let part = parts[i];
+            let num_part = part.trim_end_matches(|c: char| c.is_alphabetic());
+            if let Ok(num) = num_part.parse::<i64>() {
+                let unit_part = &part[num_part.len()..];
+                let unit = unit_part.trim_end_matches('s'); // Remove plural 's'
+                match unit {
+                    "year" => months += (num * 12) as i32,
+                    "month" | "mon" => months += num as i32,
+                    "week" => days += (num * 7) as i32,
+                    "day" => days += num as i32,
+                    "hour" => micros += num * 60 * 60 * 1_000_000,
+                    "minute" | "min" => micros += num * 60 * 1_000_000,
+                    "second" | "sec" => micros += num * 1_000_000,
+                    _ => {}
+                }
+            }
+            i += 1;
+        }
+    }
+
+    Ok(Interval { months, days, micros })
 }
 
 /// Bind a literal value
@@ -522,6 +624,27 @@ fn bind_column_ref(idents: &[sql::Ident], ctx: &ExpressionBinderContext) -> Resu
         col_offset += column_names.len();
     }
 
+    // Check for rowid pseudo-column
+    if column_name.eq_ignore_ascii_case("rowid") {
+        // Find the matching table for rowid
+        for (table_idx, (name, alias, _column_names, _column_types)) in base_tables.iter().enumerate() {
+            let table_matches = match &table_qualifier {
+                Some(qualifier) => {
+                    alias.as_ref().map(|a| a.eq_ignore_ascii_case(qualifier)).unwrap_or(false)
+                        || name.eq_ignore_ascii_case(qualifier)
+                }
+                None => true,
+            };
+
+            if table_matches {
+                return Ok(BoundExpression::new(
+                    BoundExpressionKind::RowId { table_idx },
+                    LogicalType::BigInt,
+                ));
+            }
+        }
+    }
+
     Err(Error::ColumnNotFound(column_name))
 }
 
@@ -548,6 +671,12 @@ fn collect_base_tables_rec(table_ref: &BoundTableRef, result: &mut Vec<(String, 
             let column_names: Vec<String> = subquery.select_list.iter().map(|e| e.name()).collect();
             let column_types: Vec<LogicalType> = subquery.select_list.iter().map(|e| e.return_type.clone()).collect();
             result.push((alias.clone(), Some(alias.clone()), column_names, column_types));
+        }
+        BoundTableRef::TableFunction { alias, column_alias, .. } => {
+            // Table function produces a single column
+            let col_name = column_alias.clone().unwrap_or_else(|| "range".to_string());
+            let table_name = alias.clone().unwrap_or_else(|| "range".to_string());
+            result.push((table_name.clone(), alias.clone(), vec![col_name], vec![LogicalType::BigInt]));
         }
         BoundTableRef::Empty => {}
     }
@@ -657,7 +786,7 @@ fn bind_function(
             let ret = if arg_type.is_floating_point() {
                 LogicalType::Double
             } else {
-                LogicalType::BigInt
+                LogicalType::HugeInt  // Use HugeInt to prevent overflow
             };
             (true, ret)
         }
@@ -771,6 +900,11 @@ pub fn bind_data_type(data_type: &sql::DataType) -> Result<LogicalType> {
         sql::DataType::Blob(_) | sql::DataType::Bytea => Ok(LogicalType::Blob),
         sql::DataType::Date => Ok(LogicalType::Date),
         sql::DataType::Time(_, _) => Ok(LogicalType::Time),
+        // TimestampTz (timestamp with timezone) - must come before generic Timestamp
+        sql::DataType::Timestamp(_, sql::TimezoneInfo::Tz)
+        | sql::DataType::Timestamp(_, sql::TimezoneInfo::WithTimeZone) => {
+            Ok(LogicalType::TimestampTz)
+        }
         sql::DataType::Timestamp(_, _) => Ok(LogicalType::Timestamp),
         sql::DataType::Uuid => Ok(LogicalType::Uuid),
         sql::DataType::Array(inner) => {
@@ -784,6 +918,22 @@ pub fn bind_data_type(data_type: &sql::DataType) -> Result<LogicalType> {
                 sql::ArrayElemTypeDef::None => {
                     Err(Error::Parse("Array type requires element type".to_string()))
                 }
+            }
+        }
+        sql::DataType::Interval => Ok(LogicalType::Interval),
+        // Handle DuckDB custom types that aren't in sqlparser
+        sql::DataType::Custom(name, _) => {
+            let type_name = name.to_string().to_uppercase();
+            match type_name.as_str() {
+                "HUGEINT" => Ok(LogicalType::HugeInt),
+                "UHUGEINT" => Ok(LogicalType::UHugeInt),
+                "UTINYINT" => Ok(LogicalType::UTinyInt),
+                "USMALLINT" => Ok(LogicalType::USmallInt),
+                "UINTEGER" => Ok(LogicalType::UInteger),
+                "UBIGINT" => Ok(LogicalType::UBigInt),
+                "TIMESTAMPTZ" => Ok(LogicalType::TimestampTz),
+                "TIMETZ" => Ok(LogicalType::Time), // We don't have TimeTz yet, fallback to Time
+                _ => Err(Error::NotImplemented(format!("Data type: {}", type_name))),
             }
         }
         _ => Err(Error::NotImplemented(format!("Data type: {:?}", data_type))),

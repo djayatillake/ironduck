@@ -1,9 +1,9 @@
 //! Query executor
 
-use crate::expression::evaluate;
+use crate::expression::{evaluate, evaluate_with_ctx, EvalContext};
 use ironduck_catalog::Catalog;
 use ironduck_common::{Error, LogicalType, Result, Value};
-use ironduck_planner::{Expression, LogicalOperator, LogicalPlan, WindowFunction};
+use ironduck_planner::{Expression, LogicalOperator, LogicalPlan, TableFunctionKind, WindowFunction};
 use ironduck_storage::TableStorage;
 use std::sync::Arc;
 
@@ -73,12 +73,16 @@ impl Executor {
                 let input_rows = self.execute_operator(input)?;
                 let mut output_rows = Vec::new();
                 let has_subquery = expressions.iter().any(contains_subquery);
+                let has_rowid = expressions.iter().any(contains_rowid);
 
-                for row in &input_rows {
+                for (row_idx, row) in input_rows.iter().enumerate() {
                     let mut output_row = Vec::new();
                     for expr in expressions {
                         let value = if has_subquery {
                             evaluate_with_subqueries(self, expr, row)?
+                        } else if has_rowid {
+                            let ctx = EvalContext::with_row_index(row_idx as i64);
+                            evaluate_with_ctx(expr, row, &ctx)?
                         } else {
                             evaluate(expr, row)?
                         };
@@ -107,11 +111,15 @@ impl Executor {
             LogicalOperator::Filter { input, predicate } => {
                 let input_rows = self.execute_operator(input)?;
                 let has_subquery = contains_subquery(predicate);
+                let has_rowid = contains_rowid(predicate);
                 let mut output_rows = Vec::new();
 
-                for row in input_rows {
+                for (row_idx, row) in input_rows.into_iter().enumerate() {
                     let result = if has_subquery {
                         evaluate_with_subqueries(self, predicate, &row)?
+                    } else if has_rowid {
+                        let ctx = EvalContext::with_row_index(row_idx as i64);
+                        evaluate_with_ctx(predicate, &row, &ctx)?
                     } else {
                         evaluate(predicate, &row)?
                     };
@@ -241,7 +249,13 @@ impl Executor {
                     }
 
                     let mut result_rows = Vec::new();
-                    for (_, group_rows) in groups {
+
+                    // Sort group keys for deterministic output
+                    let mut sorted_keys: Vec<_> = groups.keys().cloned().collect();
+                    sorted_keys.sort();
+
+                    for key in sorted_keys {
+                        let group_rows = groups.get(&key).unwrap();
                         let mut result_row = Vec::new();
 
                         // Add group by values
@@ -253,7 +267,7 @@ impl Executor {
 
                         // Add aggregate values
                         for agg in aggregates {
-                            let value = compute_aggregate(agg, &group_rows)?;
+                            let value = compute_aggregate(agg, group_rows)?;
                             result_row.push(value);
                         }
 
@@ -274,9 +288,9 @@ impl Executor {
                 let right_rows = self.execute_operator(right)?;
                 let mut result = Vec::new();
 
-                // Determine the width of right side for NULL padding
-                let right_width = right_rows.first().map(|r| r.len()).unwrap_or(0);
-                let left_width = left_rows.first().map(|r| r.len()).unwrap_or(0);
+                // Determine the width of left/right sides from schema (not from rows, which may be empty)
+                let right_width = right.output_types().len();
+                let left_width = left.output_types().len();
 
                 match join_type {
                     ironduck_planner::JoinType::Cross => {
@@ -428,6 +442,7 @@ impl Executor {
                 name,
                 columns,
                 if_not_exists,
+                source,
             } => {
                 // Check if table exists
                 if self.catalog.get_table(schema, name).is_some() {
@@ -443,7 +458,15 @@ impl Executor {
 
                 // Create storage for the table
                 let types: Vec<_> = columns.iter().map(|(_, t)| t.clone()).collect();
-                self.storage.get_or_create(schema, name, &types);
+                let table_data = self.storage.get_or_create(schema, name, &types);
+
+                // For CREATE TABLE ... AS SELECT ..., insert the data
+                if let Some(source_op) = source {
+                    let source_rows = self.execute_operator(source_op)?;
+                    for row in source_rows {
+                        table_data.insert(row);
+                    }
+                }
 
                 Ok(vec![vec![Value::Varchar(format!("Created table {}", name))]])
             }
@@ -459,6 +482,23 @@ impl Executor {
 
                 self.catalog.create_schema(name)?;
                 Ok(vec![vec![Value::Varchar(format!("Created schema {}", name))]])
+            }
+
+            LogicalOperator::CreateView {
+                schema,
+                name,
+                sql,
+                column_names,
+                or_replace,
+            } => {
+                self.catalog.create_view(
+                    schema,
+                    name,
+                    sql.clone(),
+                    column_names.clone(),
+                    *or_replace,
+                )?;
+                Ok(vec![vec![Value::Varchar(format!("Created view {}", name))]])
             }
 
             LogicalOperator::Insert {
@@ -493,8 +533,15 @@ impl Executor {
                     // Handle INSERT ... VALUES (...)
                     for row_exprs in values {
                         let mut row = Vec::new();
-                        for expr in row_exprs {
-                            row.push(evaluate(expr, &[])?);
+                        for (idx, expr) in row_exprs.iter().enumerate() {
+                            let val = evaluate(expr, &[])?;
+                            // Coerce to target column type
+                            let coerced = if idx < types.len() {
+                                coerce_value(val, &types[idx])?
+                            } else {
+                                val
+                            };
+                            row.push(coerced);
                         }
                         table_data.insert(row);
                         count += 1;
@@ -992,6 +1039,113 @@ impl Executor {
                 // No-op statements return empty result
                 Ok(vec![vec![Value::Varchar("OK".to_string())]])
             }
+
+            LogicalOperator::TableFunction { function, .. } => {
+                match function {
+                    TableFunctionKind::Range { start, stop, step } => {
+                        let start_val = evaluate(start, &[])?;
+                        let stop_val = evaluate(stop, &[])?;
+                        let step_val = evaluate(step, &[])?;
+
+                        // Handle different types for range
+                        match (&start_val, &stop_val, &step_val) {
+                            // Date range with interval step
+                            (Value::Date(start_date), Value::Date(stop_date), Value::Interval(interval)) => {
+                                use chrono::Duration;
+
+                                let mut rows = Vec::new();
+
+                                // Convert interval to microseconds for sub-day precision
+                                let micros_per_step = interval.micros
+                                    + (interval.days as i64 * 24 * 60 * 60 * 1_000_000)
+                                    + (interval.months as i64 * 30 * 24 * 60 * 60 * 1_000_000);
+
+                                if micros_per_step == 0 {
+                                    return Err(Error::Execution("range() step cannot be zero".to_string()));
+                                }
+
+                                // Convert dates to timestamps for sub-day interval support
+                                let start_ts = start_date.and_hms_opt(0, 0, 0).unwrap();
+                                let stop_ts = stop_date.and_hms_opt(0, 0, 0).unwrap();
+                                let mut current = start_ts;
+
+                                if micros_per_step > 0 {
+                                    while current < stop_ts {
+                                        rows.push(vec![Value::Timestamp(current)]);
+                                        current = current + Duration::microseconds(micros_per_step);
+                                    }
+                                } else {
+                                    while current > stop_ts {
+                                        rows.push(vec![Value::Timestamp(current)]);
+                                        current = current + Duration::microseconds(micros_per_step);
+                                    }
+                                }
+
+                                Ok(rows)
+                            }
+
+                            // Timestamp range with interval step
+                            (Value::Timestamp(start_ts), Value::Timestamp(stop_ts), Value::Interval(interval)) => {
+                                use chrono::Duration;
+
+                                let mut rows = Vec::new();
+                                let mut current = *start_ts;
+
+                                // Convert interval to microseconds
+                                let micros_per_step = interval.micros
+                                    + (interval.days as i64 * 24 * 60 * 60 * 1_000_000)
+                                    + (interval.months as i64 * 30 * 24 * 60 * 60 * 1_000_000);
+
+                                if micros_per_step == 0 {
+                                    return Err(Error::Execution("range() step cannot be zero".to_string()));
+                                }
+
+                                if micros_per_step > 0 {
+                                    while current < *stop_ts {
+                                        rows.push(vec![Value::Timestamp(current)]);
+                                        current = current + Duration::microseconds(micros_per_step);
+                                    }
+                                } else {
+                                    while current > *stop_ts {
+                                        rows.push(vec![Value::Timestamp(current)]);
+                                        current = current + Duration::microseconds(micros_per_step);
+                                    }
+                                }
+
+                                Ok(rows)
+                            }
+
+                            // Integer range (original behavior)
+                            _ => {
+                                let start = start_val.as_i64().unwrap_or(0);
+                                let stop = stop_val.as_i64().unwrap_or(0);
+                                let step = step_val.as_i64().unwrap_or(1);
+
+                                if step == 0 {
+                                    return Err(Error::Execution("range() step cannot be zero".to_string()));
+                                }
+
+                                let mut rows = Vec::new();
+                                let mut current = start;
+
+                                if step > 0 {
+                                    while current < stop {
+                                        rows.push(vec![Value::BigInt(current)]);
+                                        current += step;
+                                    }
+                                } else {
+                                    while current > stop {
+                                        rows.push(vec![Value::BigInt(current)]);
+                                        current += step;
+                                    }
+                                }
+
+                                Ok(rows)
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 }
@@ -1064,6 +1218,9 @@ fn format_plan(op: &LogicalOperator, indent: usize) -> String {
         LogicalOperator::CreateSchema { name, .. } => {
             format!("{}CreateSchema: {}", prefix, name)
         }
+        LogicalOperator::CreateView { name, .. } => {
+            format!("{}CreateView: {}", prefix, name)
+        }
         LogicalOperator::Insert { table, .. } => {
             format!("{}Insert: {}", prefix, table)
         }
@@ -1099,6 +1256,9 @@ fn format_plan(op: &LogicalOperator, indent: usize) -> String {
         }
         LogicalOperator::NoOp => {
             format!("{}NoOp", prefix)
+        }
+        LogicalOperator::TableFunction { column_name, .. } => {
+            format!("{}TableFunction: range() -> {}", prefix, column_name)
         }
     }
 }
@@ -1226,11 +1386,33 @@ fn contains_subquery(expr: &Expression) -> bool {
     }
 }
 
+/// Check if expression contains rowid references
+fn contains_rowid(expr: &Expression) -> bool {
+    match expr {
+        Expression::RowId { .. } => true,
+        Expression::BinaryOp { left, right, .. } => contains_rowid(left) || contains_rowid(right),
+        Expression::UnaryOp { expr, .. } => contains_rowid(expr),
+        Expression::Function { args, .. } => args.iter().any(contains_rowid),
+        Expression::Cast { expr, .. } => contains_rowid(expr),
+        Expression::IsNull(expr) | Expression::IsNotNull(expr) => contains_rowid(expr),
+        Expression::Case { operand, conditions, results, else_result } => {
+            operand.as_ref().map_or(false, |e| contains_rowid(e))
+                || conditions.iter().any(contains_rowid)
+                || results.iter().any(contains_rowid)
+                || else_result.as_ref().map_or(false, |e| contains_rowid(e))
+        }
+        Expression::InList { expr, list, .. } => contains_rowid(expr) || list.iter().any(contains_rowid),
+        Expression::InSubquery { expr, .. } => contains_rowid(expr),
+        _ => false,
+    }
+}
+
 /// Check if an expression is constant (no column references)
 fn is_constant(expr: &Expression) -> bool {
     match expr {
         Expression::Constant(_) => true,
         Expression::ColumnRef { .. } => false,
+        Expression::RowId { .. } => false,
         Expression::BinaryOp { left, right, .. } => is_constant(left) && is_constant(right),
         Expression::UnaryOp { expr, .. } => is_constant(expr),
         Expression::Function { args, .. } => args.iter().all(is_constant),
@@ -1292,8 +1474,11 @@ fn compute_aggregate(
         }
 
         Sum => {
-            let mut sum = 0f64;
+            // Use i128 for integer sums to preserve precision, f64 for floats
+            let mut int_sum: i128 = 0;
+            let mut float_sum: f64 = 0.0;
             let mut has_value = false;
+            let mut has_float = false;
 
             for row in rows {
                 if args.is_empty() {
@@ -1303,27 +1488,40 @@ fn compute_aggregate(
                 match val {
                     Value::TinyInt(i) => {
                         has_value = true;
-                        sum += i as f64;
+                        int_sum += i as i128;
                     }
                     Value::SmallInt(i) => {
                         has_value = true;
-                        sum += i as f64;
+                        int_sum += i as i128;
                     }
                     Value::Integer(i) => {
                         has_value = true;
-                        sum += i as f64;
+                        int_sum += i as i128;
                     }
                     Value::BigInt(i) => {
                         has_value = true;
-                        sum += i as f64;
+                        int_sum += i as i128;
+                    }
+                    Value::HugeInt(i) => {
+                        has_value = true;
+                        int_sum += i;
                     }
                     Value::Float(f) => {
                         has_value = true;
-                        sum += f as f64;
+                        has_float = true;
+                        float_sum += f as f64;
                     }
                     Value::Double(f) => {
                         has_value = true;
-                        sum += f;
+                        has_float = true;
+                        float_sum += f;
+                    }
+                    Value::Boolean(b) => {
+                        // SUM(boolean) counts TRUE as 1, FALSE as 0
+                        has_value = true;
+                        if b {
+                            int_sum += 1;
+                        }
                     }
                     Value::Null => {}
                     _ => {
@@ -1335,52 +1533,142 @@ fn compute_aggregate(
                 }
             }
 
-            // DuckDB returns NULL for SUM of no values, otherwise DOUBLE
-            if has_value {
-                Ok(Value::Double(sum))
-            } else {
+            if !has_value {
                 Ok(Value::Null)
+            } else if has_float {
+                // If we had any floats, return as double
+                Ok(Value::Double(float_sum + int_sum as f64))
+            } else {
+                // For pure integer sums, return HugeInt to preserve precision
+                Ok(Value::HugeInt(int_sum))
             }
         }
 
         Avg => {
-            let mut sum = 0f64;
-            let mut count = 0i64;
+            use chrono::{NaiveDateTime, NaiveDate, NaiveTime, DateTime, Utc, TimeZone, Timelike};
+            use ironduck_common::value::Interval;
+
+            // Track what type we're averaging
+            enum AvgType {
+                Numeric,
+                Timestamp,
+                Date,
+                Time,
+                TimestampTz,
+                Interval,
+            }
+
+            // Collect values (applying DISTINCT if needed)
+            let mut values: Vec<Value> = Vec::new();
+            let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
 
             for row in rows {
                 if args.is_empty() {
                     continue;
                 }
                 let val = evaluate(&args[0], row)?;
+                if val.is_null() {
+                    continue;
+                }
+
+                if distinct {
+                    let key = format!("{:?}", val);
+                    if seen.insert(key) {
+                        values.push(val);
+                    }
+                } else {
+                    values.push(val);
+                }
+            }
+
+            let mut sum = 0f64;
+            let mut count = 0i64;
+            let mut avg_type = None;
+
+            // For intervals, we need separate accumulators
+            let mut interval_months: i64 = 0;
+            let mut interval_days: i64 = 0;
+            let mut interval_micros: i128 = 0;
+
+            for val in values {
                 match val {
                     Value::Null => {} // Skip nulls
                     Value::TinyInt(i) => {
+                        avg_type.get_or_insert(AvgType::Numeric);
                         sum += i as f64;
                         count += 1;
                     }
                     Value::SmallInt(i) => {
+                        avg_type.get_or_insert(AvgType::Numeric);
                         sum += i as f64;
                         count += 1;
                     }
                     Value::Integer(i) => {
+                        avg_type.get_or_insert(AvgType::Numeric);
                         sum += i as f64;
                         count += 1;
                     }
                     Value::BigInt(i) => {
+                        avg_type.get_or_insert(AvgType::Numeric);
+                        sum += i as f64;
+                        count += 1;
+                    }
+                    Value::HugeInt(i) => {
+                        avg_type.get_or_insert(AvgType::Numeric);
                         sum += i as f64;
                         count += 1;
                     }
                     Value::Float(f) => {
+                        avg_type.get_or_insert(AvgType::Numeric);
                         sum += f as f64;
                         count += 1;
                     }
                     Value::Double(f) => {
+                        avg_type.get_or_insert(AvgType::Numeric);
                         sum += f;
+                        count += 1;
+                    }
+                    Value::Timestamp(ts) => {
+                        avg_type.get_or_insert(AvgType::Timestamp);
+                        // Convert to microseconds since epoch
+                        let micros = ts.and_utc().timestamp_micros();
+                        sum += micros as f64;
+                        count += 1;
+                    }
+                    Value::Date(d) => {
+                        avg_type.get_or_insert(AvgType::Date);
+                        // Convert to days since Unix epoch, then to microseconds for precision
+                        let epoch = NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
+                        let days = (d - epoch).num_days();
+                        // Store as microseconds (days * 24 * 60 * 60 * 1_000_000)
+                        let micros = days as f64 * 86400.0 * 1_000_000.0;
+                        sum += micros;
+                        count += 1;
+                    }
+                    Value::Time(t) => {
+                        avg_type.get_or_insert(AvgType::Time);
+                        // Convert to nanoseconds since midnight
+                        let nanos = t.num_seconds_from_midnight() as i64 * 1_000_000_000
+                            + t.nanosecond() as i64;
+                        sum += nanos as f64;
+                        count += 1;
+                    }
+                    Value::TimestampTz(ts) => {
+                        avg_type.get_or_insert(AvgType::TimestampTz);
+                        let micros = ts.timestamp_micros();
+                        sum += micros as f64;
+                        count += 1;
+                    }
+                    Value::Interval(i) => {
+                        avg_type.get_or_insert(AvgType::Interval);
+                        interval_months += i.months as i64;
+                        interval_days += i.days as i64;
+                        interval_micros += i.micros as i128;
                         count += 1;
                     }
                     _ => {
                         return Err(Error::TypeMismatch {
-                            expected: "numeric".to_string(),
+                            expected: "numeric or temporal".to_string(),
                             got: format!("{:?}", val),
                         })
                     }
@@ -1390,7 +1678,67 @@ fn compute_aggregate(
             if count == 0 {
                 Ok(Value::Null)
             } else {
-                Ok(Value::Double(sum / count as f64))
+                match avg_type {
+                    Some(AvgType::Numeric) | None => {
+                        Ok(Value::Double(sum / count as f64))
+                    }
+                    Some(AvgType::Timestamp) => {
+                        let avg_micros = (sum / count as f64) as i64;
+                        let secs = avg_micros / 1_000_000;
+                        let micros = (avg_micros % 1_000_000) as u32;
+                        let ts = DateTime::from_timestamp(secs, micros * 1000)
+                            .map(|dt| dt.naive_utc())
+                            .unwrap_or_else(|| NaiveDateTime::default());
+                        Ok(Value::Timestamp(ts))
+                    }
+                    Some(AvgType::Date) => {
+                        // Average of dates returns a timestamp (to handle fractional days)
+                        let avg_micros = (sum / count as f64) as i64;
+                        let secs = avg_micros / 1_000_000;
+                        let micros = ((avg_micros % 1_000_000).abs()) as u32;
+                        let ts = DateTime::from_timestamp(secs, micros * 1000)
+                            .map(|dt| dt.naive_utc())
+                            .unwrap_or_else(|| NaiveDateTime::default());
+                        Ok(Value::Timestamp(ts))
+                    }
+                    Some(AvgType::Time) => {
+                        let avg_nanos = (sum / count as f64) as i64;
+                        let secs = (avg_nanos / 1_000_000_000) as u32;
+                        let nanos = (avg_nanos % 1_000_000_000) as u32;
+                        let time = NaiveTime::from_num_seconds_from_midnight_opt(secs, nanos)
+                            .unwrap_or_else(|| NaiveTime::from_hms_opt(0, 0, 0).unwrap());
+                        Ok(Value::Time(time))
+                    }
+                    Some(AvgType::TimestampTz) => {
+                        let avg_micros = (sum / count as f64) as i64;
+                        let secs = avg_micros / 1_000_000;
+                        let micros = (avg_micros % 1_000_000) as u32;
+                        let ts = DateTime::from_timestamp(secs, micros * 1000)
+                            .unwrap_or_else(|| Utc.with_ymd_and_hms(1970, 1, 1, 0, 0, 0).unwrap());
+                        Ok(Value::TimestampTz(ts))
+                    }
+                    Some(AvgType::Interval) => {
+                        // Calculate averages keeping fractional parts
+                        let avg_months_f = interval_months as f64 / count as f64;
+                        let avg_days_f = interval_days as f64 / count as f64;
+                        let avg_micros_f = interval_micros as f64 / count as f64;
+
+                        // Whole months, fractional months become days
+                        let whole_months = avg_months_f.trunc() as i32;
+                        let frac_months = avg_months_f.fract();
+                        let extra_days_from_months = frac_months * 30.0; // Approximate month = 30 days
+
+                        // Whole days, fractional days become microseconds
+                        let total_days = avg_days_f + extra_days_from_months;
+                        let whole_days = total_days.trunc() as i32;
+                        let frac_days = total_days.fract();
+                        let extra_micros_from_days = (frac_days * 24.0 * 60.0 * 60.0 * 1_000_000.0).round() as i64;
+
+                        let total_micros = avg_micros_f.round() as i64 + extra_micros_from_days;
+
+                        Ok(Value::Interval(Interval::new(whole_months, whole_days, total_micros)))
+                    }
+                }
             }
         }
 
@@ -1495,10 +1843,21 @@ fn compute_aggregate(
                 }
             }
 
+            // Return NULL if no non-null values
+            if values.is_empty() {
+                return Ok(Value::Null);
+            }
+
             // Handle DISTINCT
             if distinct {
                 let mut seen = std::collections::HashSet::new();
                 values.retain(|v| seen.insert(v.clone()));
+            }
+
+            // Sort values if DISTINCT (for consistent ordering)
+            // TODO: Support ORDER BY clause within aggregate
+            if distinct {
+                values.sort();
             }
 
             Ok(Value::Varchar(values.join(&delimiter)))
@@ -1990,4 +2349,115 @@ impl QueryResult {
     pub fn column_count(&self) -> usize {
         self.columns.len()
     }
+}
+
+/// Coerce a value to a target type
+fn coerce_value(value: Value, target_type: &LogicalType) -> Result<Value> {
+    use ironduck_common::value::Interval;
+
+    // If already the right type or NULL, return as-is
+    if value.is_null() {
+        return Ok(value);
+    }
+
+    match (value.clone(), target_type) {
+        // String to Interval conversion
+        (Value::Varchar(s), LogicalType::Interval) => {
+            parse_interval(&s).map(Value::Interval)
+        }
+        // Keep value if types match
+        (Value::Interval(_), LogicalType::Interval) => Ok(value),
+        (Value::Timestamp(_), LogicalType::Timestamp) => Ok(value),
+        (Value::Date(_), LogicalType::Date) => Ok(value),
+        (Value::Time(_), LogicalType::Time) => Ok(value),
+        (Value::TimestampTz(_), LogicalType::TimestampTz) => Ok(value),
+        (Value::Integer(_), LogicalType::Integer) => Ok(value),
+        (Value::BigInt(_), LogicalType::BigInt) => Ok(value),
+        (Value::Double(_), LogicalType::Double) => Ok(value),
+        (Value::Varchar(_), LogicalType::Varchar) => Ok(value),
+        (Value::Boolean(_), LogicalType::Boolean) => Ok(value),
+        // For other types, just return the value (may need more conversions later)
+        _ => Ok(value),
+    }
+}
+
+/// Parse an interval string like "1 day", "30 days", "1 year 2 months"
+fn parse_interval(s: &str) -> Result<ironduck_common::value::Interval> {
+    use ironduck_common::value::Interval;
+
+    let s = s.trim();
+
+    // Handle PostgreSQL-style intervals like "@ 1 minute"
+    let s = s.strip_prefix("@ ").unwrap_or(s);
+    let s = s.strip_prefix('@').unwrap_or(s).trim();
+
+    // Handle "ago" suffix for negative intervals
+    let (s, negate) = if s.ends_with(" ago") {
+        (s.strip_suffix(" ago").unwrap(), true)
+    } else {
+        (s, false)
+    };
+
+    let mut months = 0i32;
+    let mut days = 0i32;
+    let mut micros = 0i64;
+
+    // Split on whitespace and process pairs
+    let parts: Vec<&str> = s.split_whitespace().collect();
+    let mut i = 0;
+
+    while i < parts.len() {
+        // Try to parse as number + unit
+        if i + 1 < parts.len() {
+            if let Ok(num) = parts[i].parse::<i64>() {
+                let unit = parts[i + 1].to_lowercase();
+                match unit.as_str() {
+                    "year" | "years" => months += (num * 12) as i32,
+                    "month" | "months" => months += num as i32,
+                    "week" | "weeks" => days += (num * 7) as i32,
+                    "day" | "days" => days += num as i32,
+                    "hour" | "hours" => micros += num * 3600 * 1_000_000,
+                    "minute" | "minutes" => micros += num * 60 * 1_000_000,
+                    "second" | "seconds" => micros += num * 1_000_000,
+                    "millisecond" | "milliseconds" => micros += num * 1_000,
+                    "microsecond" | "microseconds" => micros += num,
+                    _ => {}
+                }
+                i += 2;
+                continue;
+            }
+        }
+
+        // Try parsing composite format like "1 day 2 hours 3 minutes 4 seconds"
+        // or simple format like "1 day"
+        if let Ok(num) = parts[i].parse::<i64>() {
+            // Just a number, skip
+            i += 1;
+        } else {
+            // Might be a time format like "04:18:23"
+            if parts[i].contains(':') {
+                let time_parts: Vec<&str> = parts[i].split(':').collect();
+                if time_parts.len() >= 2 {
+                    if let (Ok(h), Ok(m)) = (time_parts[0].parse::<i64>(), time_parts[1].parse::<i64>()) {
+                        micros += h * 3600 * 1_000_000;
+                        micros += m * 60 * 1_000_000;
+                        if time_parts.len() >= 3 {
+                            if let Ok(s) = time_parts[2].parse::<f64>() {
+                                micros += (s * 1_000_000.0) as i64;
+                            }
+                        }
+                    }
+                }
+            }
+            i += 1;
+        }
+    }
+
+    if negate {
+        months = -months;
+        days = -days;
+        micros = -micros;
+    }
+
+    Ok(Interval::new(months, days, micros))
 }

@@ -25,6 +25,12 @@ pub enum Error {
     #[error("Table already exists: {0}")]
     TableAlreadyExists(String),
 
+    #[error("View not found: {0}")]
+    ViewNotFound(String),
+
+    #[error("View already exists: {0}")]
+    ViewAlreadyExists(String),
+
     #[error("Schema already exists: {0}")]
     SchemaAlreadyExists(String),
 

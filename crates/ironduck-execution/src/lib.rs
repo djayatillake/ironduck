@@ -12,6 +12,6 @@ pub mod vectorized_expr;
 
 pub use chunk::DataChunk;
 pub use executor::{Executor, QueryResult};
-pub use expression::evaluate;
+pub use expression::{evaluate, evaluate_with_ctx, EvalContext};
 pub use vector::Vector;
 pub use vectorized_expr::evaluate_vectorized;

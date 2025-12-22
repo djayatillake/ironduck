@@ -46,6 +46,7 @@ impl BoundExpression {
             BoundExpressionKind::ScalarSubquery(_) => "SUBQUERY".to_string(),
             BoundExpressionKind::Star => "*".to_string(),
             BoundExpressionKind::WindowFunction { name, .. } => name.clone(),
+            BoundExpressionKind::RowId { .. } => "rowid".to_string(),
         }
     }
 }
@@ -148,6 +149,11 @@ pub enum BoundExpressionKind {
         partition_by: Vec<BoundExpression>,
         /// ORDER BY expressions (expression, ascending, nulls_first)
         order_by: Vec<(BoundExpression, bool, bool)>,
+    },
+
+    /// Row ID pseudo-column
+    RowId {
+        table_idx: usize,
     },
 }
 

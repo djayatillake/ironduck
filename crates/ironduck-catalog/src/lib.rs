@@ -11,11 +11,13 @@ mod column;
 mod function;
 mod schema;
 mod table;
+mod view;
 
 pub use column::{Column, ColumnId};
 pub use function::{Function, FunctionId};
 pub use schema::{Schema, SchemaId};
 pub use table::{Table, TableId};
+pub use view::{View, ViewId};
 
 /// Unique identifier for catalog entries
 pub type CatalogId = u64;
@@ -110,6 +112,37 @@ impl Catalog {
     pub fn get_table(&self, schema_name: &str, table_name: &str) -> Option<Arc<Table>> {
         let schema = self.get_schema(schema_name)?;
         schema.get_table(table_name)
+    }
+
+    /// Create a view in the given schema
+    pub fn create_view(
+        &self,
+        schema_name: &str,
+        view_name: &str,
+        sql: String,
+        column_names: Vec<String>,
+        or_replace: bool,
+    ) -> Result<ViewId> {
+        let schema = self
+            .get_schema(schema_name)
+            .ok_or_else(|| Error::SchemaNotFound(schema_name.to_string()))?;
+
+        let view_id = self.next_id();
+        let view = View::new(view_id, view_name.to_string(), sql, column_names);
+
+        if or_replace {
+            schema.add_or_replace_view(view);
+        } else {
+            schema.add_view(view)?;
+        }
+
+        Ok(view_id)
+    }
+
+    /// Get a view by schema and view name
+    pub fn get_view(&self, schema_name: &str, view_name: &str) -> Option<Arc<View>> {
+        let schema = self.get_schema(schema_name)?;
+        schema.get_view(view_name)
     }
 
     /// List all schema names

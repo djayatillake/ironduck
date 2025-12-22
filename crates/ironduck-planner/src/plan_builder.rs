@@ -12,8 +12,14 @@ pub fn build_plan(statement: &BoundStatement) -> Result<LogicalPlan> {
     match statement {
         BoundStatement::Select(select) => build_select_plan(select),
         BoundStatement::CreateTable(create) => {
-            // CREATE TABLE doesn't produce a query plan, it's a DDL operation
-            // Return a dummy plan that produces no rows
+            // Build source plan if we have a SELECT source (CTAS)
+            let source = if let Some(source_query) = &create.source_query {
+                let source_plan = build_select_plan(source_query)?;
+                Some(Box::new(source_plan.root))
+            } else {
+                None
+            };
+
             Ok(LogicalPlan::new(
                 LogicalOperator::CreateTable {
                     schema: create.schema.clone(),
@@ -24,6 +30,7 @@ pub fn build_plan(statement: &BoundStatement) -> Result<LogicalPlan> {
                         .map(|c| (c.name.clone(), c.data_type.clone()))
                         .collect(),
                     if_not_exists: create.if_not_exists,
+                    source,
                 },
                 vec!["Success".to_string()],
             ))
@@ -58,6 +65,16 @@ pub fn build_plan(statement: &BoundStatement) -> Result<LogicalPlan> {
             LogicalOperator::CreateSchema {
                 name: create.name.clone(),
                 if_not_exists: create.if_not_exists,
+            },
+            vec!["Success".to_string()],
+        )),
+        BoundStatement::CreateView(view) => Ok(LogicalPlan::new(
+            LogicalOperator::CreateView {
+                schema: view.schema.clone(),
+                name: view.name.clone(),
+                sql: view.sql.clone(),
+                column_names: view.column_names.clone(),
+                or_replace: view.or_replace,
             },
             vec!["Success".to_string()],
         )),
@@ -470,6 +487,7 @@ fn build_table_ref_plan(table_ref: &BoundTableRef) -> Result<LogicalOperator> {
             right,
             join_type,
             condition,
+            ..
         } => {
             let left_plan = build_table_ref_plan(left)?;
             let right_plan = build_table_ref_plan(right)?;
@@ -491,6 +509,23 @@ fn build_table_ref_plan(table_ref: &BoundTableRef) -> Result<LogicalOperator> {
         }
 
         BoundTableRef::Empty => Ok(LogicalOperator::DummyScan),
+
+        BoundTableRef::TableFunction { function, column_alias, .. } => {
+            match function {
+                ironduck_binder::TableFunctionType::Range { start, stop, step } => {
+                    let column_name = column_alias.clone().unwrap_or_else(|| "range".to_string());
+                    Ok(LogicalOperator::TableFunction {
+                        function: super::TableFunctionKind::Range {
+                            start: convert_expression(start),
+                            stop: convert_expression(stop),
+                            step: convert_expression(step),
+                        },
+                        column_name,
+                        output_type: ironduck_common::LogicalType::BigInt,
+                    })
+                }
+            }
+        }
     }
 }
 
@@ -697,6 +732,10 @@ fn convert_expression(expr: &BoundExpression) -> super::Expression {
             // Return a placeholder that will be replaced
             super::Expression::Constant(Value::Null)
         }
+
+        BoundExpressionKind::RowId { table_idx } => super::Expression::RowId {
+            table_index: *table_idx,
+        },
     }
 }
 

@@ -2,9 +2,10 @@
 
 use super::expression_binder::{bind_data_type, bind_expression, ExpressionBinderContext};
 use super::{
-    BoundCTE, BoundColumnDef, BoundCreateSchema, BoundCreateTable, BoundDelete, BoundDrop,
-    BoundExpression, BoundInsert, BoundJoinType, BoundOrderBy, BoundSelect, BoundSetOperation,
-    BoundStatement, BoundTableRef, BoundUpdate, Binder, DistinctKind, DropObjectType, SetOperationType,
+    BoundCTE, BoundColumnDef, BoundCreateSchema, BoundCreateTable, BoundCreateView, BoundDelete,
+    BoundDrop, BoundExpression, BoundInsert, BoundJoinType, BoundOrderBy, BoundSelect,
+    BoundSetOperation, BoundStatement, BoundTableRef, BoundUpdate, Binder, DistinctKind,
+    DropObjectType, SetOperationType, TableFunctionType,
 };
 use ironduck_common::{Error, Result};
 use sqlparser::ast as sql;
@@ -79,6 +80,10 @@ pub fn bind_statement(binder: &Binder, stmt: &sql::Statement) -> Result<BoundSta
 
         // PRAGMA statements - treat as no-ops for compatibility
         sql::Statement::Pragma { .. } => Ok(BoundStatement::NoOp),
+
+        sql::Statement::CreateView { name, query, or_replace, .. } => {
+            bind_create_view(binder, name, query, *or_replace)
+        }
 
         _ => Err(Error::NotImplemented(format!("Statement: {:?}", stmt))),
     }
@@ -295,28 +300,30 @@ fn bind_select_with_ctes(
                 }
                 sql::SelectItem::Wildcard(_) => {
                     // Expand * to all columns from all tables
-                    for table_ref in &from {
-                        if let BoundTableRef::BaseTable {
-                            column_names,
-                            column_types,
-                            ..
-                        } = table_ref
-                        {
-                            for (idx, (name, typ)) in column_names.iter().zip(column_types.iter()).enumerate() {
-                                select_list.push(BoundExpression::new(
-                                    super::BoundExpressionKind::ColumnRef {
-                                        table_idx: 0,
-                                        column_idx: idx,
-                                        name: name.clone(),
-                                    },
-                                    typ.clone(),
-                                ));
-                            }
-                        }
+                    // Track global column offset across all tables in FROM
+                    let mut global_col_offset = 0;
+                    for (table_idx, table_ref) in from.iter().enumerate() {
+                        expand_wildcard_with_offset(table_ref, table_idx, &mut global_col_offset, &mut select_list);
                     }
                 }
-                sql::SelectItem::QualifiedWildcard(_, _) => {
-                    return Err(Error::NotImplemented("Qualified wildcard".to_string()));
+                sql::SelectItem::QualifiedWildcard(name, _) => {
+                    // Expand table.* to all columns from the specified table
+                    let table_name = name.0.last()
+                        .map(|i| i.value.clone())
+                        .unwrap_or_default();
+
+                    let mut found = false;
+                    let mut global_col_offset = 0;
+                    for (table_idx, table_ref) in from.iter().enumerate() {
+                        if expand_qualified_wildcard(table_ref, &table_name, table_idx, &mut global_col_offset, &mut select_list) {
+                            found = true;
+                            // Don't break - we need to continue counting columns for proper offset
+                        }
+                    }
+
+                    if !found {
+                        return Err(Error::TableNotFound(table_name));
+                    }
                 }
             }
         }
@@ -400,6 +407,7 @@ fn collect_tables_from_ref(table_ref: &BoundTableRef) -> Vec<BoundTableRef> {
             tables
         }
         BoundTableRef::Subquery { .. } => vec![table_ref.clone()],
+        BoundTableRef::TableFunction { .. } => vec![table_ref.clone()],
         BoundTableRef::Empty => vec![],
     }
 }
@@ -437,7 +445,7 @@ fn bind_from_with_ctes(
                 _ => return Err(Error::NotImplemented("Join type".to_string())),
             };
 
-            let condition = match &join.join_operator {
+            let (condition, using_columns) = match &join.join_operator {
                 sql::JoinOperator::Inner(constraint)
                 | sql::JoinOperator::LeftOuter(constraint)
                 | sql::JoinOperator::RightOuter(constraint)
@@ -450,13 +458,61 @@ fn bind_from_with_ctes(
                             let mut all_tables = join_tables;
                             all_tables.extend(right_tables);
                             let ctx = ExpressionBinderContext::new(&all_tables);
-                            Some(bind_expression(binder, expr, &ctx)?)
+                            (Some(bind_expression(binder, expr, &ctx)?), Vec::new())
                         }
-                        sql::JoinConstraint::None => None,
-                        _ => return Err(Error::NotImplemented("Join constraint".to_string())),
+                        sql::JoinConstraint::Using(columns) => {
+                            // USING (col1, col2, ...) is equivalent to:
+                            // ON left.col1 = right.col1 AND left.col2 = right.col2 ...
+                            let join_tables = collect_tables_from_ref(&current);
+                            let right_tables = collect_tables_from_ref(&right);
+                            let mut all_tables = join_tables;
+                            all_tables.extend(right_tables);
+                            let ctx = ExpressionBinderContext::new(&all_tables);
+
+                            // Collect USING column names (for wildcard expansion)
+                            let using_cols: Vec<String> = columns.iter().map(|c| c.value.clone()).collect();
+
+                            // Build equality conditions for each column
+                            let mut conditions: Vec<BoundExpression> = Vec::new();
+                            for col in columns {
+                                // Create left.col = right.col expression
+                                let left_ref = sql::Expr::Identifier(col.clone());
+                                let right_ref = sql::Expr::Identifier(col.clone());
+                                let eq_expr = sql::Expr::BinaryOp {
+                                    left: Box::new(left_ref),
+                                    op: sql::BinaryOperator::Eq,
+                                    right: Box::new(right_ref),
+                                };
+                                conditions.push(bind_expression(binder, &eq_expr, &ctx)?);
+                            }
+
+                            // Combine with AND
+                            let cond = if conditions.is_empty() {
+                                None
+                            } else {
+                                let mut result = conditions.remove(0);
+                                for cond in conditions {
+                                    result = BoundExpression {
+                                        expr: super::BoundExpressionKind::BinaryOp {
+                                            left: Box::new(result),
+                                            op: super::BoundBinaryOperator::And,
+                                            right: Box::new(cond),
+                                        },
+                                        return_type: ironduck_common::LogicalType::Boolean,
+                                        alias: None,
+                                    };
+                                }
+                                Some(result)
+                            };
+                            (cond, using_cols)
+                        }
+                        sql::JoinConstraint::None => (None, Vec::new()),
+                        sql::JoinConstraint::Natural => {
+                            return Err(Error::NotImplemented("NATURAL join".to_string()))
+                        }
                     }
                 }
-                _ => None,
+                _ => (None, Vec::new()),
             };
 
             current = BoundTableRef::Join {
@@ -464,6 +520,7 @@ fn bind_from_with_ctes(
                 right: Box::new(right),
                 join_type,
                 condition,
+                using_columns,
             };
         }
 
@@ -485,8 +542,19 @@ fn bind_table_factor_with_ctes(
     ctes: &[BoundCTE],
 ) -> Result<BoundTableRef> {
     match factor {
-        sql::TableFactor::Table { name, alias, .. } => {
+        sql::TableFactor::Table { name, alias, args, .. } => {
             let parts: Vec<_> = name.0.iter().map(|i| i.value.clone()).collect();
+
+            // Check if this is a table-valued function (has args and name is a known function)
+            if let Some(table_args) = args {
+                if parts.len() == 1 {
+                    let func_name = parts[0].to_uppercase();
+                    if matches!(func_name.as_str(), "RANGE" | "GENERATE_SERIES") {
+                        // TableFunctionArgs.args is already Vec<FunctionArg>
+                        return bind_table_function(binder, name, &table_args.args, alias);
+                    }
+                }
+            }
 
             // For single-part names, check CTEs first
             if parts.len() == 1 {
@@ -512,22 +580,55 @@ fn bind_table_factor_with_ctes(
                 (binder.current_schema().to_string(), parts[0].clone())
             };
 
-            // Look up table in catalog
-            let table = binder
-                .catalog()
-                .get_table(&schema_name, &table_name)
-                .ok_or_else(|| Error::TableNotFound(table_name.clone()))?;
+            // First, try to look up as a table
+            if let Some(table) = binder.catalog().get_table(&schema_name, &table_name) {
+                let column_names: Vec<_> = table.columns.iter().map(|c| c.name.clone()).collect();
+                let column_types: Vec<_> = table.columns.iter().map(|c| c.logical_type.clone()).collect();
 
-            let column_names: Vec<_> = table.columns.iter().map(|c| c.name.clone()).collect();
-            let column_types: Vec<_> = table.columns.iter().map(|c| c.logical_type.clone()).collect();
+                return Ok(BoundTableRef::BaseTable {
+                    schema: schema_name,
+                    name: table_name,
+                    alias: alias.as_ref().map(|a| a.name.value.clone()),
+                    column_names,
+                    column_types,
+                });
+            }
 
-            Ok(BoundTableRef::BaseTable {
-                schema: schema_name,
-                name: table_name,
-                alias: alias.as_ref().map(|a| a.name.value.clone()),
-                column_names,
-                column_types,
-            })
+            // If not a table, try to look up as a view
+            if let Some(view) = binder.catalog().get_view(&schema_name, &table_name) {
+                // Parse and bind the view's SQL query
+                let dialect = sqlparser::dialect::DuckDbDialect {};
+                let statements = sqlparser::parser::Parser::parse_sql(&dialect, &view.sql)
+                    .map_err(|e| Error::Parse(e.to_string()))?;
+
+                if statements.is_empty() {
+                    return Err(Error::Internal("View has no query".to_string()));
+                }
+
+                // The view SQL should be a SELECT query
+                if let sql::Statement::Query(query) = &statements[0] {
+                    let bound_stmt = bind_query(binder, query)?;
+                    let bound_select = match bound_stmt {
+                        BoundStatement::Select(sel) => sel,
+                        _ => return Err(Error::Internal("View query must be SELECT".to_string())),
+                    };
+
+                    let alias_name = alias
+                        .as_ref()
+                        .map(|a| a.name.value.clone())
+                        .unwrap_or_else(|| table_name.clone());
+
+                    return Ok(BoundTableRef::Subquery {
+                        subquery: Box::new(bound_select),
+                        alias: alias_name,
+                    });
+                } else {
+                    return Err(Error::Internal("View query is not a SELECT".to_string()));
+                }
+            }
+
+            // Neither table nor view found
+            Err(Error::TableNotFound(table_name.clone()))
         }
 
         sql::TableFactor::Derived { subquery, alias, .. } => {
@@ -550,7 +651,103 @@ fn bind_table_factor_with_ctes(
             })
         }
 
+        sql::TableFactor::Function { name, args, alias, .. } => {
+            bind_table_function(binder, name, args, alias)
+        }
+
         _ => Err(Error::NotImplemented(format!("Table factor: {:?}", factor))),
+    }
+}
+
+/// Bind a table-valued function (e.g., range(), generate_series())
+fn bind_table_function(
+    binder: &Binder,
+    name: &sql::ObjectName,
+    args: &[sql::FunctionArg],
+    alias: &Option<sql::TableAlias>,
+) -> Result<BoundTableRef> {
+    use super::bound_expression::BoundExpressionKind;
+    use ironduck_common::{LogicalType, Value};
+
+    let func_name = name.to_string().to_uppercase();
+
+    match func_name.as_str() {
+        "RANGE" | "GENERATE_SERIES" => {
+            // range() can have 1, 2, or 3 arguments:
+            // range(stop) - generates 0 to stop-1
+            // range(start, stop) - generates start to stop-1
+            // range(start, stop, step) - generates start to stop-1 with step
+
+            let ctx = ExpressionBinderContext::new(&[]);
+
+            let bound_args: Vec<BoundExpression> = args
+                .iter()
+                .filter_map(|arg| {
+                    let expr_arg = match arg {
+                        sql::FunctionArg::Unnamed(expr) => Some(expr),
+                        sql::FunctionArg::Named { arg, .. } => Some(arg),
+                        _ => None,
+                    };
+                    expr_arg.and_then(|expr| match expr {
+                        sql::FunctionArgExpr::Expr(e) => bind_expression(binder, e, &ctx).ok(),
+                        _ => None,
+                    })
+                })
+                .collect();
+
+            let (start, stop, step) = match bound_args.len() {
+                1 => {
+                    // range(stop) - start=0, step=1
+                    let zero = BoundExpression {
+                        expr: BoundExpressionKind::Constant(Value::BigInt(0)),
+                        return_type: LogicalType::BigInt,
+                        alias: None,
+                    };
+                    let one = BoundExpression {
+                        expr: BoundExpressionKind::Constant(Value::BigInt(1)),
+                        return_type: LogicalType::BigInt,
+                        alias: None,
+                    };
+                    (zero, bound_args.into_iter().next().unwrap(), one)
+                }
+                2 => {
+                    // range(start, stop) - step=1
+                    let one = BoundExpression {
+                        expr: BoundExpressionKind::Constant(Value::BigInt(1)),
+                        return_type: LogicalType::BigInt,
+                        alias: None,
+                    };
+                    let mut iter = bound_args.into_iter();
+                    (iter.next().unwrap(), iter.next().unwrap(), one)
+                }
+                3 => {
+                    // range(start, stop, step)
+                    let mut iter = bound_args.into_iter();
+                    (iter.next().unwrap(), iter.next().unwrap(), iter.next().unwrap())
+                }
+                _ => {
+                    return Err(Error::InvalidArguments(format!(
+                        "range() requires 1-3 arguments, got {}",
+                        bound_args.len()
+                    )));
+                }
+            };
+
+            // Extract column alias from table alias if provided
+            let (table_alias, column_alias) = if let Some(a) = alias {
+                let col_alias = a.columns.first().map(|c| c.name.value.clone());
+                (Some(a.name.value.clone()), col_alias)
+            } else {
+                (None, None)
+            };
+
+            Ok(BoundTableRef::TableFunction {
+                function: TableFunctionType::Range { start, stop, step },
+                alias: table_alias,
+                column_alias,
+            })
+        }
+        _ => Err(Error::NotImplemented(format!("Table function: {}", func_name))),
     }
 }
 
@@ -563,6 +760,34 @@ fn bind_create_table(binder: &Binder, create: &sql::CreateTable) -> Result<Bound
         (binder.current_schema().to_string(), parts[0].clone())
     };
 
+    // Check for CREATE TABLE ... AS SELECT ...
+    if let Some(query) = &create.query {
+        let bound_stmt = bind_query(binder, query)?;
+        let bound_select = match bound_stmt {
+            BoundStatement::Select(sel) => sel,
+            _ => return Err(Error::NotImplemented("CREATE TABLE AS requires SELECT".to_string())),
+        };
+
+        // Derive columns from the query's output
+        let columns: Vec<_> = bound_select.select_list.iter().map(|expr| {
+            BoundColumnDef {
+                name: expr.name(),
+                data_type: expr.return_type.clone(),
+                nullable: true,
+                default: None,
+            }
+        }).collect();
+
+        return Ok(BoundCreateTable {
+            schema,
+            name,
+            columns,
+            if_not_exists: create.if_not_exists,
+            source_query: Some(Box::new(bound_select)),
+        });
+    }
+
+    // Regular CREATE TABLE with column definitions
     let mut columns = Vec::new();
     for col in &create.columns {
         let data_type = bind_data_type(&col.data_type)?;
@@ -583,7 +808,42 @@ fn bind_create_table(binder: &Binder, create: &sql::CreateTable) -> Result<Bound
         name,
         columns,
         if_not_exists: create.if_not_exists,
+        source_query: None,
     })
+}
+
+/// Bind CREATE VIEW
+fn bind_create_view(
+    binder: &Binder,
+    name: &sql::ObjectName,
+    query: &sql::Query,
+    or_replace: bool,
+) -> Result<BoundStatement> {
+    let parts: Vec<_> = name.0.iter().map(|i| i.value.clone()).collect();
+    let (schema, view_name) = if parts.len() == 2 {
+        (parts[0].clone(), parts[1].clone())
+    } else {
+        (binder.current_schema().to_string(), parts[0].clone())
+    };
+
+    // Bind the query to get column names
+    let bound_stmt = bind_query(binder, query)?;
+    let column_names = match &bound_stmt {
+        BoundStatement::Select(sel) => sel.select_list.iter().map(|e| e.name()).collect(),
+        BoundStatement::SetOperation(op) => op.left.select_list.iter().map(|e| e.name()).collect(),
+        _ => return Err(Error::NotImplemented("View query must be SELECT".to_string())),
+    };
+
+    // Store the original SQL text
+    let sql = format!("{}", query);
+
+    Ok(BoundStatement::CreateView(BoundCreateView {
+        schema,
+        name: view_name,
+        sql,
+        column_names,
+        or_replace,
+    }))
 }
 
 /// Bind INSERT
@@ -774,4 +1034,311 @@ fn bind_update(
         assignments: bound_assignments,
         where_clause,
     })
+}
+
+/// Expand qualified wildcard (table.*) - only expand columns from the matching table
+fn expand_qualified_wildcard(
+    table_ref: &BoundTableRef,
+    target_name: &str,
+    table_idx: usize,
+    col_offset: &mut usize,
+    select_list: &mut Vec<BoundExpression>,
+) -> bool {
+    match table_ref {
+        BoundTableRef::BaseTable {
+            name,
+            alias,
+            column_names,
+            column_types,
+            ..
+        } => {
+            let matches = alias.as_ref().map(|a| a.eq_ignore_ascii_case(target_name)).unwrap_or(false)
+                || name.eq_ignore_ascii_case(target_name);
+
+            if matches {
+                for (idx, (col_name, typ)) in column_names.iter().zip(column_types.iter()).enumerate() {
+                    select_list.push(BoundExpression::new(
+                        super::BoundExpressionKind::ColumnRef {
+                            table_idx,
+                            column_idx: *col_offset + idx,
+                            name: col_name.clone(),
+                        },
+                        typ.clone(),
+                    ));
+                }
+            }
+            *col_offset += column_names.len();
+            matches
+        }
+        BoundTableRef::Subquery { subquery, alias } => {
+            let matches = alias.eq_ignore_ascii_case(target_name);
+
+            if matches {
+                for (idx, expr) in subquery.select_list.iter().enumerate() {
+                    select_list.push(BoundExpression::new(
+                        super::BoundExpressionKind::ColumnRef {
+                            table_idx,
+                            column_idx: *col_offset + idx,
+                            name: expr.name(),
+                        },
+                        expr.return_type.clone(),
+                    ));
+                }
+            }
+            *col_offset += subquery.select_list.len();
+            matches
+        }
+        BoundTableRef::Join { left, right, .. } => {
+            let left_matched = expand_qualified_wildcard(left, target_name, table_idx, col_offset, select_list);
+            let right_matched = expand_qualified_wildcard(right, target_name, table_idx, col_offset, select_list);
+            left_matched || right_matched
+        }
+        BoundTableRef::TableFunction { alias, column_alias, .. } => {
+            let matches = alias.as_ref().map(|a| a.eq_ignore_ascii_case(target_name)).unwrap_or(false);
+
+            if matches {
+                let col_name = column_alias.clone().unwrap_or_else(|| "range".to_string());
+                select_list.push(BoundExpression::new(
+                    super::BoundExpressionKind::ColumnRef {
+                        table_idx,
+                        column_idx: *col_offset,
+                        name: col_name,
+                    },
+                    ironduck_common::LogicalType::BigInt,
+                ));
+            }
+            *col_offset += 1;
+            matches
+        }
+        BoundTableRef::Empty => false,
+    }
+}
+
+/// Expand qualified wildcard with skip columns (for JOIN USING deduplication)
+fn expand_qualified_wildcard_with_skip(
+    table_ref: &BoundTableRef,
+    target_name: &str,
+    table_idx: usize,
+    col_offset: &mut usize,
+    select_list: &mut Vec<BoundExpression>,
+    skip_columns: &[String],
+) -> bool {
+    match table_ref {
+        BoundTableRef::BaseTable {
+            name,
+            alias,
+            column_names,
+            column_types,
+            ..
+        } => {
+            let matches = alias.as_ref().map(|a| a.eq_ignore_ascii_case(target_name)).unwrap_or(false)
+                || name.eq_ignore_ascii_case(target_name);
+
+            let mut local_col_idx = 0;
+            for (col_name, typ) in column_names.iter().zip(column_types.iter()) {
+                // Check if this column should be skipped (USING column)
+                let should_skip = skip_columns.iter().any(|sc| sc.eq_ignore_ascii_case(col_name));
+
+                if matches && !should_skip {
+                    select_list.push(BoundExpression::new(
+                        super::BoundExpressionKind::ColumnRef {
+                            table_idx,
+                            column_idx: *col_offset + local_col_idx,
+                            name: col_name.clone(),
+                        },
+                        typ.clone(),
+                    ));
+                }
+
+                // Only increment local_col_idx for non-skipped columns
+                if !should_skip {
+                    local_col_idx += 1;
+                }
+            }
+            // Increment col_offset by the number of non-skipped columns
+            *col_offset += local_col_idx;
+            matches
+        }
+        BoundTableRef::Subquery { subquery, alias } => {
+            let matches = alias.eq_ignore_ascii_case(target_name);
+
+            let mut local_col_idx = 0;
+            for expr in subquery.select_list.iter() {
+                let col_name = expr.name();
+                let should_skip = skip_columns.iter().any(|sc| sc.eq_ignore_ascii_case(&col_name));
+
+                if matches && !should_skip {
+                    select_list.push(BoundExpression::new(
+                        super::BoundExpressionKind::ColumnRef {
+                            table_idx,
+                            column_idx: *col_offset + local_col_idx,
+                            name: col_name,
+                        },
+                        expr.return_type.clone(),
+                    ));
+                }
+
+                if !should_skip {
+                    local_col_idx += 1;
+                }
+            }
+            *col_offset += local_col_idx;
+            matches
+        }
+        BoundTableRef::Join { left, right, using_columns, .. } => {
+            // For nested joins, pass through skip_columns but also add using_columns for right side
+            let left_matched = expand_qualified_wildcard_with_skip(left, target_name, table_idx, col_offset, select_list, skip_columns);
+            // For right side, combine parent skip_columns with this join's using_columns
+            let mut combined_skip = skip_columns.to_vec();
+            combined_skip.extend(using_columns.iter().cloned());
+            let right_matched = expand_qualified_wildcard_with_skip(right, target_name, table_idx, col_offset, select_list, &combined_skip);
+            left_matched || right_matched
+        }
+        BoundTableRef::TableFunction { alias, column_alias, .. } => {
+            let matches = alias.as_ref().map(|a| a.eq_ignore_ascii_case(target_name)).unwrap_or(false);
+
+            let col_name = column_alias.clone().unwrap_or_else(|| "range".to_string());
+            let should_skip = skip_columns.iter().any(|sc| sc.eq_ignore_ascii_case(&col_name));
+
+            if matches && !should_skip {
+                select_list.push(BoundExpression::new(
+                    super::BoundExpressionKind::ColumnRef {
+                        table_idx,
+                        column_idx: *col_offset,
+                        name: col_name,
+                    },
+                    ironduck_common::LogicalType::BigInt,
+                ));
+            }
+            if !should_skip {
+                *col_offset += 1;
+            }
+            matches
+        }
+        BoundTableRef::Empty => false,
+    }
+}
+
+/// Check if a table reference matches a given name (for qualified wildcards)
+fn matches_table_name(table_ref: &BoundTableRef, name: &str) -> bool {
+    match table_ref {
+        BoundTableRef::BaseTable { name: table_name, alias, .. } => {
+            alias.as_ref().map(|a| a.eq_ignore_ascii_case(name)).unwrap_or(false)
+                || table_name.eq_ignore_ascii_case(name)
+        }
+        BoundTableRef::Subquery { alias, .. } => {
+            alias.eq_ignore_ascii_case(name)
+        }
+        BoundTableRef::Join { left, right, .. } => {
+            matches_table_name(left, name) || matches_table_name(right, name)
+        }
+        BoundTableRef::TableFunction { alias, .. } => {
+            alias.as_ref().map(|a| a.eq_ignore_ascii_case(name)).unwrap_or(false)
+        }
+        BoundTableRef::Empty => false,
+    }
+}
+
+/// Recursively expand wildcard (*) for a table reference, handling joins and subqueries
+fn expand_wildcard_for_table(
+    table_ref: &BoundTableRef,
+    table_idx: usize,
+    select_list: &mut Vec<BoundExpression>,
+) {
+    let mut col_offset = 0;
+    expand_wildcard_rec(table_ref, table_idx, &mut col_offset, select_list);
+}
+
+/// Expand wildcard with a global column offset (for multiple tables in FROM)
+fn expand_wildcard_with_offset(
+    table_ref: &BoundTableRef,
+    table_idx: usize,
+    global_col_offset: &mut usize,
+    select_list: &mut Vec<BoundExpression>,
+) {
+    expand_wildcard_rec(table_ref, table_idx, global_col_offset, select_list);
+}
+
+fn expand_wildcard_rec(
+    table_ref: &BoundTableRef,
+    table_idx: usize,
+    col_offset: &mut usize,
+    select_list: &mut Vec<BoundExpression>,
+) {
+    expand_wildcard_rec_with_skip(table_ref, table_idx, col_offset, select_list, &[]);
+}
+
+fn expand_wildcard_rec_with_skip(
+    table_ref: &BoundTableRef,
+    table_idx: usize,
+    col_offset: &mut usize,
+    select_list: &mut Vec<BoundExpression>,
+    skip_columns: &[String],
+) {
+    match table_ref {
+        BoundTableRef::BaseTable {
+            column_names,
+            column_types,
+            ..
+        } => {
+            let mut local_col_idx = 0;
+            for (name, typ) in column_names.iter().zip(column_types.iter()) {
+                let should_skip = skip_columns.iter().any(|sc| sc.eq_ignore_ascii_case(name));
+                if !should_skip {
+                    select_list.push(BoundExpression::new(
+                        super::BoundExpressionKind::ColumnRef {
+                            table_idx,
+                            column_idx: *col_offset + local_col_idx,
+                            name: name.clone(),
+                        },
+                        typ.clone(),
+                    ));
+                    local_col_idx += 1;
+                }
+            }
+            *col_offset += local_col_idx;
+        }
+        BoundTableRef::Subquery { subquery, .. } => {
+            // For subqueries (including views), get columns from the select list
+            let mut local_col_idx = 0;
+            for expr in subquery.select_list.iter() {
+                let col_name = expr.name();
+                let should_skip = skip_columns.iter().any(|sc| sc.eq_ignore_ascii_case(&col_name));
+                if !should_skip {
+                    select_list.push(BoundExpression::new(
+                        super::BoundExpressionKind::ColumnRef {
+                            table_idx,
+                            column_idx: *col_offset + local_col_idx,
+                            name: col_name,
+                        },
+                        expr.return_type.clone(),
+                    ));
+                    local_col_idx += 1;
+                }
+            }
+            *col_offset += local_col_idx;
+        }
+        BoundTableRef::Join { left, right, .. } => {
+            // For left side, use parent skip_columns
+            expand_wildcard_rec_with_skip(left, table_idx, col_offset, select_list, skip_columns);
+            // For right side, just use parent skip_columns (no special USING handling here)
+            expand_wildcard_rec_with_skip(right, table_idx, col_offset, select_list, skip_columns);
+        }
+        BoundTableRef::TableFunction { column_alias, .. } => {
+            let col_name = column_alias.clone().unwrap_or_else(|| "range".to_string());
+            let should_skip = skip_columns.iter().any(|sc| sc.eq_ignore_ascii_case(&col_name));
+            if !should_skip {
+                select_list.push(BoundExpression::new(
+                    super::BoundExpressionKind::ColumnRef {
+                        table_idx,
+                        column_idx: *col_offset,
+                        name: col_name,
+                    },
+                    ironduck_common::LogicalType::BigInt,
+                ));
+                *col_offset += 1;
+            }
+        }
+        BoundTableRef::Empty => {}
+    }
 }
