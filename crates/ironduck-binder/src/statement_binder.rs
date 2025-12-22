@@ -558,7 +558,13 @@ fn bind_select_with_ctes(
         // Bind GROUP BY
         match &select.group_by {
             sql::GroupByExpr::All(_) => {
-                return Err(Error::NotImplemented("GROUP BY ALL".to_string()));
+                // GROUP BY ALL - automatically group by all non-aggregate expressions
+                // in the SELECT list
+                for select_expr in &result.select_list {
+                    if !expression_contains_aggregate(select_expr) {
+                        result.group_by.push(select_expr.clone());
+                    }
+                }
             }
             sql::GroupByExpr::Expressions(exprs, _) => {
                 for expr in exprs {
@@ -713,7 +719,63 @@ fn bind_from_with_ctes(
                         }
                         sql::JoinConstraint::None => (None, Vec::new()),
                         sql::JoinConstraint::Natural => {
-                            return Err(Error::NotImplemented("NATURAL join".to_string()))
+                            // NATURAL JOIN - join on all columns with the same name
+                            let left_columns = get_table_ref_columns(&current);
+                            let right_columns = get_table_ref_columns(&right);
+
+                            // Find common column names (case-insensitive)
+                            let common_cols: Vec<String> = left_columns
+                                .iter()
+                                .filter(|lc| {
+                                    right_columns.iter().any(|rc| lc.eq_ignore_ascii_case(rc))
+                                })
+                                .cloned()
+                                .collect();
+
+                            if common_cols.is_empty() {
+                                // No common columns - treat as cross join
+                                (None, Vec::new())
+                            } else {
+                                let join_tables = collect_tables_from_ref(&current);
+                                let right_tables = collect_tables_from_ref(&right);
+                                let mut all_tables = join_tables;
+                                all_tables.extend(right_tables);
+                                let ctx = ExpressionBinderContext::new(&all_tables);
+
+                                // Build equality conditions for each common column
+                                let mut conditions: Vec<BoundExpression> = Vec::new();
+                                for col_name in &common_cols {
+                                    let col_ident = sql::Ident::new(col_name.clone());
+                                    let left_ref = sql::Expr::Identifier(col_ident.clone());
+                                    let right_ref = sql::Expr::Identifier(col_ident);
+                                    let eq_expr = sql::Expr::BinaryOp {
+                                        left: Box::new(left_ref),
+                                        op: sql::BinaryOperator::Eq,
+                                        right: Box::new(right_ref),
+                                    };
+                                    conditions.push(bind_expression(binder, &eq_expr, &ctx)?);
+                                }
+
+                                // Combine with AND
+                                let cond = if conditions.is_empty() {
+                                    None
+                                } else {
+                                    let mut result = conditions.remove(0);
+                                    for cond in conditions {
+                                        result = BoundExpression {
+                                            expr: super::BoundExpressionKind::BinaryOp {
+                                                left: Box::new(result),
+                                                op: super::BoundBinaryOperator::And,
+                                                right: Box::new(cond),
+                                            },
+                                            return_type: ironduck_common::LogicalType::Boolean,
+                                            alias: None,
+                                        };
+                                    }
+                                    Some(result)
+                                };
+                                (cond, common_cols)
+                            }
                         }
                     }
                 }
@@ -1687,4 +1749,49 @@ fn bind_create_sequence(
         cycle,
         if_not_exists,
     }))
+}
+
+/// Get column names from a table reference (for NATURAL joins)
+fn get_table_ref_columns(table_ref: &BoundTableRef) -> Vec<String> {
+    match table_ref {
+        BoundTableRef::BaseTable { column_names, .. } => column_names.clone(),
+        BoundTableRef::Subquery { subquery, .. } => {
+            subquery.select_list.iter().map(|e| e.name()).collect()
+        }
+        BoundTableRef::Join { left, right, .. } => {
+            let mut cols = get_table_ref_columns(left);
+            cols.extend(get_table_ref_columns(right));
+            cols
+        }
+        BoundTableRef::TableFunction { column_alias, .. } => {
+            vec![column_alias.clone().unwrap_or_else(|| "column".to_string())]
+        }
+        BoundTableRef::Empty => vec![],
+    }
+}
+
+/// Check if an expression contains an aggregate function
+fn expression_contains_aggregate(expr: &BoundExpression) -> bool {
+    use super::BoundExpressionKind;
+
+    match &expr.expr {
+        BoundExpressionKind::Function { is_aggregate, .. } => *is_aggregate,
+        BoundExpressionKind::BinaryOp { left, right, .. } => {
+            expression_contains_aggregate(left) || expression_contains_aggregate(right)
+        }
+        BoundExpressionKind::UnaryOp { expr, .. } => expression_contains_aggregate(expr),
+        BoundExpressionKind::Cast { expr, .. } => expression_contains_aggregate(expr),
+        BoundExpressionKind::Case { operand, when_clauses, else_result } => {
+            operand.as_ref().map_or(false, |e| expression_contains_aggregate(e))
+                || when_clauses.iter().any(|(c, r)| {
+                    expression_contains_aggregate(c) || expression_contains_aggregate(r)
+                })
+                || else_result.as_ref().map_or(false, |e| expression_contains_aggregate(e))
+        }
+        BoundExpressionKind::WindowFunction { .. } => {
+            // Window functions are not aggregates in the GROUP BY sense
+            false
+        }
+        _ => false,
+    }
 }
