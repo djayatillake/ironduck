@@ -1981,6 +1981,7 @@ fn compute_aggregate(
 
     let args = &agg.args;
     let distinct = agg.distinct;
+    let has_order_by = !agg.order_by.is_empty();
 
     // Apply FILTER clause if present - filter out rows that don't match
     let filtered_rows: Vec<Vec<Value>>;
@@ -2437,15 +2438,15 @@ fn compute_aggregate(
                 return Ok(Value::Null);
             }
 
-            // Handle DISTINCT
+            // Handle DISTINCT while preserving order
             if distinct {
                 let mut seen = std::collections::HashSet::new();
                 values.retain(|v| seen.insert(v.clone()));
             }
 
-            // Sort values if DISTINCT (for consistent ordering)
-            // TODO: Support ORDER BY clause within aggregate
-            if distinct {
+            // Sort values alphabetically if DISTINCT and no ORDER BY was specified
+            // (for consistent ordering when no explicit order is requested)
+            if distinct && !has_order_by {
                 values.sort();
             }
 
