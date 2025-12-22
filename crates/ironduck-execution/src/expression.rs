@@ -2025,6 +2025,69 @@ fn evaluate_function(name: &str, args: &[Value]) -> Result<Value> {
                 Ok(first.clone())
             }
         }
+        "NVL2" => {
+            // NVL2(expr, val_if_not_null, val_if_null)
+            let first = args.first().unwrap_or(&Value::Null);
+            if first.is_null() {
+                Ok(args.get(2).cloned().unwrap_or(Value::Null))
+            } else {
+                Ok(args.get(1).cloned().unwrap_or(Value::Null))
+            }
+        }
+        "DECODE" => {
+            // DECODE(expr, search1, result1, search2, result2, ..., default)
+            // Returns result for first matching search value
+            let expr = args.first().unwrap_or(&Value::Null);
+            let mut i = 1;
+            while i + 1 < args.len() {
+                if &args[i] == expr {
+                    return Ok(args[i + 1].clone());
+                }
+                i += 2;
+            }
+            // Return default if no match (last arg if odd number of remaining args)
+            if i < args.len() {
+                Ok(args[i].clone())
+            } else {
+                Ok(Value::Null)
+            }
+        }
+        "CHOOSE" => {
+            // CHOOSE(index, val1, val2, val3, ...)
+            // Returns val at 1-based index
+            let index = args.first().and_then(|v| v.as_i64()).unwrap_or(0) as usize;
+            if index >= 1 && index < args.len() {
+                Ok(args[index].clone())
+            } else {
+                Ok(Value::Null)
+            }
+        }
+        "ZEROIFNULL" => {
+            let first = args.first().unwrap_or(&Value::Null);
+            if first.is_null() {
+                Ok(Value::Integer(0))
+            } else {
+                Ok(first.clone())
+            }
+        }
+        "NULLIFZERO" => {
+            match args.first() {
+                Some(Value::Integer(0)) | Some(Value::BigInt(0)) => Ok(Value::Null),
+                Some(Value::Float(f)) if *f == 0.0 => Ok(Value::Null),
+                Some(Value::Double(f)) if *f == 0.0 => Ok(Value::Null),
+                Some(v) => Ok(v.clone()),
+                None => Ok(Value::Null),
+            }
+        }
+        "IFNOT" => {
+            // IFNOT(cond, val) returns val if cond is false
+            let cond = args.first().map(|v| matches!(v, Value::Boolean(true))).unwrap_or(false);
+            if !cond {
+                Ok(args.get(1).cloned().unwrap_or(Value::Null))
+            } else {
+                Ok(Value::Null)
+            }
+        }
 
         // Type functions
         "TYPEOF" => {
@@ -2464,47 +2527,6 @@ fn evaluate_function(name: &str, args: &[Value]) -> Result<Value> {
                 _ => return Ok(Value::Null),
             };
             Ok(Value::Varchar(name.to_string()))
-        }
-        "DAYOFWEEK" | "WEEKDAY" => {
-            use chrono::Datelike;
-            match args.first() {
-                Some(Value::Date(d)) => Ok(Value::Integer(d.weekday().num_days_from_sunday() as i32)),
-                Some(Value::Timestamp(dt)) => Ok(Value::Integer(dt.weekday().num_days_from_sunday() as i32)),
-                _ => Ok(Value::Null),
-            }
-        }
-        "DAYOFYEAR" | "DOY" => {
-            use chrono::Datelike;
-            match args.first() {
-                Some(Value::Date(d)) => Ok(Value::Integer(d.ordinal() as i32)),
-                Some(Value::Timestamp(dt)) => Ok(Value::Integer(dt.ordinal() as i32)),
-                _ => Ok(Value::Null),
-            }
-        }
-        "WEEKOFYEAR" | "WEEK" => {
-            use chrono::Datelike;
-            match args.first() {
-                Some(Value::Date(d)) => Ok(Value::Integer(d.iso_week().week() as i32)),
-                Some(Value::Timestamp(dt)) => Ok(Value::Integer(dt.iso_week().week() as i32)),
-                _ => Ok(Value::Null),
-            }
-        }
-        "QUARTER" => {
-            use chrono::Datelike;
-            match args.first() {
-                Some(Value::Date(d)) => Ok(Value::Integer(((d.month() - 1) / 3 + 1) as i32)),
-                Some(Value::Timestamp(dt)) => Ok(Value::Integer(((dt.month() - 1) / 3 + 1) as i32)),
-                _ => Ok(Value::Null),
-            }
-        }
-        "ISODOW" => {
-            // ISO day of week (Monday = 1, Sunday = 7)
-            use chrono::Datelike;
-            match args.first() {
-                Some(Value::Date(d)) => Ok(Value::Integer(d.weekday().num_days_from_monday() as i32 + 1)),
-                Some(Value::Timestamp(dt)) => Ok(Value::Integer(dt.weekday().num_days_from_monday() as i32 + 1)),
-                _ => Ok(Value::Null),
-            }
         }
         "EPOCH" | "EPOCH_MS" => {
             match args.first() {
