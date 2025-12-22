@@ -71,6 +71,9 @@ pub struct BoundSelect {
     pub offset: Option<u64>,
     /// DISTINCT or DISTINCT ON
     pub distinct: DistinctKind,
+    /// CTEs (Common Table Expressions) used in this query
+    /// Includes recursive CTEs with their base and recursive cases
+    pub ctes: Vec<BoundCTE>,
 }
 
 /// DISTINCT mode
@@ -97,6 +100,7 @@ impl BoundSelect {
             limit: None,
             offset: None,
             distinct: DistinctKind::None,
+            ctes: Vec::new(),
         }
     }
 

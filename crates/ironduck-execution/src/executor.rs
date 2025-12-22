@@ -6,6 +6,7 @@ use ironduck_common::{Error, LogicalType, Result, Value};
 use ironduck_planner::{Expression, LogicalOperator, LogicalPlan, TableFunctionKind, WindowFrame, WindowFrameBound, WindowFunction};
 use ironduck_storage::TableStorage;
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::sync::Arc;
 
 // Thread-local catalog reference for expression evaluation in functions like compute_aggregate
@@ -41,6 +42,9 @@ fn eval_with_catalog(expr: &Expression, row: &[Value]) -> Result<Value> {
 pub struct Executor {
     catalog: Arc<Catalog>,
     storage: Arc<TableStorage>,
+    /// Working tables for recursive CTE execution
+    /// Maps CTE name to the current iteration's rows
+    recursive_working_tables: RefCell<HashMap<String, Vec<Vec<Value>>>>,
 }
 
 impl Executor {
@@ -48,12 +52,17 @@ impl Executor {
         Executor {
             catalog,
             storage: Arc::new(TableStorage::new()),
+            recursive_working_tables: RefCell::new(HashMap::new()),
         }
     }
 
     /// Create executor with shared storage
     pub fn with_storage(catalog: Arc<Catalog>, storage: Arc<TableStorage>) -> Self {
-        Executor { catalog, storage }
+        Executor {
+            catalog,
+            storage,
+            recursive_working_tables: RefCell::new(HashMap::new()),
+        }
     }
 
     /// Get storage reference
@@ -1289,7 +1298,7 @@ impl Executor {
             }
 
             LogicalOperator::RecursiveCTE {
-                name: _,
+                name,
                 base_case,
                 recursive_case,
                 output_names: _,
@@ -1298,7 +1307,14 @@ impl Executor {
             } => {
                 // Execute the recursive CTE using iterative fixpoint computation
                 // 1. Execute the base case (anchor)
-                let mut result = self.execute_operator(base_case)?;
+                let base_result = self.execute_operator(base_case)?;
+
+                // Initialize accumulator with base case results
+                let mut result = base_result.clone();
+
+                // The working table starts with the base case results
+                // This is what RecursiveCTEScan will read from
+                let mut working_table = base_result;
 
                 // 2. Iteratively execute the recursive case until no new rows are produced
                 let max_iterations = 1000; // Prevent infinite loops
@@ -1306,33 +1322,45 @@ impl Executor {
 
                 loop {
                     if iteration >= max_iterations {
-                        return Err(Error::NotImplemented(
-                            "Recursive CTE exceeded maximum iteration limit".to_string()
+                        return Err(Error::Execution(
+                            "Recursive CTE exceeded maximum iteration limit (1000)".to_string()
                         ));
                     }
                     iteration += 1;
 
-                    // Execute the recursive part with current result as input
-                    // The recursive case references the CTE, which should read from result
-                    // For now, we use a simplified approach: execute recursive_case
-                    // and check if it produces new rows
+                    // Set the working table for this CTE so RecursiveCTEScan can access it
+                    self.recursive_working_tables
+                        .borrow_mut()
+                        .insert(name.clone(), working_table.clone());
+
+                    // Execute the recursive part - it will read from working_table via RecursiveCTEScan
                     let new_rows = self.execute_operator(recursive_case)?;
+
+                    // Clear the working table entry after execution
+                    self.recursive_working_tables.borrow_mut().remove(name);
 
                     if new_rows.is_empty() {
                         break;
                     }
 
-                    // Add new rows to result
+                    // Add new rows to result and update working table for next iteration
                     if *union_all {
-                        // UNION ALL: just append all rows
-                        result.extend(new_rows);
+                        // UNION ALL: append all rows, working table becomes new rows only
+                        result.extend(new_rows.clone());
+                        working_table = new_rows;
                     } else {
-                        // UNION: deduplicate
+                        // UNION: deduplicate, working table becomes only truly new rows
+                        let mut truly_new = Vec::new();
                         for row in new_rows {
                             if !result.contains(&row) {
-                                result.push(row);
+                                result.push(row.clone());
+                                truly_new.push(row);
                             }
                         }
+                        if truly_new.is_empty() {
+                            break;
+                        }
+                        working_table = truly_new;
                     }
                 }
 
@@ -1496,13 +1524,19 @@ impl Executor {
             }
 
             LogicalOperator::RecursiveCTEScan { cte_name, .. } => {
-                // RecursiveCTEScan is used within the recursive case of a RecursiveCTE
-                // It should read from the working table, which is handled by the parent RecursiveCTE operator
-                // This branch should not be executed directly - it's a placeholder for the recursive reference
-                Err(Error::NotImplemented(format!(
-                    "RecursiveCTEScan for '{}' should be handled by parent RecursiveCTE operator",
-                    cte_name
-                )))
+                // RecursiveCTEScan reads from the working table set by the parent RecursiveCTE operator
+                // The working table contains rows from the previous iteration
+                let working_tables = self.recursive_working_tables.borrow();
+                if let Some(rows) = working_tables.get(cte_name) {
+                    Ok(rows.clone())
+                } else {
+                    // If no working table is set, this means RecursiveCTEScan is being
+                    // executed outside of a RecursiveCTE context, which is an error
+                    Err(Error::Execution(format!(
+                        "RecursiveCTEScan for '{}' executed outside of RecursiveCTE context",
+                        cte_name
+                    )))
+                }
             }
         }
     }

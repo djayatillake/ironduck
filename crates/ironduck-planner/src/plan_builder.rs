@@ -2,7 +2,7 @@
 
 use super::{LogicalOperator, LogicalPlan, SetOperationType};
 use ironduck_binder::{
-    BoundDelete, BoundExpression, BoundExpressionKind, BoundSelect, BoundSetOperation,
+    BoundCTE, BoundDelete, BoundExpression, BoundExpressionKind, BoundSelect, BoundSetOperation,
     BoundStatement, BoundTableRef, BoundUpdate, DistinctKind,
 };
 use ironduck_common::{Error, LogicalType, Result, Value};
@@ -202,7 +202,8 @@ fn build_select_plan(select: &BoundSelect) -> Result<LogicalPlan> {
     let output_names = select.output_names();
 
     // Start with the source (FROM clause)
-    let mut plan = build_from_plan(&select.from)?;
+    // Pass CTEs so recursive CTE references can be resolved
+    let mut plan = build_from_plan_with_ctes(&select.from, &select.ctes)?;
 
     // Add WHERE filter
     if let Some(where_clause) = &select.where_clause {
@@ -477,6 +478,10 @@ fn build_select_plan(select: &BoundSelect) -> Result<LogicalPlan> {
 
 /// Build plan for FROM clause
 fn build_from_plan(from: &[BoundTableRef]) -> Result<LogicalOperator> {
+    build_from_plan_with_ctes(from, &[])
+}
+
+fn build_from_plan_with_ctes(from: &[BoundTableRef], ctes: &[BoundCTE]) -> Result<LogicalOperator> {
     if from.is_empty() || matches!(from.first(), Some(BoundTableRef::Empty)) {
         // No FROM clause - return a dummy scan that produces one row
         return Ok(LogicalOperator::DummyScan);
@@ -485,7 +490,7 @@ fn build_from_plan(from: &[BoundTableRef]) -> Result<LogicalOperator> {
     let mut result: Option<LogicalOperator> = None;
 
     for table_ref in from {
-        let table_plan = build_table_ref_plan(table_ref)?;
+        let table_plan = build_table_ref_plan_with_ctes(table_ref, ctes)?;
 
         result = Some(match result {
             None => table_plan,
@@ -499,6 +504,43 @@ fn build_from_plan(from: &[BoundTableRef]) -> Result<LogicalOperator> {
     }
 
     Ok(result.unwrap_or(LogicalOperator::DummyScan))
+}
+
+/// Build plan for a table reference with CTE context
+fn build_table_ref_plan_with_ctes(table_ref: &BoundTableRef, ctes: &[BoundCTE]) -> Result<LogicalOperator> {
+    // Special handling for RecursiveCTERef - look up the CTE and build RecursiveCTE operator
+    if let BoundTableRef::RecursiveCTERef { cte_name, column_names, column_types, .. } = table_ref {
+        // Look for matching recursive CTE
+        if let Some(cte) = ctes.iter().find(|c| c.is_recursive && c.name.eq_ignore_ascii_case(cte_name)) {
+            // Build the base case plan
+            let base_plan = build_select_plan(&cte.query)?;
+
+            // Build the recursive case plan (this will contain RecursiveCTEScan for self-reference)
+            // The recursive case references the CTE which becomes RecursiveCTEScan
+            let recursive_plan = if let Some(ref recursive_query) = cte.recursive_query {
+                build_select_plan(recursive_query)?
+            } else {
+                // No recursive case - this shouldn't happen for recursive CTEs
+                return Err(ironduck_common::Error::Internal(
+                    "Recursive CTE missing recursive case".to_string()
+                ));
+            };
+
+            return Ok(LogicalOperator::RecursiveCTE {
+                name: cte_name.clone(),
+                base_case: Box::new(base_plan.root),
+                recursive_case: Box::new(recursive_plan.root),
+                output_names: column_names.clone(),
+                output_types: column_types.clone(),
+                union_all: cte.union_all,
+            });
+        }
+        // If CTE not found in ctes list, fall through to RecursiveCTEScan
+        // (This happens when building the recursive case itself)
+    }
+
+    // Delegate to regular build_table_ref_plan for other cases
+    build_table_ref_plan(table_ref)
 }
 
 /// Build plan for a table reference

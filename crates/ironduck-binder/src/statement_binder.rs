@@ -165,7 +165,9 @@ fn bind_query(binder: &Binder, query: &sql::Query) -> Result<BoundStatement> {
         }
         _ => {
             // Regular SELECT
-            let select = bind_query_select_with_ctes(binder, query, &ctes)?;
+            let mut select = bind_query_select_with_ctes(binder, query, &ctes)?;
+            // Store CTEs on the select so planner can create RecursiveCTE operators
+            select.ctes = ctes;
             Ok(BoundStatement::Select(select))
         }
     }
@@ -273,6 +275,7 @@ fn bind_recursive_cte(
                 limit: None,
                 offset: None,
                 distinct: if all { DistinctKind::None } else { DistinctKind::All },
+                ctes: Vec::new(),
             };
 
             return Ok(BoundCTE {
@@ -880,7 +883,12 @@ fn bind_table_factor_with_ctes(
 
                     // For recursive CTEs, return a special reference marker
                     if cte.is_recursive {
-                        let column_names = cte.query.output_names();
+                        // Use column aliases if provided, otherwise use output names from base case
+                        let column_names = if !cte.column_aliases.is_empty() {
+                            cte.column_aliases.clone()
+                        } else {
+                            cte.query.output_names()
+                        };
                         let column_types = cte.query.output_types();
                         return Ok(BoundTableRef::RecursiveCTERef {
                             cte_name: cte.name.clone(),
