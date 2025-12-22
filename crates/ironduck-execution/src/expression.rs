@@ -1516,6 +1516,65 @@ fn evaluate_function(name: &str, args: &[Value]) -> Result<Value> {
             let s = args.first().and_then(|v| v.as_str()).unwrap_or("");
             Ok(Value::Integer(s.len() as i32))
         }
+        "BIT_AND" | "BITAND" => {
+            let a = args.first().and_then(|v| v.as_i64()).unwrap_or(0);
+            let b = args.get(1).and_then(|v| v.as_i64()).unwrap_or(0);
+            Ok(Value::BigInt(a & b))
+        }
+        "BIT_OR" | "BITOR" => {
+            let a = args.first().and_then(|v| v.as_i64()).unwrap_or(0);
+            let b = args.get(1).and_then(|v| v.as_i64()).unwrap_or(0);
+            Ok(Value::BigInt(a | b))
+        }
+        "BIT_XOR" | "BITXOR" | "XOR" => {
+            let a = args.first().and_then(|v| v.as_i64()).unwrap_or(0);
+            let b = args.get(1).and_then(|v| v.as_i64()).unwrap_or(0);
+            Ok(Value::BigInt(a ^ b))
+        }
+        "BIT_NOT" | "BITNOT" => {
+            let a = args.first().and_then(|v| v.as_i64()).unwrap_or(0);
+            Ok(Value::BigInt(!a))
+        }
+        "LEFT_SHIFT" | "LSHIFT" | "SHIFTLEFT" => {
+            let a = args.first().and_then(|v| v.as_i64()).unwrap_or(0);
+            let b = args.get(1).and_then(|v| v.as_i64()).unwrap_or(0) as u32;
+            Ok(Value::BigInt(a << b.min(63)))
+        }
+        "RIGHT_SHIFT" | "RSHIFT" | "SHIFTRIGHT" => {
+            let a = args.first().and_then(|v| v.as_i64()).unwrap_or(0);
+            let b = args.get(1).and_then(|v| v.as_i64()).unwrap_or(0) as u32;
+            Ok(Value::BigInt(a >> b.min(63)))
+        }
+        "GET_BIT" => {
+            // Get the bit at position n (0-indexed from right)
+            let val = args.first().and_then(|v| v.as_i64()).unwrap_or(0);
+            let pos = args.get(1).and_then(|v| v.as_i64()).unwrap_or(0) as u32;
+            if pos >= 64 {
+                Ok(Value::Integer(0))
+            } else {
+                Ok(Value::Integer(((val >> pos) & 1) as i32))
+            }
+        }
+        "SET_BIT" => {
+            // Set the bit at position n to 1 or 0
+            let val = args.first().and_then(|v| v.as_i64()).unwrap_or(0);
+            let pos = args.get(1).and_then(|v| v.as_i64()).unwrap_or(0) as u32;
+            let new_val = args.get(2).and_then(|v| v.as_i64()).unwrap_or(1);
+            if pos >= 64 {
+                Ok(Value::BigInt(val))
+            } else if new_val != 0 {
+                Ok(Value::BigInt(val | (1 << pos)))
+            } else {
+                Ok(Value::BigInt(val & !(1 << pos)))
+            }
+        }
+        "BITSTRING" => {
+            // Convert integer to binary string
+            let val = args.first().and_then(|v| v.as_i64()).unwrap_or(0);
+            let width = args.get(1).and_then(|v| v.as_i64()).unwrap_or(64) as usize;
+            let binary = format!("{:0>width$b}", val.abs(), width = width.min(64));
+            Ok(Value::Varchar(binary))
+        }
 
         // Format function
         "FORMAT" | "PRINTF" | "SPRINTF" => {
@@ -1971,6 +2030,70 @@ fn evaluate_function(name: &str, args: &[Value]) -> Result<Value> {
         "TYPEOF" => {
             let val = args.first().unwrap_or(&Value::Null);
             Ok(Value::Varchar(val.logical_type().to_string()))
+        }
+
+        // System/utility functions
+        "VERSION" => {
+            Ok(Value::Varchar("IronDuck 0.1.0 (DuckDB compatible)".to_string()))
+        }
+        "CURRENT_DATABASE" | "DATABASE" => {
+            Ok(Value::Varchar("memory".to_string()))
+        }
+        "CURRENT_SCHEMA" | "SCHEMA" => {
+            Ok(Value::Varchar("main".to_string()))
+        }
+        "CURRENT_USER" | "USER" | "SESSION_USER" => {
+            Ok(Value::Varchar("ironduck".to_string()))
+        }
+        "CURRENT_CATALOG" => {
+            Ok(Value::Varchar("memory".to_string()))
+        }
+        "CURRENT_SETTING" => {
+            // Return default settings
+            let setting = args.first().and_then(|v| v.as_str()).unwrap_or("");
+            match setting.to_lowercase().as_str() {
+                "timezone" => Ok(Value::Varchar("UTC".to_string())),
+                "memory_limit" => Ok(Value::Varchar("unlimited".to_string())),
+                "threads" => Ok(Value::Varchar("1".to_string())),
+                _ => Ok(Value::Null),
+            }
+        }
+        "ALIAS" => {
+            // Returns the alias of a column (for display purposes)
+            args.first().cloned().ok_or_else(|| Error::InvalidArguments("ALIAS requires an argument".to_string()))
+        }
+        "ERROR" => {
+            // Raise an error with the given message
+            let msg = args.first().and_then(|v| v.as_str()).unwrap_or("User error");
+            Err(Error::NotImplemented(msg.to_string()))
+        }
+        "CONSTANT_OR_NULL" => {
+            // Returns constant if all rows have same value, NULL otherwise
+            // For scalar context, just return the first arg
+            args.first().cloned().ok_or_else(|| Error::InvalidArguments("CONSTANT_OR_NULL requires an argument".to_string()))
+        }
+        "STATS" => {
+            // Return stats about a column (simplified)
+            Ok(Value::Varchar("Statistics not available".to_string()))
+        }
+        "PG_TYPEOF" => {
+            // PostgreSQL compatibility - return type name
+            let val = args.first().unwrap_or(&Value::Null);
+            let type_name = match val.logical_type() {
+                LogicalType::Integer => "integer",
+                LogicalType::BigInt => "bigint",
+                LogicalType::SmallInt => "smallint",
+                LogicalType::TinyInt => "tinyint",
+                LogicalType::Float => "real",
+                LogicalType::Double => "double precision",
+                LogicalType::Varchar => "text",
+                LogicalType::Boolean => "boolean",
+                LogicalType::Date => "date",
+                LogicalType::Timestamp => "timestamp without time zone",
+                LogicalType::Time => "time without time zone",
+                _ => "unknown",
+            };
+            Ok(Value::Varchar(type_name.to_string()))
         }
 
         // Date/Time functions
@@ -2573,6 +2696,121 @@ fn evaluate_function(name: &str, args: &[Value]) -> Result<Value> {
         }
         "JSON_OBJECT" => {
             // Create JSON object from key-value pairs
+            let mut obj = String::from("{");
+            let mut first = true;
+            for chunk in args.chunks(2) {
+                if chunk.len() == 2 {
+                    if !first { obj.push(','); }
+                    first = false;
+                    let key = value_to_string(&chunk[0]);
+                    let val = value_to_json_string(&chunk[1]);
+                    obj.push_str(&format!("\"{}\":{}", key, val));
+                }
+            }
+            obj.push('}');
+            Ok(Value::Varchar(obj))
+        }
+        "JSON_MERGE_PATCH" => {
+            // Merge two JSON objects (RFC 7396)
+            let json1_str = args.first().and_then(|v| v.as_str()).unwrap_or("{}");
+            let json2_str = args.get(1).and_then(|v| v.as_str()).unwrap_or("{}");
+
+            let json1: serde_json::Value = serde_json::from_str(json1_str).unwrap_or(serde_json::Value::Null);
+            let json2: serde_json::Value = serde_json::from_str(json2_str).unwrap_or(serde_json::Value::Null);
+
+            fn merge(a: &mut serde_json::Value, b: serde_json::Value) {
+                if let (Some(a_obj), Some(b_obj)) = (a.as_object_mut(), b.as_object()) {
+                    for (k, v) in b_obj {
+                        if v.is_null() {
+                            a_obj.remove(k);
+                        } else if let Some(existing) = a_obj.get_mut(k) {
+                            merge(existing, v.clone());
+                        } else {
+                            a_obj.insert(k.clone(), v.clone());
+                        }
+                    }
+                } else {
+                    *a = b;
+                }
+            }
+
+            let mut result = json1;
+            merge(&mut result, json2);
+            Ok(Value::Varchar(result.to_string()))
+        }
+        "JSON_CONTAINS" => {
+            // Check if JSON contains a value at path
+            let json_str = args.first().and_then(|v| v.as_str()).unwrap_or("{}");
+            let needle = args.get(1).and_then(|v| v.as_str()).unwrap_or("");
+
+            let json_str_lower = json_str.to_lowercase();
+            let needle_lower = needle.to_lowercase();
+            Ok(Value::Boolean(json_str_lower.contains(&needle_lower)))
+        }
+        "JSON_QUOTE" => {
+            // Quote a string as a JSON string
+            let s = args.first().and_then(|v| v.as_str()).unwrap_or("");
+            let quoted = serde_json::to_string(s).unwrap_or_else(|_| format!("\"{}\"", s));
+            Ok(Value::Varchar(quoted))
+        }
+        "TRY_JSON_EXTRACT" | "JSON_EXTRACT_PATH_TEXT" => {
+            // Like JSON_EXTRACT but returns NULL on error instead of failing
+            let json_str = args.first().and_then(|v| v.as_str()).unwrap_or("");
+            let path = args.get(1).and_then(|v| v.as_str()).unwrap_or("");
+
+            match serde_json::from_str::<serde_json::Value>(json_str) {
+                Ok(mut val) => {
+                    for key in path.trim_start_matches('$').trim_start_matches('.').split('.') {
+                        if key.is_empty() { continue; }
+                        val = match val {
+                            serde_json::Value::Object(ref obj) => {
+                                obj.get(key).cloned().unwrap_or(serde_json::Value::Null)
+                            }
+                            serde_json::Value::Array(ref arr) => {
+                                if let Ok(idx) = key.parse::<usize>() {
+                                    arr.get(idx).cloned().unwrap_or(serde_json::Value::Null)
+                                } else {
+                                    serde_json::Value::Null
+                                }
+                            }
+                            _ => serde_json::Value::Null,
+                        };
+                    }
+                    if val.is_null() {
+                        Ok(Value::Null)
+                    } else if let Some(s) = val.as_str() {
+                        Ok(Value::Varchar(s.to_string()))
+                    } else {
+                        Ok(Value::Varchar(val.to_string()))
+                    }
+                }
+                Err(_) => Ok(Value::Null),
+            }
+        }
+        "JSON_SERIALIZE" => {
+            // Serialize value to JSON (alias for TO_JSON)
+            match args.first() {
+                Some(v) => Ok(Value::Varchar(value_to_json_string(v))),
+                None => Ok(Value::Varchar("null".to_string())),
+            }
+        }
+        "JSON_DESERIALIZE" | "JSON_PARSE" | "FROM_JSON" => {
+            // Parse JSON string into a value
+            let json_str = args.first().and_then(|v| v.as_str()).unwrap_or("null");
+            match serde_json::from_str::<serde_json::Value>(json_str) {
+                Ok(json) => Ok(json_value_to_value(&json)),
+                Err(_) => Ok(Value::Null),
+            }
+        }
+        "JSON_GROUP_ARRAY" | "JSON_AGG" => {
+            // This is an aggregate function, but we handle scalar case
+            let json_vals: Vec<String> = args.iter()
+                .map(|v| value_to_json_string(v))
+                .collect();
+            Ok(Value::Varchar(format!("[{}]", json_vals.join(","))))
+        }
+        "JSON_GROUP_OBJECT" => {
+            // This is an aggregate function, but we handle scalar case
             let mut obj = String::from("{");
             let mut first = true;
             for chunk in args.chunks(2) {
