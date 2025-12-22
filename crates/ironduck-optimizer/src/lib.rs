@@ -7,13 +7,14 @@ use ironduck_planner::LogicalPlan;
 
 pub mod rules;
 
-use rules::{ConstantFolding, FilterPushdown};
+use rules::{ConstantFolding, FilterPushdown, ProjectionPushdown};
 
 /// All optimization rules in order of application
 fn get_rules() -> Vec<Box<dyn OptimizationRule>> {
     vec![
         Box::new(ConstantFolding),
         Box::new(FilterPushdown),
+        Box::new(ProjectionPushdown),
     ]
 }
 
