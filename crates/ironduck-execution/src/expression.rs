@@ -1562,6 +1562,64 @@ fn evaluate_function(name: &str, args: &[Value]) -> Result<Value> {
                 Ok(Value::Double(f64::from_bits(next_bits)))
             }
         }
+        "FMOD" => {
+            // Floating-point modulo
+            let x = args.first().and_then(|v| v.as_f64()).unwrap_or(0.0);
+            let y = args.get(1).and_then(|v| v.as_f64()).unwrap_or(1.0);
+            if y == 0.0 {
+                Ok(Value::Null)
+            } else {
+                Ok(Value::Double(x % y))
+            }
+        }
+        "COPYSIGN" => {
+            // Return x with the sign of y
+            let x = args.first().and_then(|v| v.as_f64()).unwrap_or(0.0);
+            let y = args.get(1).and_then(|v| v.as_f64()).unwrap_or(1.0);
+            Ok(Value::Double(x.copysign(y)))
+        }
+        "HYPOT" => {
+            // Return sqrt(x*x + y*y) without overflow
+            let x = args.first().and_then(|v| v.as_f64()).unwrap_or(0.0);
+            let y = args.get(1).and_then(|v| v.as_f64()).unwrap_or(0.0);
+            Ok(Value::Double(x.hypot(y)))
+        }
+        "LDEXP" => {
+            // Return x * 2^exp
+            let x = args.first().and_then(|v| v.as_f64()).unwrap_or(0.0);
+            let exp = args.get(1).and_then(|v| v.as_i64()).unwrap_or(0) as i32;
+            Ok(Value::Double(x * (2.0_f64).powi(exp)))
+        }
+        "SIGNBIT" => {
+            // Return true if sign bit is set (including -0.0)
+            let val = args.first().and_then(|v| v.as_f64()).unwrap_or(0.0);
+            Ok(Value::Boolean(val.is_sign_negative()))
+        }
+        "FDIM" => {
+            // Return positive difference: max(x - y, 0)
+            let x = args.first().and_then(|v| v.as_f64()).unwrap_or(0.0);
+            let y = args.get(1).and_then(|v| v.as_f64()).unwrap_or(0.0);
+            Ok(Value::Double((x - y).max(0.0)))
+        }
+        "FMA" => {
+            // Fused multiply-add: x * y + z
+            let x = args.first().and_then(|v| v.as_f64()).unwrap_or(0.0);
+            let y = args.get(1).and_then(|v| v.as_f64()).unwrap_or(0.0);
+            let z = args.get(2).and_then(|v| v.as_f64()).unwrap_or(0.0);
+            Ok(Value::Double(x.mul_add(y, z)))
+        }
+        "REMAINDER" | "IEEE_REMAINDER" => {
+            // IEEE 754 remainder
+            let x = args.first().and_then(|v| v.as_f64()).unwrap_or(0.0);
+            let y = args.get(1).and_then(|v| v.as_f64()).unwrap_or(1.0);
+            if y == 0.0 {
+                Ok(Value::Null)
+            } else {
+                // IEEE remainder: x - n*y where n is the integer nearest x/y
+                let n = (x / y).round();
+                Ok(Value::Double(x - n * y))
+            }
+        }
 
         // UUID functions
         "GEN_RANDOM_UUID" | "UUID" => {
