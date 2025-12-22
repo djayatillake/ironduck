@@ -337,9 +337,24 @@ fn build_select_plan(select: &BoundSelect) -> Result<LogicalPlan> {
             plan = LogicalOperator::Window {
                 input: Box::new(plan),
                 window_exprs,
-                output_names: window_output_names,
+                output_names: window_output_names.clone(),
                 output_types: window_output_types,
             };
+
+            // Apply QUALIFY filter if present (filters after window functions)
+            if let Some(qualify) = &select.qualify {
+                // Convert qualify expression, replacing window function references
+                // with column references to the Window operator output
+                let qualify_predicate = convert_qualify_expression(
+                    qualify,
+                    &select.select_list,
+                    input_cols,
+                );
+                plan = LogicalOperator::Filter {
+                    input: Box::new(plan),
+                    predicate: qualify_predicate,
+                };
+            }
 
             // Build projection that references window output
             let mut expressions = Vec::new();
@@ -1311,6 +1326,79 @@ fn convert_having_expression(
     }
 
     convert_inner(expr, group_by, num_group_by, select_list, &mut having_agg_idx)
+}
+
+/// Convert QUALIFY expression with proper window function column references
+/// The QUALIFY clause filters rows after window functions are computed.
+/// Window functions are at columns [input_cols..input_cols + num_windows]
+fn convert_qualify_expression(
+    expr: &BoundExpression,
+    select_list: &[BoundExpression],
+    input_cols: usize,
+) -> super::Expression {
+    fn convert_inner(
+        expr: &BoundExpression,
+        select_list: &[BoundExpression],
+        input_cols: usize,
+        window_idx: &mut usize,
+    ) -> super::Expression {
+        match &expr.expr {
+            BoundExpressionKind::WindowFunction { name, .. } => {
+                // Find matching window function in SELECT list
+                let mut select_window_idx = 0;
+                for sel_expr in select_list {
+                    if let BoundExpressionKind::WindowFunction { name: sel_name, .. } = &sel_expr.expr {
+                        if name == sel_name {
+                            // Found a match - reference the window output column
+                            return super::Expression::ColumnRef {
+                                table_index: 0,
+                                column_index: input_cols + select_window_idx,
+                                name: name.clone(),
+                            };
+                        }
+                        select_window_idx += 1;
+                    }
+                }
+                // Not found in SELECT - it's a window function in QUALIFY only
+                // Reference based on position
+                let idx = *window_idx;
+                *window_idx += 1;
+                super::Expression::ColumnRef {
+                    table_index: 0,
+                    column_index: input_cols + idx,
+                    name: name.clone(),
+                }
+            }
+            BoundExpressionKind::ColumnRef { table_idx, column_idx, name } => {
+                // Column reference - pass through
+                super::Expression::ColumnRef {
+                    table_index: *table_idx,
+                    column_index: *column_idx,
+                    name: name.clone(),
+                }
+            }
+            BoundExpressionKind::BinaryOp { left, op, right } => {
+                let logical_op = convert_binary_op(op);
+                super::Expression::BinaryOp {
+                    left: Box::new(convert_inner(left, select_list, input_cols, window_idx)),
+                    op: logical_op,
+                    right: Box::new(convert_inner(right, select_list, input_cols, window_idx)),
+                }
+            }
+            BoundExpressionKind::UnaryOp { op, expr: inner } => {
+                let logical_op = convert_unary_op(op);
+                super::Expression::UnaryOp {
+                    op: logical_op,
+                    expr: Box::new(convert_inner(inner, select_list, input_cols, window_idx)),
+                }
+            }
+            BoundExpressionKind::Constant(v) => super::Expression::Constant(v.clone()),
+            _ => convert_expression(expr),
+        }
+    }
+
+    let mut window_idx = 0;
+    convert_inner(expr, select_list, input_cols, &mut window_idx)
 }
 
 /// Find a matching output column for an ORDER BY expression

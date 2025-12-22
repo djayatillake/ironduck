@@ -264,6 +264,7 @@ fn bind_recursive_cte(
                 where_clause: None,
                 group_by: Vec::new(),
                 having: None,
+                qualify: None,
                 order_by: Vec::new(),
                 limit: None,
                 offset: None,
@@ -325,6 +326,7 @@ fn bind_recursive_cte(
         where_clause: None,
         group_by: Vec::new(),
         having: None,
+        qualify: None,
         order_by: Vec::new(),
         limit: None,
         offset: None,
@@ -576,6 +578,11 @@ fn bind_select_with_ctes(
         // Bind HAVING
         if let Some(having) = &select.having {
             result.having = Some(bind_expression(binder, having, &ctx)?);
+        }
+
+        // Bind QUALIFY clause (filters after window functions are evaluated)
+        if let Some(qualify) = &select.qualify {
+            result.qualify = Some(bind_expression(binder, qualify, &ctx)?);
         }
     }
 

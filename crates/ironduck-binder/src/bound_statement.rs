@@ -61,6 +61,8 @@ pub struct BoundSelect {
     pub group_by: Vec<BoundExpression>,
     /// HAVING clause
     pub having: Option<BoundExpression>,
+    /// QUALIFY clause (filters after window functions are evaluated)
+    pub qualify: Option<BoundExpression>,
     /// ORDER BY expressions
     pub order_by: Vec<BoundOrderBy>,
     /// LIMIT
@@ -90,6 +92,7 @@ impl BoundSelect {
             where_clause: None,
             group_by: Vec::new(),
             having: None,
+            qualify: None,
             order_by: Vec::new(),
             limit: None,
             offset: None,
