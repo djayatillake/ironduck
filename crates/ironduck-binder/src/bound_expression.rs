@@ -84,6 +84,9 @@ pub enum BoundExpressionKind {
         is_aggregate: bool,
         /// DISTINCT modifier for aggregates (e.g., COUNT(DISTINCT x))
         distinct: bool,
+        /// ORDER BY clause for ordered aggregates (e.g., SUM(x ORDER BY y))
+        /// Each tuple is (expression, ascending, nulls_first)
+        order_by: Vec<(BoundExpression, bool, bool)>,
     },
 
     /// Type cast

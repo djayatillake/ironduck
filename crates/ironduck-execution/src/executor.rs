@@ -1511,6 +1511,70 @@ fn is_constant(expr: &Expression) -> bool {
     }
 }
 
+/// Sort rows based on ORDER BY expressions for ordered aggregates
+fn sort_rows_for_aggregate(
+    rows: &[Vec<Value>],
+    order_by: &[(Expression, bool, bool)],
+) -> Result<Vec<Vec<Value>>> {
+    use std::cmp::Ordering;
+
+    let mut indexed_rows: Vec<(usize, Vec<Value>)> = rows
+        .iter()
+        .enumerate()
+        .map(|(i, row)| (i, row.clone()))
+        .collect();
+
+    // Sort with error handling
+    let mut sort_error: Option<Error> = None;
+    indexed_rows.sort_by(|(_, row_a), (_, row_b)| {
+        if sort_error.is_some() {
+            return Ordering::Equal;
+        }
+
+        for (expr, ascending, nulls_first) in order_by {
+            let val_a = match evaluate(expr, row_a) {
+                Ok(v) => v,
+                Err(e) => {
+                    sort_error = Some(e);
+                    return Ordering::Equal;
+                }
+            };
+            let val_b = match evaluate(expr, row_b) {
+                Ok(v) => v,
+                Err(e) => {
+                    sort_error = Some(e);
+                    return Ordering::Equal;
+                }
+            };
+
+            // Handle nulls
+            match (&val_a, &val_b) {
+                (Value::Null, Value::Null) => continue,
+                (Value::Null, _) => {
+                    return if *nulls_first { Ordering::Less } else { Ordering::Greater };
+                }
+                (_, Value::Null) => {
+                    return if *nulls_first { Ordering::Greater } else { Ordering::Less };
+                }
+                _ => {}
+            }
+
+            let cmp = val_a.partial_cmp(&val_b).unwrap_or(Ordering::Equal);
+            let cmp = if *ascending { cmp } else { cmp.reverse() };
+            if cmp != Ordering::Equal {
+                return cmp;
+            }
+        }
+        Ordering::Equal
+    });
+
+    if let Some(e) = sort_error {
+        return Err(e);
+    }
+
+    Ok(indexed_rows.into_iter().map(|(_, row)| row).collect())
+}
+
 /// Compute an aggregate function
 fn compute_aggregate(
     agg: &ironduck_planner::AggregateExpression,
@@ -1520,6 +1584,15 @@ fn compute_aggregate(
 
     let args = &agg.args;
     let distinct = agg.distinct;
+
+    // If there's an ORDER BY clause, sort the rows first
+    let sorted_rows: Vec<Vec<Value>>;
+    let rows = if !agg.order_by.is_empty() {
+        sorted_rows = sort_rows_for_aggregate(rows, &agg.order_by)?;
+        &sorted_rows[..]
+    } else {
+        rows
+    };
 
     match agg.function {
         Count => {
@@ -1730,12 +1803,19 @@ fn compute_aggregate(
                         sum += nanos as f64;
                         count += 1;
                     }
-                    Value::TimeTz(t, _offset) => {
+                    Value::TimeTz(t, offset_secs) => {
                         avg_type.get_or_insert(AvgType::TimeTz);
-                        // Convert to nanoseconds since midnight (ignoring offset for avg)
-                        let nanos = t.num_seconds_from_midnight() as i64 * 1_000_000_000
+                        // Convert to nanoseconds since midnight, then normalize to UTC
+                        // by subtracting the offset
+                        let local_nanos = t.num_seconds_from_midnight() as i64 * 1_000_000_000
                             + t.nanosecond() as i64;
-                        sum += nanos as f64;
+                        // Offset is in seconds, convert to nanos and subtract to get UTC
+                        let offset_nanos = offset_secs as i64 * 1_000_000_000;
+                        let utc_nanos = local_nanos - offset_nanos;
+                        // Wrap around 24 hours (handle times that cross midnight)
+                        let day_nanos: i64 = 24 * 60 * 60 * 1_000_000_000;
+                        let utc_nanos = ((utc_nanos % day_nanos) + day_nanos) % day_nanos;
+                        sum += utc_nanos as f64;
                         count += 1;
                     }
                     Value::TimestampTz(ts) => {
@@ -2605,10 +2685,31 @@ fn parse_timetz(s: &str) -> Result<(chrono::NaiveTime, i32)> {
     Ok((time, offset_secs))
 }
 
-/// Parse a timezone offset string like "0530" or "05:30" or "1559" to seconds
+/// Parse a timezone offset string like "0530" or "05:30" or "04:30:45" to seconds
 fn parse_tz_offset_str(s: &str) -> i32 {
+    // Split by colons first to handle HH:MM:SS format
+    let parts: Vec<&str> = s.split(':').collect();
+    if parts.len() >= 3 {
+        // HH:MM:SS format
+        let hours: i32 = parts[0].parse().unwrap_or(0);
+        let mins: i32 = parts[1].parse().unwrap_or(0);
+        let secs: i32 = parts[2].parse().unwrap_or(0);
+        return hours * 3600 + mins * 60 + secs;
+    } else if parts.len() == 2 {
+        // HH:MM format
+        let hours: i32 = parts[0].parse().unwrap_or(0);
+        let mins: i32 = parts[1].parse().unwrap_or(0);
+        return hours * 3600 + mins * 60;
+    }
+
+    // No colons - try HHMM or HHMMSS format
     let s = s.replace(':', "");
-    if s.len() >= 4 {
+    if s.len() >= 6 {
+        let hours: i32 = s[..2].parse().unwrap_or(0);
+        let mins: i32 = s[2..4].parse().unwrap_or(0);
+        let secs: i32 = s[4..6].parse().unwrap_or(0);
+        hours * 3600 + mins * 60 + secs
+    } else if s.len() >= 4 {
         let hours: i32 = s[..2].parse().unwrap_or(0);
         let mins: i32 = s[2..4].parse().unwrap_or(0);
         hours * 3600 + mins * 60

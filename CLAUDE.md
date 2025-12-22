@@ -17,7 +17,7 @@ IronDuck is a **complete replication of DuckDB written in pure Rust**. The goal 
 
 We validate correctness by running DuckDB's official SQLLogicTest suite against IronDuck.
 
-**Current Status**: 95.9% (117/122 tests passing)
+**Current Status**: 100% (122/122 tests passing)
 
 #### What are SQLLogicTests?
 
@@ -111,10 +111,10 @@ ironduck/
 
 Features not yet implemented:
 
-- **Sequences**: CREATE SEQUENCE, NEXTVAL, CURRVAL
-- **TIMETZ type**: Time with timezone
-- **Ordered aggregates**: SUM(x ORDER BY y) syntax
+- **Recursive CTEs**: WITH RECURSIVE queries
 - **Some INTERVAL syntax**: `INTERVAL 7 MINUTES` (use `INTERVAL '7' MINUTE`)
+- **Persistent storage**: Currently in-memory only
+- **Transactions**: BEGIN, COMMIT, ROLLBACK
 
 ## Contributing
 

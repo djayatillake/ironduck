@@ -2,7 +2,7 @@
 
 ## Current Progress (December 2025)
 
-**DuckDB Compatibility: 98.4% (120/122 tests passing)**
+**DuckDB Compatibility: 100% (122/122 tests passing)**
 
 ### Completed Features
 - [x] Core SQL parsing via sqlparser-rs
@@ -22,11 +22,11 @@
 - [x] CREATE TABLE, INSERT, UPDATE, DELETE, DROP TABLE
 - [x] CREATE VIEW, DROP VIEW
 - [x] CREATE SEQUENCE, NEXTVAL, CURRVAL
-- [x] TIMETZ type (time with timezone)
+- [x] TIMETZ type (time with timezone) with proper UTC normalization for AVG
+- [x] Ordered aggregates (SUM(x ORDER BY y) syntax)
 - [x] EXPLAIN query plans
 
 ### Not Yet Implemented
-- [ ] Ordered aggregates (SUM(x ORDER BY y) syntax)
 - [ ] Recursive CTEs
 - [ ] Persistent storage (currently in-memory only)
 - [ ] Transactions (BEGIN, COMMIT, ROLLBACK)

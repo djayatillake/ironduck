@@ -312,6 +312,7 @@ pub fn bind_expression(
                     args,
                     is_aggregate: false,
                     distinct: false,
+                    order_by: vec![],
                 },
                 LogicalType::Varchar,
             ))
@@ -335,6 +336,7 @@ pub fn bind_expression(
                     args,
                     is_aggregate: false,
                     distinct: false,
+                    order_by: vec![],
                 },
                 LogicalType::Varchar,
             ))
@@ -351,6 +353,7 @@ pub fn bind_expression(
                     args: vec![string, substr],
                     is_aggregate: false,
                     distinct: false,
+                    order_by: vec![],
                 },
                 LogicalType::Integer,
             ))
@@ -365,6 +368,7 @@ pub fn bind_expression(
                     args: vec![bound_expr],
                     is_aggregate: false,
                     distinct: false,
+                    order_by: vec![],
                 },
                 LogicalType::Double,
             ))
@@ -379,6 +383,7 @@ pub fn bind_expression(
                     args: vec![bound_expr],
                     is_aggregate: false,
                     distinct: false,
+                    order_by: vec![],
                 },
                 LogicalType::Double,
             ))
@@ -400,6 +405,7 @@ pub fn bind_expression(
                     ],
                     is_aggregate: false,
                     distinct: false,
+                    order_by: vec![],
                 },
                 LogicalType::BigInt,
             ))
@@ -747,6 +753,25 @@ fn bind_function(
         _ => false,
     };
 
+    // Extract ORDER BY clause for ordered aggregates (e.g., SUM(x ORDER BY y))
+    let order_by: Vec<(BoundExpression, bool, bool)> = match &func.args {
+        sql::FunctionArguments::List(arg_list) => {
+            let mut order_by_exprs = Vec::new();
+            for clause in &arg_list.clauses {
+                if let sql::FunctionArgumentClause::OrderBy(order_by_list) = clause {
+                    for order_expr in order_by_list {
+                        let bound_expr = bind_expression(binder, &order_expr.expr, ctx)?;
+                        let ascending = order_expr.asc.unwrap_or(true);
+                        let nulls_first = order_expr.nulls_first.unwrap_or(!ascending);
+                        order_by_exprs.push((bound_expr, ascending, nulls_first));
+                    }
+                }
+            }
+            order_by_exprs
+        }
+        _ => vec![],
+    };
+
     // Validate argument count for functions that require specific numbers
     match name.as_str() {
         // Single-argument aggregate functions
@@ -871,6 +896,7 @@ fn bind_function(
             args,
             is_aggregate,
             distinct,
+            order_by,
         },
         return_type,
     ))

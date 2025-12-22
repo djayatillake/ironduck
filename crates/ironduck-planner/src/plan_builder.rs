@@ -263,12 +263,24 @@ fn build_select_plan(select: &BoundSelect) -> Result<LogicalPlan> {
 
         for (idx, bound_expr) in select.select_list.iter().enumerate() {
             if is_aggregate_expr(bound_expr) {
-                // This is an aggregate - reference its position in the aggregate output
+                // This is a direct aggregate - reference its position in the aggregate output
                 expressions.push(super::Expression::ColumnRef {
                     table_index: 0,
                     column_index: num_group_by + agg_idx,
                     name: output_names.get(idx).cloned().unwrap_or_default(),
                 });
+                agg_idx += 1;
+            } else if has_aggregate(bound_expr) {
+                // This is an expression wrapping an aggregate (e.g., CAST(SUM(x) AS BIGINT))
+                // We need to reference the aggregate output and wrap it with the outer expression
+                let agg_ref = super::Expression::ColumnRef {
+                    table_index: 0,
+                    column_index: num_group_by + agg_idx,
+                    name: output_names.get(idx).cloned().unwrap_or_default(),
+                };
+                // Apply the outer wrapper (e.g., Cast) to the aggregate result reference
+                let wrapped = wrap_aggregate_reference(bound_expr, agg_ref);
+                expressions.push(wrapped);
                 agg_idx += 1;
             } else if has_group_by {
                 // This should be a group by column - find its position
@@ -609,6 +621,7 @@ fn convert_expression(expr: &BoundExpression) -> super::Expression {
             args,
             is_aggregate: _,
             distinct: _, // distinct is handled in extract_aggregate
+            order_by: _, // order_by is handled in extract_aggregate
         } => {
             // Return function expression - aggregates are handled specially in Aggregate operator
             super::Expression::Function {
@@ -760,6 +773,7 @@ fn has_aggregate(expr: &BoundExpression) -> bool {
             has_aggregate(left) || has_aggregate(right)
         }
         BoundExpressionKind::UnaryOp { expr, .. } => has_aggregate(expr),
+        BoundExpressionKind::Cast { expr, .. } => has_aggregate(expr),
         BoundExpressionKind::Case {
             operand,
             when_clauses,
@@ -776,6 +790,47 @@ fn has_aggregate(expr: &BoundExpression) -> bool {
 /// Check if an expression is directly an aggregate function (not nested)
 fn is_aggregate_expr(expr: &BoundExpression) -> bool {
     matches!(&expr.expr, BoundExpressionKind::Function { is_aggregate: true, .. })
+}
+
+/// Wrap an aggregate output reference with the outer expression wrapper
+/// For example, if bound_expr is CAST(SUM(x) AS BIGINT), this returns CAST(agg_ref AS BIGINT)
+fn wrap_aggregate_reference(bound_expr: &BoundExpression, agg_ref: super::Expression) -> super::Expression {
+    match &bound_expr.expr {
+        // If this is the aggregate function itself, return the reference
+        BoundExpressionKind::Function { is_aggregate: true, .. } => agg_ref,
+        // If this is a Cast wrapping something containing an aggregate, recurse and wrap with Cast
+        BoundExpressionKind::Cast { expr, target_type } => {
+            let inner = wrap_aggregate_reference(expr, agg_ref);
+            super::Expression::Cast {
+                expr: Box::new(inner),
+                target_type: target_type.clone(),
+            }
+        }
+        // If this is a BinaryOp containing an aggregate, recurse on the appropriate side
+        BoundExpressionKind::BinaryOp { left, op, right } => {
+            let has_left_agg = has_aggregate(left);
+            let has_right_agg = has_aggregate(right);
+
+            let left_expr = if has_left_agg {
+                wrap_aggregate_reference(left, agg_ref.clone())
+            } else {
+                convert_expression(left)
+            };
+            let right_expr = if has_right_agg {
+                wrap_aggregate_reference(right, agg_ref)
+            } else {
+                convert_expression(right)
+            };
+
+            super::Expression::BinaryOp {
+                left: Box::new(left_expr),
+                op: convert_binary_op(op),
+                right: Box::new(right_expr),
+            }
+        }
+        // For other cases, just convert normally (shouldn't happen if has_aggregate was true)
+        _ => convert_expression(bound_expr),
+    }
 }
 
 /// Simple expression equality check for group by matching
@@ -795,11 +850,14 @@ fn expressions_equal(a: &super::Expression, b: &super::Expression) -> bool {
 /// Extract aggregate expression
 fn extract_aggregate(expr: &BoundExpression) -> Option<super::AggregateExpression> {
     match &expr.expr {
+        // Handle Cast expressions - look inside them for aggregates
+        BoundExpressionKind::Cast { expr, .. } => extract_aggregate(expr),
         BoundExpressionKind::Function {
             name,
             args,
             is_aggregate,
             distinct,
+            order_by,
         } if *is_aggregate => {
             let func = match name.as_str() {
                 "COUNT" => super::AggregateFunction::Count,
@@ -842,11 +900,20 @@ fn extract_aggregate(expr: &BoundExpression) -> Option<super::AggregateExpressio
                 args.iter().map(convert_expression).collect()
             };
 
+            // Convert order_by expressions
+            let converted_order_by: Vec<_> = order_by
+                .iter()
+                .map(|(expr, asc, nulls_first)| {
+                    (convert_expression(expr), *asc, *nulls_first)
+                })
+                .collect();
+
             Some(super::AggregateExpression {
                 function: func,
                 args: converted_args,
                 distinct: *distinct,
                 filter: None,
+                order_by: converted_order_by,
             })
         }
         _ => None,
@@ -861,6 +928,7 @@ fn has_window_function(expr: &BoundExpression) -> bool {
             has_window_function(left) || has_window_function(right)
         }
         BoundExpressionKind::UnaryOp { expr, .. } => has_window_function(expr),
+        BoundExpressionKind::Cast { expr, .. } => has_window_function(expr),
         BoundExpressionKind::Case { operand, when_clauses, else_result } => {
             operand.as_ref().map_or(false, |e| has_window_function(e))
                 || when_clauses.iter().any(|(c, r)| has_window_function(c) || has_window_function(r))

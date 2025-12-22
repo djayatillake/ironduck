@@ -379,6 +379,9 @@ pub struct AggregateExpression {
     pub args: Vec<Expression>,
     pub distinct: bool,
     pub filter: Option<Expression>,
+    /// ORDER BY clause for ordered aggregates (e.g., SUM(x ORDER BY y))
+    /// Each tuple is (expression, ascending, nulls_first)
+    pub order_by: Vec<(Expression, bool, bool)>,
 }
 
 impl AggregateExpression {
