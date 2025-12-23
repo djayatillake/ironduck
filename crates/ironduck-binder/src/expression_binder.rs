@@ -910,7 +910,7 @@ fn bind_function(
         // Single-argument aggregate functions
         "AVG" | "SUM" | "MIN" | "MAX" | "FIRST" | "LAST" | "STDDEV" | "STDDEV_SAMP"
         | "STDDEV_POP" | "VARIANCE" | "VAR_SAMP" | "VAR_POP" | "BIT_AND" | "BIT_OR"
-        | "BIT_XOR" | "PRODUCT" | "MEDIAN" | "MODE" | "ARRAY_AGG" | "BOOL_AND"
+        | "BIT_XOR" | "PRODUCT" | "MEDIAN" | "MODE" | "ARRAY_AGG" | "LIST_AGG" | "LIST" | "BOOL_AND"
         | "BOOL_OR" | "EVERY" | "ANY" => {
             // These functions need exactly 1 argument (excluding COUNT which can be 0 with *)
             if args.is_empty() {
@@ -960,7 +960,7 @@ fn bind_function(
         // String aggregate
         "STRING_AGG" | "GROUP_CONCAT" | "LISTAGG" => (true, LogicalType::Varchar),
         // Array aggregate
-        "ARRAY_AGG" => {
+        "ARRAY_AGG" | "LIST_AGG" | "LIST" => {
             let arg_type = args.first().map(|a| a.return_type.clone()).unwrap_or(LogicalType::Null);
             (true, LogicalType::List(Box::new(arg_type)))
         }
