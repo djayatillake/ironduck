@@ -237,6 +237,13 @@ pub enum BoundBinaryOperator {
     Concat,
     Like,
     ILike,
+
+    // Bitwise
+    BitwiseAnd,
+    BitwiseOr,
+    BitwiseXor,
+    ShiftLeft,
+    ShiftRight,
 }
 
 /// Unary operators
@@ -276,6 +283,13 @@ impl BoundBinaryOperator {
             | BoundBinaryOperator::Modulo => {
                 left.common_supertype(right).unwrap_or(LogicalType::Double)
             }
+
+            // Bitwise operators return bigint
+            BoundBinaryOperator::BitwiseAnd
+            | BoundBinaryOperator::BitwiseOr
+            | BoundBinaryOperator::BitwiseXor
+            | BoundBinaryOperator::ShiftLeft
+            | BoundBinaryOperator::ShiftRight => LogicalType::BigInt,
         }
     }
 }

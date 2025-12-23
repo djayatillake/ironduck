@@ -780,6 +780,13 @@ fn bind_binary_op(op: &sql::BinaryOperator) -> Result<BoundBinaryOperator> {
         sql::BinaryOperator::And => Ok(BoundBinaryOperator::And),
         sql::BinaryOperator::Or => Ok(BoundBinaryOperator::Or),
         sql::BinaryOperator::StringConcat => Ok(BoundBinaryOperator::Concat),
+        sql::BinaryOperator::BitwiseAnd => Ok(BoundBinaryOperator::BitwiseAnd),
+        sql::BinaryOperator::BitwiseOr => Ok(BoundBinaryOperator::BitwiseOr),
+        sql::BinaryOperator::BitwiseXor => Ok(BoundBinaryOperator::BitwiseXor),
+        sql::BinaryOperator::Xor => Ok(BoundBinaryOperator::BitwiseXor),
+        sql::BinaryOperator::PGBitwiseXor => Ok(BoundBinaryOperator::BitwiseXor),
+        sql::BinaryOperator::PGBitwiseShiftLeft => Ok(BoundBinaryOperator::ShiftLeft),
+        sql::BinaryOperator::PGBitwiseShiftRight => Ok(BoundBinaryOperator::ShiftRight),
         _ => Err(Error::NotImplemented(format!("Binary operator {:?}", op))),
     }
 }

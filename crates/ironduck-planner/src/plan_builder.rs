@@ -736,6 +736,11 @@ fn convert_expression(expr: &BoundExpression) -> super::Expression {
                 ironduck_binder::BoundBinaryOperator::Concat => super::BinaryOperator::Concat,
                 ironduck_binder::BoundBinaryOperator::Like => super::BinaryOperator::Like,
                 ironduck_binder::BoundBinaryOperator::ILike => super::BinaryOperator::ILike,
+                ironduck_binder::BoundBinaryOperator::BitwiseAnd => super::BinaryOperator::BitwiseAnd,
+                ironduck_binder::BoundBinaryOperator::BitwiseOr => super::BinaryOperator::BitwiseOr,
+                ironduck_binder::BoundBinaryOperator::BitwiseXor => super::BinaryOperator::BitwiseXor,
+                ironduck_binder::BoundBinaryOperator::ShiftLeft => super::BinaryOperator::ShiftLeft,
+                ironduck_binder::BoundBinaryOperator::ShiftRight => super::BinaryOperator::ShiftRight,
             };
 
             super::Expression::BinaryOp {
@@ -1287,6 +1292,11 @@ fn convert_binary_op(op: &ironduck_binder::BoundBinaryOperator) -> super::Binary
         ironduck_binder::BoundBinaryOperator::Concat => super::BinaryOperator::Concat,
         ironduck_binder::BoundBinaryOperator::Like => super::BinaryOperator::Like,
         ironduck_binder::BoundBinaryOperator::ILike => super::BinaryOperator::ILike,
+        ironduck_binder::BoundBinaryOperator::BitwiseAnd => super::BinaryOperator::BitwiseAnd,
+        ironduck_binder::BoundBinaryOperator::BitwiseOr => super::BinaryOperator::BitwiseOr,
+        ironduck_binder::BoundBinaryOperator::BitwiseXor => super::BinaryOperator::BitwiseXor,
+        ironduck_binder::BoundBinaryOperator::ShiftLeft => super::BinaryOperator::ShiftLeft,
+        ironduck_binder::BoundBinaryOperator::ShiftRight => super::BinaryOperator::ShiftRight,
     }
 }
 
