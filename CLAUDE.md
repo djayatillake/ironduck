@@ -98,6 +98,7 @@ The query optimizer applies multiple rules in order:
 2. **Predicate Simplification**: Simplifies boolean logic (e.g., `TRUE AND x` → `x`)
 3. **Filter Pushdown**: Pushes filters closer to data sources to reduce processing
 4. **Projection Pushdown**: Eliminates unused columns early to reduce memory usage
+5. **Limit Pushdown**: Combines consecutive limits and pushes them past projections
 
 ## Crate Architecture
 
