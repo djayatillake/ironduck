@@ -732,6 +732,12 @@ fn evaluate_function(name: &str, args: &[Value]) -> Result<Value> {
             let parts: Vec<&str> = s.split(delimiter).collect();
             Ok(Value::Varchar(parts.get(part.saturating_sub(1)).unwrap_or(&"").to_string()))
         }
+        "STRING_SPLIT" | "STR_SPLIT" | "STRING_TO_ARRAY" => {
+            let s = args.first().and_then(|v| v.as_str()).unwrap_or("");
+            let delimiter = args.get(1).and_then(|v| v.as_str()).unwrap_or("");
+            let parts: Vec<Value> = s.split(delimiter).map(|p| Value::Varchar(p.to_string())).collect();
+            Ok(Value::List(parts))
+        }
         "INITCAP" => {
             let s = args.first().and_then(|v| v.as_str()).unwrap_or("");
             let result: String = s.split_whitespace()
@@ -763,6 +769,26 @@ fn evaluate_function(name: &str, args: &[Value]) -> Result<Value> {
             let s = args.first().and_then(|v| v.as_str()).unwrap_or("");
             let needle = args.get(1).and_then(|v| v.as_str()).unwrap_or("");
             Ok(Value::Boolean(s.contains(needle)))
+        }
+        "FORMAT" | "PRINTF" => {
+            // Simple {} placeholder replacement (DuckDB-style)
+            let format_str = args.first().and_then(|v| v.as_str()).unwrap_or("");
+            let mut result = format_str.to_string();
+            let mut arg_idx = 1;
+            while let Some(pos) = result.find("{}") {
+                if let Some(arg) = args.get(arg_idx) {
+                    let replacement = match arg {
+                        Value::Null => "NULL".to_string(),
+                        Value::Varchar(s) => s.clone(),
+                        _ => arg.to_string(),
+                    };
+                    result = result[..pos].to_string() + &replacement + &result[pos + 2..];
+                    arg_idx += 1;
+                } else {
+                    break;
+                }
+            }
+            Ok(Value::Varchar(result))
         }
 
         // Regular expression functions
