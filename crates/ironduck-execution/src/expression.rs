@@ -902,6 +902,45 @@ fn evaluate_function(name: &str, args: &[Value]) -> Result<Value> {
                 _ => Ok(Value::Boolean(false)),
             }
         }
+        "ARRAY_EXTRACT" | "LIST_EXTRACT" | "LIST_ELEMENT" => {
+            // Get element at index (1-based)
+            match (args.first(), args.get(1)) {
+                (Some(Value::List(list)), Some(idx)) => {
+                    let index = idx.as_i64().unwrap_or(0);
+                    if index <= 0 || index as usize > list.len() {
+                        Ok(Value::Null)
+                    } else {
+                        Ok(list[(index - 1) as usize].clone())
+                    }
+                }
+                (Some(Value::Null), _) | (_, Some(Value::Null)) => Ok(Value::Null),
+                _ => Ok(Value::Null),
+            }
+        }
+        "ARRAY_SLICE" | "LIST_SLICE" => {
+            // Get slice of array: array_slice(arr, start, end) - 1-based, inclusive
+            match args.first() {
+                Some(Value::List(list)) => {
+                    let start = args.get(1).and_then(|v| v.as_i64()).unwrap_or(1) as usize;
+                    let end = args.get(2).and_then(|v| v.as_i64()).map(|e| e as usize).unwrap_or(list.len());
+
+                    if start == 0 || start > list.len() {
+                        return Ok(Value::List(vec![]));
+                    }
+
+                    let start_idx = start.saturating_sub(1);
+                    let end_idx = end.min(list.len());
+
+                    if start_idx >= end_idx {
+                        Ok(Value::List(vec![]))
+                    } else {
+                        Ok(Value::List(list[start_idx..end_idx].to_vec()))
+                    }
+                }
+                Some(Value::Null) => Ok(Value::Null),
+                _ => Ok(Value::List(vec![])),
+            }
+        }
         "LIST_POSITION" | "ARRAY_POSITION" | "ARRAY_INDEXOF" => {
             // Find position of element in list (1-indexed, 0 if not found)
             match args.first() {

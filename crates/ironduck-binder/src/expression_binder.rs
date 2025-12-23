@@ -553,6 +553,68 @@ pub fn bind_expression(
             }
         }
 
+        // Array subscript: arr[index]
+        sql::Expr::Subscript { expr, subscript } => {
+            let array_expr = bind_expression(_binder, expr, ctx)?;
+            match subscript.as_ref() {
+                sql::Subscript::Index { index } => {
+                    let index_expr = bind_expression(_binder, index, ctx)?;
+                    // Get element type from array type
+                    let element_type = match &array_expr.return_type {
+                        LogicalType::List(inner) => inner.as_ref().clone(),
+                        _ => LogicalType::Unknown,
+                    };
+                    Ok(BoundExpression::new(
+                        BoundExpressionKind::Function {
+                            name: "ARRAY_EXTRACT".to_string(),
+                            args: vec![array_expr, index_expr],
+                            is_aggregate: false,
+                            distinct: false,
+                            order_by: vec![],
+                            filter: None,
+                        },
+                        element_type,
+                    ))
+                }
+                sql::Subscript::Slice { lower_bound, upper_bound, stride } => {
+                    let lower = lower_bound.as_ref()
+                        .map(|e| bind_expression(_binder, e, ctx))
+                        .transpose()?;
+                    let upper = upper_bound.as_ref()
+                        .map(|e| bind_expression(_binder, e, ctx))
+                        .transpose()?;
+                    let _stride = stride.as_ref()
+                        .map(|e| bind_expression(_binder, e, ctx))
+                        .transpose()?;
+
+                    let mut args = vec![array_expr.clone()];
+                    if let Some(l) = lower {
+                        args.push(l);
+                    } else {
+                        args.push(BoundExpression::new(
+                            BoundExpressionKind::Constant(Value::BigInt(1)),
+                            LogicalType::BigInt,
+                        ));
+                    }
+                    if let Some(u) = upper {
+                        args.push(u);
+                    }
+
+                    Ok(BoundExpression::new(
+                        BoundExpressionKind::Function {
+                            name: "ARRAY_SLICE".to_string(),
+                            args,
+                            is_aggregate: false,
+                            distinct: false,
+                            order_by: vec![],
+                            filter: None,
+                        },
+                        array_expr.return_type,
+                    ))
+                }
+            }
+        }
+
         _ => Err(Error::NotImplemented(format!(
             "Expression type: {:?}",
             expr

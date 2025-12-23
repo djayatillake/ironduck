@@ -95,6 +95,13 @@ pub fn bind_statement(binder: &Binder, stmt: &sql::Statement) -> Result<BoundSta
             bind_create_sequence(binder, name, *if_not_exists, sequence_options)
         }
 
+        // Transaction statements - treat as no-ops for in-memory database
+        sql::Statement::StartTransaction { .. } => Ok(BoundStatement::NoOp),
+        sql::Statement::Commit { .. } => Ok(BoundStatement::NoOp),
+        sql::Statement::Rollback { .. } => Ok(BoundStatement::NoOp),
+        sql::Statement::Savepoint { .. } => Ok(BoundStatement::NoOp),
+        sql::Statement::ReleaseSavepoint { .. } => Ok(BoundStatement::NoOp),
+
         _ => Err(Error::NotImplemented(format!("Statement: {:?}", stmt))),
     }
 }
@@ -1284,6 +1291,33 @@ fn bind_table_factor_with_ctes(
 
         sql::TableFactor::Function { name, args, alias, .. } => {
             bind_table_function(binder, name, args, alias)
+        }
+
+        sql::TableFactor::UNNEST { array_exprs, alias, with_offset, with_offset_alias, .. } => {
+            // Handle UNNEST([1,2,3]) table factor
+            use super::bound_expression::BoundExpressionKind;
+
+            let ctx = ExpressionBinderContext::new(&[]);
+
+            if array_exprs.is_empty() {
+                return Err(Error::InvalidArguments("UNNEST requires at least one array argument".to_string()));
+            }
+
+            let array_expr = bind_expression(binder, &array_exprs[0], &ctx)?;
+
+            // Extract column alias from table alias if provided
+            let (table_alias, column_alias) = if let Some(a) = alias {
+                let col_alias = a.columns.first().map(|c| c.name.value.clone());
+                (Some(a.name.value.clone()), col_alias)
+            } else {
+                (None, None)
+            };
+
+            Ok(BoundTableRef::TableFunction {
+                function: TableFunctionType::Unnest { array_expr },
+                alias: table_alias,
+                column_alias,
+            })
         }
 
         _ => Err(Error::NotImplemented(format!("Table factor: {:?}", factor))),
