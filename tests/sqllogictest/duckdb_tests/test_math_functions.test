@@ -1,0 +1,185 @@
+# Test math functions
+
+# Basic math
+query I
+SELECT ABS(-5);
+----
+5
+
+query R
+SELECT ABS(-5.5);
+----
+5.5
+
+# Rounding
+query I
+SELECT CEIL(4.3);
+----
+5
+
+query I
+SELECT FLOOR(4.7);
+----
+4
+
+query I
+SELECT ROUND(4.5);
+----
+5
+
+query R
+SELECT ROUND(4.567, 2);
+----
+4.57
+
+query I
+SELECT TRUNC(4.9);
+----
+4
+
+# Powers and roots
+query I
+SELECT POWER(2, 3);
+----
+8
+
+query I
+SELECT SQRT(16);
+----
+4
+
+query I
+SELECT CBRT(27);
+----
+3
+
+# Logarithms and exponentials
+query I
+SELECT LN(2.718281828459045);
+----
+1
+
+query R
+SELECT EXP(1);
+----
+2.718281828459045
+
+# LOG with base 10
+query I
+SELECT LOG10(100);
+----
+2
+
+# Sign
+query I
+SELECT SIGN(5);
+----
+1
+
+query I
+SELECT SIGN(-5);
+----
+-1
+
+query I
+SELECT SIGN(0);
+----
+0
+
+# Modulo
+query I
+SELECT MOD(10, 3);
+----
+1
+
+query I
+SELECT 10 % 3;
+----
+1
+
+# Constants
+query R
+SELECT PI();
+----
+3.141592653589793
+
+# Trigonometric functions
+query I
+SELECT SIN(0);
+----
+0
+
+query I
+SELECT COS(0);
+----
+1
+
+query I
+SELECT TAN(0);
+----
+0
+
+# Inverse trig
+query I
+SELECT ASIN(0);
+----
+0
+
+query I
+SELECT ACOS(1);
+----
+0
+
+query I
+SELECT ATAN(0);
+----
+0
+
+# Hyperbolic functions
+query I
+SELECT SINH(0);
+----
+0
+
+query I
+SELECT COSH(0);
+----
+1
+
+query I
+SELECT TANH(0);
+----
+0
+
+# Angle conversion
+query I
+SELECT DEGREES(3.141592653589793);
+----
+180
+
+query R
+SELECT RADIANS(180);
+----
+3.141592653589793
+
+# GCD and LCM
+query I
+SELECT GCD(12, 18);
+----
+6
+
+query I
+SELECT LCM(4, 6);
+----
+12
+
+# Factorial
+query I
+SELECT FACTORIAL(5);
+----
+120
+
+query I
+SELECT FACTORIAL(0);
+----
+1
