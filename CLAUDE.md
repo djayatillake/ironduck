@@ -17,7 +17,7 @@ IronDuck is a **complete replication of DuckDB written in pure Rust**. The goal 
 
 We validate correctness by running DuckDB's official SQLLogicTest suite against IronDuck.
 
-**Current Status**: 100% (396/396 tests passing)
+**Current Status**: 100% (466/466 tests passing)
 
 #### What are SQLLogicTests?
 
