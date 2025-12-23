@@ -508,6 +508,46 @@ pub fn bind_expression(
             ))
         }
 
+        // Array literal: [1, 2, 3] or ARRAY[1, 2, 3]
+        sql::Expr::Array(arr) => {
+            let mut elements = Vec::new();
+            let mut element_type = LogicalType::Null;
+
+            for elem in &arr.elem {
+                let bound = bind_expression(_binder, elem, ctx)?;
+                if element_type == LogicalType::Null {
+                    element_type = bound.return_type.clone();
+                }
+                elements.push(bound);
+            }
+
+            // Create a list type
+            let list_type = LogicalType::List(Box::new(element_type));
+
+            // Convert to a constant List value if all elements are constants
+            let all_constants = elements.iter().all(|e| matches!(e.expr, BoundExpressionKind::Constant(_)));
+            if all_constants {
+                let values: Vec<Value> = elements
+                    .iter()
+                    .filter_map(|e| {
+                        if let BoundExpressionKind::Constant(v) = &e.expr {
+                            Some(v.clone())
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+                Ok(BoundExpression::new(
+                    BoundExpressionKind::Constant(Value::List(values)),
+                    list_type,
+                ))
+            } else {
+                // For non-constant arrays, we need an array expression type
+                // For now, return an error as this is less common
+                Err(Error::NotImplemented("Non-constant array literals".to_string()))
+            }
+        }
+
         _ => Err(Error::NotImplemented(format!(
             "Expression type: {:?}",
             expr

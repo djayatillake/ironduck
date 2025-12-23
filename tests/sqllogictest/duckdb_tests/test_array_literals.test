@@ -1,0 +1,39 @@
+# Array literal tests
+
+# Basic array literals
+query T
+SELECT [1, 2, 3];
+----
+[1, 2, 3]
+
+query T
+SELECT ARRAY[1, 2, 3];
+----
+[1, 2, 3]
+
+# Empty array
+query T
+SELECT [];
+----
+[]
+
+# String arrays
+query T
+SELECT ['a', 'b', 'c'];
+----
+[a, b, c]
+
+# Mixed types (coerced to string)
+query T
+SELECT [1, 2, 3, 4, 5];
+----
+[1, 2, 3, 4, 5]
+
+# Nested arrays (if supported)
+# query T
+# SELECT [[1, 2], [3, 4]];
+# ----
+# [[1, 2], [3, 4]]
+
+# Note: Non-constant array literals like [1+1, 2+2] are not yet supported
+
