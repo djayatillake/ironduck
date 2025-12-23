@@ -1,0 +1,295 @@
+# Aggregate function tests
+
+# Setup
+statement ok
+CREATE TABLE agg_test (id INTEGER, category TEXT, value INTEGER, price REAL);
+
+statement ok
+INSERT INTO agg_test VALUES
+(1, 'A', 10, 1.5),
+(2, 'A', 20, 2.5),
+(3, 'B', 30, 3.5),
+(4, 'B', 40, 4.5),
+(5, 'B', 50, 5.5),
+(6, 'C', 60, 6.5);
+
+# Basic COUNT
+query I
+SELECT COUNT(*) FROM agg_test;
+----
+6
+
+query I
+SELECT COUNT(id) FROM agg_test;
+----
+6
+
+# COUNT with NULL handling
+statement ok
+CREATE TABLE null_test (a INTEGER, b TEXT);
+
+statement ok
+INSERT INTO null_test VALUES (1, 'x'), (2, NULL), (NULL, 'y'), (NULL, NULL);
+
+query I
+SELECT COUNT(*) FROM null_test;
+----
+4
+
+query I
+SELECT COUNT(a) FROM null_test;
+----
+2
+
+query I
+SELECT COUNT(b) FROM null_test;
+----
+2
+
+# SUM
+query I
+SELECT SUM(value) FROM agg_test;
+----
+210
+
+query I
+SELECT SUM(price) FROM agg_test;
+----
+24
+
+# AVG
+query I
+SELECT AVG(value) FROM agg_test;
+----
+35
+
+# MIN and MAX
+query I
+SELECT MIN(value) FROM agg_test;
+----
+10
+
+query I
+SELECT MAX(value) FROM agg_test;
+----
+60
+
+query T
+SELECT MIN(category) FROM agg_test;
+----
+A
+
+query T
+SELECT MAX(category) FROM agg_test;
+----
+C
+
+# GROUP BY
+query TI
+SELECT category, COUNT(*) FROM agg_test GROUP BY category ORDER BY category;
+----
+A
+2
+B
+3
+C
+1
+
+query TI
+SELECT category, SUM(value) FROM agg_test GROUP BY category ORDER BY category;
+----
+A
+30
+B
+120
+C
+60
+
+query TI
+SELECT category, AVG(value) FROM agg_test GROUP BY category ORDER BY category;
+----
+A
+15
+B
+40
+C
+60
+
+# Multiple aggregates
+query III
+SELECT COUNT(*), MIN(value), MAX(value) FROM agg_test;
+----
+6
+10
+60
+
+# GROUP BY with HAVING
+query TI
+SELECT category, SUM(value) FROM agg_test GROUP BY category HAVING SUM(value) > 50 ORDER BY category;
+----
+B
+120
+C
+60
+
+query TI
+SELECT category, COUNT(*) FROM agg_test GROUP BY category HAVING COUNT(*) > 1 ORDER BY category;
+----
+A
+2
+B
+3
+
+# COUNT DISTINCT
+query I
+SELECT COUNT(DISTINCT category) FROM agg_test;
+----
+3
+
+# DISTINCT in aggregates
+statement ok
+CREATE TABLE dup_test (val INTEGER);
+
+statement ok
+INSERT INTO dup_test VALUES (1), (2), (2), (3), (3), (3);
+
+# Total sum without DISTINCT
+query I
+SELECT SUM(val) FROM dup_test;
+----
+14
+
+# COUNT DISTINCT on a column
+query I
+SELECT COUNT(DISTINCT val) FROM dup_test;
+----
+3
+
+# Aggregate with expressions
+query I
+SELECT SUM(value * 2) FROM agg_test;
+----
+420
+
+query I
+SELECT AVG(value + 10) FROM agg_test;
+----
+45
+
+# Empty result aggregates
+query I
+SELECT COUNT(*) FROM agg_test WHERE 1 = 0;
+----
+0
+
+query I
+SELECT SUM(value) FROM agg_test WHERE 1 = 0;
+----
+NULL
+
+# STRING_AGG / GROUP_CONCAT
+query T
+SELECT STRING_AGG(category, ',') FROM agg_test WHERE category IN ('A', 'B') ORDER BY id;
+----
+A,A,B,B,B
+
+# STRING_AGG with ORDER BY
+query T
+SELECT STRING_AGG(category, '-' ORDER BY id DESC) FROM agg_test;
+----
+C-B-B-B-A-A
+
+# FIRST and LAST (value functions)
+query I
+SELECT FIRST(value) FROM agg_test;
+----
+10
+
+query I
+SELECT LAST(value) FROM agg_test;
+----
+60
+
+# BOOL_AND and BOOL_OR
+statement ok
+CREATE TABLE bool_test (flag BOOLEAN);
+
+statement ok
+INSERT INTO bool_test VALUES (TRUE), (TRUE), (TRUE);
+
+query I
+SELECT BOOL_AND(flag) FROM bool_test;
+----
+1
+
+query I
+SELECT BOOL_OR(flag) FROM bool_test;
+----
+1
+
+statement ok
+INSERT INTO bool_test VALUES (FALSE);
+
+query I
+SELECT BOOL_AND(flag) FROM bool_test;
+----
+0
+
+query I
+SELECT BOOL_OR(flag) FROM bool_test;
+----
+1
+
+# BIT_AND, BIT_OR, BIT_XOR
+statement ok
+CREATE TABLE bit_test (val INTEGER);
+
+statement ok
+INSERT INTO bit_test VALUES (7), (3), (5);
+
+query I
+SELECT BIT_AND(val) FROM bit_test;
+----
+1
+
+query I
+SELECT BIT_OR(val) FROM bit_test;
+----
+7
+
+query I
+SELECT BIT_XOR(val) FROM bit_test;
+----
+1
+
+# Aggregate with CASE expression (simulating FILTER)
+query I
+SELECT SUM(CASE WHEN category = 'A' THEN value ELSE 0 END) FROM agg_test;
+----
+30
+
+# Complex GROUP BY with alias
+query TII
+SELECT category, COUNT(*) as cnt, AVG(price) FROM agg_test GROUP BY category ORDER BY category;
+----
+A
+2
+2
+B
+3
+4.5
+C
+1
+6.5
+
+# Aggregate over subquery
+query I
+SELECT SUM(total) FROM (SELECT SUM(value) as total FROM agg_test GROUP BY category) sub;
+----
+210
+
+# Aggregate returning NULL
+query I
+SELECT SUM(value) FROM agg_test WHERE category = 'Z';
+----
+NULL
