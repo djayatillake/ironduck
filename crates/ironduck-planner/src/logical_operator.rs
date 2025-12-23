@@ -346,6 +346,11 @@ pub enum Expression {
         expr: Box<Expression>,
         target_type: LogicalType,
     },
+    /// TRY_CAST expression (returns NULL on error)
+    TryCast {
+        expr: Box<Expression>,
+        target_type: LogicalType,
+    },
     /// IS NULL
     IsNull(Box<Expression>),
     /// IS NOT NULL

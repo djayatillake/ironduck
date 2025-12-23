@@ -37,6 +37,7 @@ impl BoundExpression {
             BoundExpressionKind::UnaryOp { op, .. } => format!("{:?}", op),
             BoundExpressionKind::Function { name, .. } => name.clone(),
             BoundExpressionKind::Cast { .. } => "CAST".to_string(),
+            BoundExpressionKind::TryCast { .. } => "TRY_CAST".to_string(),
             BoundExpressionKind::Case { .. } => "CASE".to_string(),
             BoundExpressionKind::IsNull { .. } => "IS NULL".to_string(),
             BoundExpressionKind::IsNotNull { .. } => "IS NOT NULL".to_string(),
@@ -103,6 +104,12 @@ pub enum BoundExpressionKind {
 
     /// Type cast
     Cast {
+        expr: Box<BoundExpression>,
+        target_type: LogicalType,
+    },
+
+    /// TRY_CAST (returns NULL on error)
+    TryCast {
         expr: Box<BoundExpression>,
         target_type: LogicalType,
     },

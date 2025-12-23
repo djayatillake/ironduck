@@ -190,18 +190,23 @@ pub fn bind_expression(
             ))
         }
 
-        // Cast
-        sql::Expr::Cast { expr, data_type, .. } => {
+        // Cast (CAST and TRY_CAST)
+        sql::Expr::Cast { expr, data_type, kind, .. } => {
             let bound_expr = bind_expression(_binder, expr, ctx)?;
             let target_type = bind_data_type(data_type)?;
 
-            Ok(BoundExpression::new(
-                BoundExpressionKind::Cast {
+            let kind = match kind {
+                sql::CastKind::TryCast => BoundExpressionKind::TryCast {
                     expr: Box::new(bound_expr),
                     target_type: target_type.clone(),
                 },
-                target_type,
-            ))
+                _ => BoundExpressionKind::Cast {
+                    expr: Box::new(bound_expr),
+                    target_type: target_type.clone(),
+                },
+            };
+
+            Ok(BoundExpression::new(kind, target_type))
         }
 
         // Wildcard

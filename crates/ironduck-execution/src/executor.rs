@@ -1874,7 +1874,7 @@ fn contains_subquery(expr: &Expression) -> bool {
         Expression::BinaryOp { left, right, .. } => contains_subquery(left) || contains_subquery(right),
         Expression::UnaryOp { expr, .. } => contains_subquery(expr),
         Expression::Function { args, .. } => args.iter().any(contains_subquery),
-        Expression::Cast { expr, .. } => contains_subquery(expr),
+        Expression::Cast { expr, .. } | Expression::TryCast { expr, .. } => contains_subquery(expr),
         Expression::IsNull(expr) | Expression::IsNotNull(expr) => contains_subquery(expr),
         Expression::Case { operand, conditions, results, else_result } => {
             operand.as_ref().map_or(false, |e| contains_subquery(e))
@@ -1894,7 +1894,7 @@ fn contains_rowid(expr: &Expression) -> bool {
         Expression::BinaryOp { left, right, .. } => contains_rowid(left) || contains_rowid(right),
         Expression::UnaryOp { expr, .. } => contains_rowid(expr),
         Expression::Function { args, .. } => args.iter().any(contains_rowid),
-        Expression::Cast { expr, .. } => contains_rowid(expr),
+        Expression::Cast { expr, .. } | Expression::TryCast { expr, .. } => contains_rowid(expr),
         Expression::IsNull(expr) | Expression::IsNotNull(expr) => contains_rowid(expr),
         Expression::Case { operand, conditions, results, else_result } => {
             operand.as_ref().map_or(false, |e| contains_rowid(e))
@@ -1918,7 +1918,7 @@ fn is_constant(expr: &Expression) -> bool {
         Expression::BinaryOp { left, right, .. } => is_constant(left) && is_constant(right),
         Expression::UnaryOp { expr, .. } => is_constant(expr),
         Expression::Function { args, .. } => args.iter().all(is_constant),
-        Expression::Cast { expr, .. } => is_constant(expr),
+        Expression::Cast { expr, .. } | Expression::TryCast { expr, .. } => is_constant(expr),
         Expression::IsNull(expr) | Expression::IsNotNull(expr) => is_constant(expr),
         Expression::Case {
             operand,

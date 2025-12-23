@@ -1,0 +1,64 @@
+# Date/Interval arithmetic tests
+
+# Date + Interval (days)
+query T
+SELECT DATE '2023-01-15' + INTERVAL '1' DAY;
+----
+2023-01-16
+
+query T
+SELECT DATE '2023-01-15' + INTERVAL '10' DAY;
+----
+2023-01-25
+
+# Date + Interval (months)
+query T
+SELECT DATE '2023-01-15' + INTERVAL '1' MONTH;
+----
+2023-02-15
+
+query T
+SELECT DATE '2023-11-15' + INTERVAL '2' MONTH;
+----
+2024-01-15
+
+# Date - Interval
+query T
+SELECT DATE '2023-01-15' - INTERVAL '5' DAY;
+----
+2023-01-10
+
+query T
+SELECT DATE '2023-01-15' - INTERVAL '1' MONTH;
+----
+2022-12-15
+
+# Date - Date (returns number of days)
+query I
+SELECT DATE '2023-01-15' - DATE '2023-01-10';
+----
+5
+
+query I
+SELECT DATE '2023-01-10' - DATE '2023-01-15';
+----
+-5
+
+# Timestamp + Interval (hours)
+query T
+SELECT TIMESTAMP '2023-01-15 12:00:00' + INTERVAL '2' HOUR;
+----
+2023-01-15 14:00:00
+
+# Timestamp + Interval (minutes)
+query T
+SELECT TIMESTAMP '2023-01-15 12:00:00' + INTERVAL '30' MINUTE;
+----
+2023-01-15 12:30:00
+
+# Timestamp - Interval
+query T
+SELECT TIMESTAMP '2023-01-15 12:00:00' - INTERVAL '2' HOUR;
+----
+2023-01-15 10:00:00
+

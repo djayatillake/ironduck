@@ -133,6 +133,15 @@ pub fn evaluate_with_ctx(expr: &Expression, row: &[Value], ctx: &EvalContext) ->
             cast_value(&val, target_type)
         }
 
+        Expression::TryCast { expr, target_type } => {
+            let val = evaluate_with_ctx(expr, row, ctx)?;
+            // TRY_CAST returns NULL on error instead of failing
+            match cast_value(&val, target_type) {
+                Ok(v) => Ok(v),
+                Err(_) => Ok(Value::Null),
+            }
+        }
+
         Expression::IsNull(expr) => {
             let val = evaluate_with_ctx(expr, row, ctx)?;
             Ok(Value::Boolean(val.is_null()))
@@ -240,8 +249,104 @@ fn evaluate_binary_op(left: &Value, op: BinaryOperator, right: &Value) -> Result
 
     match op {
         // Arithmetic operations
-        BinaryOperator::Add => arithmetic_op(left, right, |a, b| a + b, |a, b| a + b),
-        BinaryOperator::Subtract => arithmetic_op(left, right, |a, b| a - b, |a, b| a - b),
+        BinaryOperator::Add => {
+            // Handle date/timestamp + interval
+            match (left, right) {
+                (Value::Date(d), Value::Interval(i)) | (Value::Interval(i), Value::Date(d)) => {
+                    use chrono::Months;
+                    let mut result = *d;
+                    if i.months != 0 {
+                        result = result.checked_add_months(Months::new(i.months.unsigned_abs()))
+                            .unwrap_or(result);
+                        if i.months < 0 {
+                            result = result.checked_sub_months(Months::new((i.months.abs() * 2) as u32))
+                                .unwrap_or(result);
+                        }
+                    }
+                    if i.days != 0 {
+                        result = result + chrono::Duration::days(i.days as i64);
+                    }
+                    Ok(Value::Date(result))
+                }
+                (Value::Timestamp(ts), Value::Interval(i)) | (Value::Interval(i), Value::Timestamp(ts)) => {
+                    use chrono::Months;
+                    let mut result = *ts;
+                    if i.months != 0 {
+                        let new_date = result.date().checked_add_months(Months::new(i.months.unsigned_abs()))
+                            .unwrap_or(result.date());
+                        result = new_date.and_time(result.time());
+                        if i.months < 0 {
+                            let new_date = result.date().checked_sub_months(Months::new((i.months.abs() * 2) as u32))
+                                .unwrap_or(result.date());
+                            result = new_date.and_time(result.time());
+                        }
+                    }
+                    if i.days != 0 {
+                        result = result + chrono::Duration::days(i.days as i64);
+                    }
+                    if i.micros != 0 {
+                        result = result + chrono::Duration::microseconds(i.micros);
+                    }
+                    Ok(Value::Timestamp(result))
+                }
+                _ => arithmetic_op(left, right, |a, b| a + b, |a, b| a + b),
+            }
+        }
+        BinaryOperator::Subtract => {
+            // Handle date/timestamp - interval
+            match (left, right) {
+                (Value::Date(d), Value::Interval(i)) => {
+                    use chrono::Months;
+                    let mut result = *d;
+                    if i.months != 0 {
+                        if i.months > 0 {
+                            result = result.checked_sub_months(Months::new(i.months as u32))
+                                .unwrap_or(result);
+                        } else {
+                            result = result.checked_add_months(Months::new(i.months.unsigned_abs()))
+                                .unwrap_or(result);
+                        }
+                    }
+                    if i.days != 0 {
+                        result = result - chrono::Duration::days(i.days as i64);
+                    }
+                    Ok(Value::Date(result))
+                }
+                (Value::Timestamp(ts), Value::Interval(i)) => {
+                    use chrono::Months;
+                    let mut result = *ts;
+                    if i.months != 0 {
+                        if i.months > 0 {
+                            let new_date = result.date().checked_sub_months(Months::new(i.months as u32))
+                                .unwrap_or(result.date());
+                            result = new_date.and_time(result.time());
+                        } else {
+                            let new_date = result.date().checked_add_months(Months::new(i.months.unsigned_abs()))
+                                .unwrap_or(result.date());
+                            result = new_date.and_time(result.time());
+                        }
+                    }
+                    if i.days != 0 {
+                        result = result - chrono::Duration::days(i.days as i64);
+                    }
+                    if i.micros != 0 {
+                        result = result - chrono::Duration::microseconds(i.micros);
+                    }
+                    Ok(Value::Timestamp(result))
+                }
+                (Value::Date(d1), Value::Date(d2)) => {
+                    // Date - Date = number of days
+                    let days = (*d1 - *d2).num_days();
+                    Ok(Value::BigInt(days))
+                }
+                (Value::Timestamp(t1), Value::Timestamp(t2)) => {
+                    // Timestamp - Timestamp = interval in microseconds
+                    let micros = (*t1 - *t2).num_microseconds().unwrap_or(0);
+                    Ok(Value::Interval(ironduck_common::value::Interval::new(0, 0, micros)))
+                }
+                _ => arithmetic_op(left, right, |a, b| a - b, |a, b| a - b),
+            }
+        }
         BinaryOperator::Multiply => arithmetic_op(left, right, |a, b| a * b, |a, b| a * b),
         BinaryOperator::Divide => {
             // Division by zero returns NULL in SQL (DuckDB behavior)
@@ -2391,35 +2496,74 @@ fn evaluate_function(name: &str, args: &[Value]) -> Result<Value> {
             let part = args.first().and_then(|v| v.as_str()).unwrap_or("").to_uppercase();
             let ts = args.get(1).unwrap_or(&Value::Null);
 
-            let dt = match ts {
-                Value::Timestamp(dt) => *dt,
-                Value::Null => return Ok(Value::Null),
-                _ => return Err(Error::TypeMismatch {
-                    expected: "timestamp".to_string(),
+            match ts {
+                Value::Timestamp(dt) => {
+                    let truncated = match part.as_str() {
+                        "SECOND" => NaiveDateTime::new(
+                            dt.date(),
+                            NaiveTime::from_hms_opt(dt.hour(), dt.minute(), dt.second()).unwrap(),
+                        ),
+                        "MINUTE" => NaiveDateTime::new(
+                            dt.date(),
+                            NaiveTime::from_hms_opt(dt.hour(), dt.minute(), 0).unwrap(),
+                        ),
+                        "HOUR" => NaiveDateTime::new(
+                            dt.date(),
+                            NaiveTime::from_hms_opt(dt.hour(), 0, 0).unwrap(),
+                        ),
+                        "DAY" => NaiveDateTime::new(
+                            dt.date(),
+                            NaiveTime::from_hms_opt(0, 0, 0).unwrap(),
+                        ),
+                        "WEEK" => {
+                            // Truncate to start of week (Monday)
+                            let weekday = dt.weekday().num_days_from_monday();
+                            let start_of_week = dt.date() - chrono::Duration::days(weekday as i64);
+                            NaiveDateTime::new(start_of_week, NaiveTime::from_hms_opt(0, 0, 0).unwrap())
+                        }
+                        "MONTH" => NaiveDateTime::new(
+                            NaiveDate::from_ymd_opt(dt.year(), dt.month(), 1).unwrap(),
+                            NaiveTime::from_hms_opt(0, 0, 0).unwrap(),
+                        ),
+                        "QUARTER" => {
+                            let quarter_month = ((dt.month() - 1) / 3) * 3 + 1;
+                            NaiveDateTime::new(
+                                NaiveDate::from_ymd_opt(dt.year(), quarter_month, 1).unwrap(),
+                                NaiveTime::from_hms_opt(0, 0, 0).unwrap(),
+                            )
+                        }
+                        "YEAR" => NaiveDateTime::new(
+                            NaiveDate::from_ymd_opt(dt.year(), 1, 1).unwrap(),
+                            NaiveTime::from_hms_opt(0, 0, 0).unwrap(),
+                        ),
+                        _ => return Err(Error::NotImplemented(format!("DATE_TRUNC field: {}", part))),
+                    };
+                    Ok(Value::Timestamp(truncated))
+                }
+                Value::Date(d) => {
+                    let truncated = match part.as_str() {
+                        "DAY" => *d,
+                        "WEEK" => {
+                            // Truncate to start of week (Monday)
+                            let weekday = d.weekday().num_days_from_monday();
+                            *d - chrono::Duration::days(weekday as i64)
+                        }
+                        "MONTH" => NaiveDate::from_ymd_opt(d.year(), d.month(), 1).unwrap(),
+                        "QUARTER" => {
+                            let quarter_month = ((d.month() - 1) / 3) * 3 + 1;
+                            NaiveDate::from_ymd_opt(d.year(), quarter_month, 1).unwrap()
+                        }
+                        "YEAR" => NaiveDate::from_ymd_opt(d.year(), 1, 1).unwrap(),
+                        _ => return Err(Error::NotImplemented(format!("DATE_TRUNC field: {}", part))),
+                    };
+                    Ok(Value::Date(truncated))
+                }
+                Value::Null => Ok(Value::Null),
+                _ => Err(Error::TypeMismatch {
+                    expected: "timestamp or date".to_string(),
                     got: format!("{:?}", ts),
                 }),
-            };
-
-            let truncated = match part.as_str() {
-                "SECOND" => NaiveDateTime::new(
-                    dt.date(),
-                    NaiveTime::from_hms_opt(dt.hour(), dt.minute(), dt.second()).unwrap(),
-                ),
-                "MINUTE" => NaiveDateTime::new(
-                    dt.date(),
-                    NaiveTime::from_hms_opt(dt.hour(), dt.minute(), 0).unwrap(),
-                ),
-                "HOUR" => NaiveDateTime::new(
-                    dt.date(),
-                    NaiveTime::from_hms_opt(dt.hour(), 0, 0).unwrap(),
-                ),
-                "DAY" => NaiveDateTime::new(
-                    dt.date(),
-                    NaiveTime::from_hms_opt(0, 0, 0).unwrap(),
-                ),
-                _ => return Err(Error::NotImplemented(format!("DATE_TRUNC field: {}", part))),
-            };
-            Ok(Value::Timestamp(truncated))
+            }
         }
         "YEAR" => {
             use chrono::Datelike;

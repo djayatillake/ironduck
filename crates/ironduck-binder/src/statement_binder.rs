@@ -2555,7 +2555,7 @@ fn expression_contains_aggregate(expr: &BoundExpression) -> bool {
             expression_contains_aggregate(left) || expression_contains_aggregate(right)
         }
         BoundExpressionKind::UnaryOp { expr, .. } => expression_contains_aggregate(expr),
-        BoundExpressionKind::Cast { expr, .. } => expression_contains_aggregate(expr),
+        BoundExpressionKind::Cast { expr, .. } | BoundExpressionKind::TryCast { expr, .. } => expression_contains_aggregate(expr),
         BoundExpressionKind::Case { operand, when_clauses, else_result } => {
             operand.as_ref().map_or(false, |e| expression_contains_aggregate(e))
                 || when_clauses.iter().any(|(c, r)| {

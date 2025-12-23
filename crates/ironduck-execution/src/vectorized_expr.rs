@@ -74,6 +74,12 @@ pub fn evaluate_vectorized(expr: &Expression, chunk: &DataChunk) -> Result<Vecto
             cast_vector(&vec, target_type, chunk.row_count())
         }
 
+        Expression::TryCast { expr, target_type } => {
+            let vec = evaluate_vectorized(expr, chunk)?;
+            // TRY_CAST returns NULL on error
+            try_cast_vector(&vec, target_type, chunk.row_count())
+        }
+
         Expression::Case {
             operand,
             conditions,
@@ -364,6 +370,20 @@ fn cast_vector(vec: &Vector, target_type: &LogicalType, count: usize) -> Result<
 
     for i in 0..count {
         let v = vec.get_value(i);
+        let casted = cast_value(v, target_type);
+        values.push(casted);
+    }
+
+    Ok(Vector::from_values(&values, target_type.clone()))
+}
+
+/// TRY_CAST a vector to a target type (returns NULL on error)
+fn try_cast_vector(vec: &Vector, target_type: &LogicalType, count: usize) -> Result<Vector> {
+    let mut values = Vec::with_capacity(count);
+
+    for i in 0..count {
+        let v = vec.get_value(i);
+        // TRY_CAST returns NULL if conversion fails
         let casted = cast_value(v, target_type);
         values.push(casted);
     }

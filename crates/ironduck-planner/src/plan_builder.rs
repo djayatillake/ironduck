@@ -828,6 +828,11 @@ fn convert_expression(expr: &BoundExpression) -> super::Expression {
             target_type: target_type.clone(),
         },
 
+        BoundExpressionKind::TryCast { expr, target_type } => super::Expression::TryCast {
+            expr: Box::new(convert_expression(expr)),
+            target_type: target_type.clone(),
+        },
+
         BoundExpressionKind::IsNull(expr) => super::Expression::IsNull(Box::new(convert_expression(expr))),
 
         BoundExpressionKind::IsNotNull(expr) => {
@@ -966,7 +971,7 @@ fn has_aggregate(expr: &BoundExpression) -> bool {
             has_aggregate(left) || has_aggregate(right)
         }
         BoundExpressionKind::UnaryOp { expr, .. } => has_aggregate(expr),
-        BoundExpressionKind::Cast { expr, .. } => has_aggregate(expr),
+        BoundExpressionKind::Cast { expr, .. } | BoundExpressionKind::TryCast { expr, .. } => has_aggregate(expr),
         BoundExpressionKind::Case {
             operand,
             when_clauses,
@@ -995,6 +1000,14 @@ fn wrap_aggregate_reference(bound_expr: &BoundExpression, agg_ref: super::Expres
         BoundExpressionKind::Cast { expr, target_type } => {
             let inner = wrap_aggregate_reference(expr, agg_ref);
             super::Expression::Cast {
+                expr: Box::new(inner),
+                target_type: target_type.clone(),
+            }
+        }
+        // If this is a TryCast wrapping something containing an aggregate, recurse and wrap with TryCast
+        BoundExpressionKind::TryCast { expr, target_type } => {
+            let inner = wrap_aggregate_reference(expr, agg_ref);
+            super::Expression::TryCast {
                 expr: Box::new(inner),
                 target_type: target_type.clone(),
             }
@@ -1085,8 +1098,8 @@ fn expressions_equal(a: &super::Expression, b: &super::Expression) -> bool {
 /// Extract aggregate expression
 fn extract_aggregate(expr: &BoundExpression) -> Option<super::AggregateExpression> {
     match &expr.expr {
-        // Handle Cast expressions - look inside them for aggregates
-        BoundExpressionKind::Cast { expr, .. } => extract_aggregate(expr),
+        // Handle Cast/TryCast expressions - look inside them for aggregates
+        BoundExpressionKind::Cast { expr, .. } | BoundExpressionKind::TryCast { expr, .. } => extract_aggregate(expr),
         // Handle BinaryOp - check both sides for aggregates
         BoundExpressionKind::BinaryOp { left, right, .. } => {
             extract_aggregate(left).or_else(|| extract_aggregate(right))
@@ -1221,7 +1234,7 @@ fn has_window_function(expr: &BoundExpression) -> bool {
             has_window_function(left) || has_window_function(right)
         }
         BoundExpressionKind::UnaryOp { expr, .. } => has_window_function(expr),
-        BoundExpressionKind::Cast { expr, .. } => has_window_function(expr),
+        BoundExpressionKind::Cast { expr, .. } | BoundExpressionKind::TryCast { expr, .. } => has_window_function(expr),
         BoundExpressionKind::Case { operand, when_clauses, else_result } => {
             operand.as_ref().map_or(false, |e| has_window_function(e))
                 || when_clauses.iter().any(|(c, r)| has_window_function(c) || has_window_function(r))
