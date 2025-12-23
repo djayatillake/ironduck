@@ -1,0 +1,113 @@
+# Correlated subquery tests
+
+statement ok
+CREATE TABLE employees_cs (id INTEGER, name TEXT, salary INTEGER, dept_id INTEGER);
+
+statement ok
+INSERT INTO employees_cs VALUES (1, 'Alice', 100, 1), (2, 'Bob', 80, 1), (3, 'Charlie', 90, 2), (4, 'Diana', 70, 2);
+
+statement ok
+CREATE TABLE departments (id INTEGER, name TEXT);
+
+statement ok
+INSERT INTO departments VALUES (1, 'Engineering'), (2, 'Sales');
+
+# Simple correlated subquery - employees earning above their department average
+query IT
+SELECT e.id, e.name FROM employees_cs e WHERE e.salary > (SELECT AVG(e2.salary) FROM employees_cs e2 WHERE e2.dept_id = e.dept_id) ORDER BY e.id;
+----
+1
+Alice
+3
+Charlie
+
+# Correlated subquery with COUNT
+query IT
+SELECT e.id, e.name FROM employees_cs e WHERE (SELECT COUNT(*) FROM employees_cs e2 WHERE e2.dept_id = e.dept_id) > 1 ORDER BY e.id;
+----
+1
+Alice
+2
+Bob
+3
+Charlie
+4
+Diana
+
+# Correlated subquery with MAX
+query IT
+SELECT e.id, e.name FROM employees_cs e WHERE e.salary = (SELECT MAX(e2.salary) FROM employees_cs e2 WHERE e2.dept_id = e.dept_id) ORDER BY e.id;
+----
+1
+Alice
+3
+Charlie
+
+# Correlated subquery with MIN
+query IT
+SELECT e.id, e.name FROM employees_cs e WHERE e.salary = (SELECT MIN(e2.salary) FROM employees_cs e2 WHERE e2.dept_id = e.dept_id) ORDER BY e.id;
+----
+2
+Bob
+4
+Diana
+
+# Correlated subquery in SELECT list
+query ITI
+SELECT e.id, e.name, (SELECT COUNT(*) FROM employees_cs e2 WHERE e2.dept_id = e.dept_id) as dept_count FROM employees_cs e ORDER BY e.id;
+----
+1
+Alice
+2
+2
+Bob
+2
+3
+Charlie
+2
+4
+Diana
+2
+
+# Correlated EXISTS subquery
+query IT
+SELECT d.id, d.name FROM departments d WHERE EXISTS (SELECT 1 FROM employees_cs e WHERE e.dept_id = d.id AND e.salary > 85) ORDER BY d.id;
+----
+1
+Engineering
+2
+Sales
+
+# Correlated NOT EXISTS subquery
+query IT
+SELECT d.id, d.name FROM departments d WHERE NOT EXISTS (SELECT 1 FROM employees_cs e WHERE e.dept_id = d.id AND e.salary < 75) ORDER BY d.id;
+----
+1
+Engineering
+
+# Correlated IN subquery
+query IT
+SELECT e.id, e.name FROM employees_cs e WHERE e.dept_id IN (SELECT d.id FROM departments d WHERE d.name = 'Engineering') ORDER BY e.id;
+----
+1
+Alice
+2
+Bob
+
+# Multiple correlated references
+query ITI
+SELECT e.id, e.name, (SELECT SUM(e2.salary) FROM employees_cs e2 WHERE e2.dept_id = e.dept_id AND e2.id != e.id) as others_salary FROM employees_cs e ORDER BY e.id;
+----
+1
+Alice
+80
+2
+Bob
+100
+3
+Charlie
+70
+4
+Diana
+90
+

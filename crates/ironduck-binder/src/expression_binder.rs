@@ -10,19 +10,25 @@ pub struct ExpressionBinderContext<'a> {
     pub tables: &'a [BoundTableRef],
     /// Named window definitions from WINDOW clause
     pub named_windows: &'a [sql::NamedWindowDefinition],
+    /// Outer query tables for correlated subqueries
+    pub outer_tables: &'a [BoundTableRef],
 }
 
 impl<'a> ExpressionBinderContext<'a> {
     pub fn empty() -> Self {
-        ExpressionBinderContext { tables: &[], named_windows: &[] }
+        ExpressionBinderContext { tables: &[], named_windows: &[], outer_tables: &[] }
     }
 
     pub fn new(tables: &'a [BoundTableRef]) -> Self {
-        ExpressionBinderContext { tables, named_windows: &[] }
+        ExpressionBinderContext { tables, named_windows: &[], outer_tables: &[] }
     }
 
     pub fn with_named_windows(tables: &'a [BoundTableRef], named_windows: &'a [sql::NamedWindowDefinition]) -> Self {
-        ExpressionBinderContext { tables, named_windows }
+        ExpressionBinderContext { tables, named_windows, outer_tables: &[] }
+    }
+
+    pub fn with_outer_tables(tables: &'a [BoundTableRef], outer_tables: &'a [BoundTableRef]) -> Self {
+        ExpressionBinderContext { tables, named_windows: &[], outer_tables }
     }
 }
 
@@ -207,7 +213,12 @@ pub fn bind_expression(
         // IN subquery: expr IN (SELECT ...)
         sql::Expr::InSubquery { expr, subquery, negated } => {
             let bound_expr = bind_expression(_binder, expr, ctx)?;
-            let bound_subquery = super::statement_binder::bind_subquery(_binder, subquery)?;
+            // Pass outer tables for correlated subquery support
+            let bound_subquery = if !ctx.tables.is_empty() {
+                super::statement_binder::bind_subquery_with_outer(_binder, subquery, ctx.tables)?
+            } else {
+                super::statement_binder::bind_subquery(_binder, subquery)?
+            };
 
             Ok(BoundExpression::new(
                 BoundExpressionKind::InSubquery {
@@ -221,7 +232,12 @@ pub fn bind_expression(
 
         // EXISTS subquery
         sql::Expr::Exists { subquery, negated } => {
-            let bound_subquery = super::statement_binder::bind_subquery(_binder, subquery)?;
+            // Pass outer tables for correlated subquery support
+            let bound_subquery = if !ctx.tables.is_empty() {
+                super::statement_binder::bind_subquery_with_outer(_binder, subquery, ctx.tables)?
+            } else {
+                super::statement_binder::bind_subquery(_binder, subquery)?
+            };
 
             Ok(BoundExpression::new(
                 BoundExpressionKind::Exists {
@@ -234,7 +250,12 @@ pub fn bind_expression(
 
         // Scalar subquery
         sql::Expr::Subquery(subquery) => {
-            let bound_subquery = super::statement_binder::bind_subquery(_binder, subquery)?;
+            // Pass outer tables for correlated subquery support
+            let bound_subquery = if !ctx.tables.is_empty() {
+                super::statement_binder::bind_subquery_with_outer(_binder, subquery, ctx.tables)?
+            } else {
+                super::statement_binder::bind_subquery(_binder, subquery)?
+            };
 
             // Return type is the type of the first column
             let return_type = bound_subquery
@@ -603,49 +624,77 @@ fn bind_column_ref(idents: &[sql::Ident], ctx: &ExpressionBinderContext) -> Resu
         None
     };
 
-    // If no tables, this is an error (unless it's a constant expression context)
-    if ctx.tables.is_empty() {
+    // If no tables and no outer tables, this is an error
+    if ctx.tables.is_empty() && ctx.outer_tables.is_empty() {
         return Err(Error::ColumnNotFound(column_name));
     }
 
-    // Collect all base tables from the context (flatten joins)
-    let base_tables = collect_base_tables(ctx.tables);
+    // First, try to find the column in the inner tables
+    if !ctx.tables.is_empty() {
+        // Collect all base tables from the context (flatten joins)
+        let base_tables = collect_base_tables(ctx.tables);
 
-    // Track column offset for multi-table joins
-    let mut col_offset = 0;
+        // Track column offset for multi-table joins
+        let mut col_offset = 0;
 
-    // Search for the column in available tables
-    for (table_idx, (name, alias, column_names, column_types)) in base_tables.iter().enumerate() {
-        // Check if this table matches the qualifier (if any)
-        let table_matches = match &table_qualifier {
-            Some(qualifier) => {
-                // Match against alias first, then table name
-                alias.as_ref().map(|a| a.eq_ignore_ascii_case(qualifier)).unwrap_or(false)
-                    || name.eq_ignore_ascii_case(qualifier)
+        // Search for the column in available tables
+        for (table_idx, (name, alias, column_names, column_types)) in base_tables.iter().enumerate() {
+            // Check if this table matches the qualifier (if any)
+            let table_matches = match &table_qualifier {
+                Some(qualifier) => {
+                    // Match against alias first, then table name
+                    alias.as_ref().map(|a| a.eq_ignore_ascii_case(qualifier)).unwrap_or(false)
+                        || name.eq_ignore_ascii_case(qualifier)
+                }
+                None => true, // No qualifier means search all tables
+            };
+
+            if table_matches {
+                if let Some(col_idx) = column_names.iter().position(|n| n.eq_ignore_ascii_case(&column_name)) {
+                    return Ok(BoundExpression::new(
+                        BoundExpressionKind::ColumnRef {
+                            table_idx,
+                            column_idx: col_offset + col_idx,
+                            name: column_name,
+                        },
+                        column_types[col_idx].clone(),
+                    ));
+                }
             }
-            None => true, // No qualifier means search all tables
-        };
 
-        if table_matches {
-            if let Some(col_idx) = column_names.iter().position(|n| n.eq_ignore_ascii_case(&column_name)) {
-                return Ok(BoundExpression::new(
-                    BoundExpressionKind::ColumnRef {
-                        table_idx,
-                        column_idx: col_offset + col_idx,
-                        name: column_name,
-                    },
-                    column_types[col_idx].clone(),
-                ));
-            }
+            col_offset += column_names.len();
         }
 
-        col_offset += column_names.len();
+        // Check for rowid pseudo-column
+        if column_name.eq_ignore_ascii_case("rowid") {
+            // Find the matching table for rowid
+            for (table_idx, (name, alias, _column_names, _column_types)) in base_tables.iter().enumerate() {
+                let table_matches = match &table_qualifier {
+                    Some(qualifier) => {
+                        alias.as_ref().map(|a| a.eq_ignore_ascii_case(qualifier)).unwrap_or(false)
+                            || name.eq_ignore_ascii_case(qualifier)
+                    }
+                    None => true,
+                };
+
+                if table_matches {
+                    return Ok(BoundExpression::new(
+                        BoundExpressionKind::RowId { table_idx },
+                        LogicalType::BigInt,
+                    ));
+                }
+            }
+        }
     }
 
-    // Check for rowid pseudo-column
-    if column_name.eq_ignore_ascii_case("rowid") {
-        // Find the matching table for rowid
-        for (table_idx, (name, alias, _column_names, _column_types)) in base_tables.iter().enumerate() {
+    // If not found in inner tables, try outer tables (for correlated subqueries)
+    if !ctx.outer_tables.is_empty() {
+        let outer_base_tables = collect_base_tables(ctx.outer_tables);
+
+        // Track column offset for multi-table joins
+        let mut col_offset = 0;
+
+        for (_table_idx, (name, alias, column_names, column_types)) in outer_base_tables.iter().enumerate() {
             let table_matches = match &table_qualifier {
                 Some(qualifier) => {
                     alias.as_ref().map(|a| a.eq_ignore_ascii_case(qualifier)).unwrap_or(false)
@@ -655,11 +704,19 @@ fn bind_column_ref(idents: &[sql::Ident], ctx: &ExpressionBinderContext) -> Resu
             };
 
             if table_matches {
-                return Ok(BoundExpression::new(
-                    BoundExpressionKind::RowId { table_idx },
-                    LogicalType::BigInt,
-                ));
+                if let Some(col_idx) = column_names.iter().position(|n| n.eq_ignore_ascii_case(&column_name)) {
+                    return Ok(BoundExpression::new(
+                        BoundExpressionKind::OuterColumnRef {
+                            depth: 0, // Immediate parent scope
+                            column_idx: col_offset + col_idx,
+                            name: column_name,
+                        },
+                        column_types[col_idx].clone(),
+                    ));
+                }
             }
+
+            col_offset += column_names.len();
         }
     }
 

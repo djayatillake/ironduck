@@ -702,6 +702,16 @@ fn convert_expression(expr: &BoundExpression) -> super::Expression {
             name: name.clone(),
         },
 
+        BoundExpressionKind::OuterColumnRef {
+            depth,
+            column_idx,
+            name,
+        } => super::Expression::OuterColumnRef {
+            depth: *depth,
+            column_index: *column_idx,
+            name: name.clone(),
+        },
+
         BoundExpressionKind::BinaryOp { left, op, right } => {
             let logical_op = match op {
                 ironduck_binder::BoundBinaryOperator::Add => super::BinaryOperator::Add,

@@ -310,6 +310,12 @@ pub enum Expression {
         column_index: usize,
         name: String,
     },
+    /// Outer column reference (for correlated subqueries)
+    OuterColumnRef {
+        depth: usize,
+        column_index: usize,
+        name: String,
+    },
     /// Constant value
     Constant(Value),
     /// Binary operation

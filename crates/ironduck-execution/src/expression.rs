@@ -13,6 +13,8 @@ pub struct EvalContext {
     pub row_indices: Vec<i64>,
     /// Optional catalog reference for functions like NEXTVAL
     catalog: Option<Arc<Catalog>>,
+    /// Outer row for correlated subqueries
+    pub outer_row: Option<Vec<Value>>,
 }
 
 impl std::fmt::Debug for EvalContext {
@@ -20,6 +22,7 @@ impl std::fmt::Debug for EvalContext {
         f.debug_struct("EvalContext")
             .field("row_indices", &self.row_indices)
             .field("has_catalog", &self.catalog.is_some())
+            .field("has_outer_row", &self.outer_row.is_some())
             .finish()
     }
 }
@@ -33,6 +36,7 @@ impl EvalContext {
         Self {
             row_indices: vec![row_idx],
             catalog: None,
+            outer_row: None,
         }
     }
 
@@ -40,7 +44,13 @@ impl EvalContext {
         Self {
             row_indices: Vec::new(),
             catalog: Some(catalog),
+            outer_row: None,
         }
+    }
+
+    pub fn with_outer_row(mut self, outer_row: Vec<Value>) -> Self {
+        self.outer_row = Some(outer_row);
+        self
     }
 
     pub fn catalog(&self) -> Option<&Catalog> {
@@ -62,6 +72,15 @@ pub fn evaluate_with_ctx(expr: &Expression, row: &[Value], ctx: &EvalContext) ->
             row.get(*column_index)
                 .cloned()
                 .ok_or_else(|| Error::Internal(format!("Column index {} out of bounds", column_index)))
+        }
+
+        Expression::OuterColumnRef { column_index, name, .. } => {
+            // Look up value from outer row (for correlated subqueries)
+            ctx.outer_row
+                .as_ref()
+                .and_then(|outer| outer.get(*column_index))
+                .cloned()
+                .ok_or_else(|| Error::Internal(format!("Outer column {} (index {}) not found in context", name, column_index)))
         }
 
         Expression::BinaryOp { left, op, right } => {

@@ -86,6 +86,7 @@ pub fn evaluate_vectorized(expr: &Expression, chunk: &DataChunk) -> Result<Vecto
         Expression::InSubquery { .. } => Err(Error::NotImplemented("Vectorized IN subquery".to_string())),
         Expression::Exists { .. } => Err(Error::NotImplemented("Vectorized EXISTS".to_string())),
         Expression::RowId { .. } => Err(Error::NotImplemented("Vectorized RowId".to_string())),
+        Expression::OuterColumnRef { .. } => Err(Error::NotImplemented("Vectorized OuterColumnRef (correlated subquery)".to_string())),
     }
 }
 

@@ -12,6 +12,7 @@ use std::sync::Arc;
 // Thread-local catalog reference for expression evaluation in functions like compute_aggregate
 thread_local! {
     static CURRENT_CATALOG: RefCell<Option<Arc<Catalog>>> = const { RefCell::new(None) };
+    static OUTER_ROW: RefCell<Option<Vec<Value>>> = const { RefCell::new(None) };
 }
 
 /// Set the catalog for the current thread during execution
@@ -29,13 +30,31 @@ fn current_catalog() -> Option<Arc<Catalog>> {
     CURRENT_CATALOG.with(|c| c.borrow().clone())
 }
 
-/// Evaluate expression using the thread-local catalog if available
+/// Set the outer row for the current thread during correlated subquery execution
+fn with_outer_row<T>(outer_row: Vec<Value>, f: impl FnOnce() -> T) -> T {
+    OUTER_ROW.with(|r| {
+        let old = r.borrow_mut().replace(outer_row);
+        let result = f();
+        *r.borrow_mut() = old;
+        result
+    })
+}
+
+/// Get the current thread's outer row (for correlated subqueries)
+fn current_outer_row() -> Option<Vec<Value>> {
+    OUTER_ROW.with(|r| r.borrow().clone())
+}
+
+/// Evaluate expression using the thread-local catalog and outer row if available
 fn eval_with_catalog(expr: &Expression, row: &[Value]) -> Result<Value> {
+    let mut ctx = EvalContext::new();
     if let Some(catalog) = current_catalog() {
-        evaluate_with_ctx(expr, row, &EvalContext::with_catalog(catalog))
-    } else {
-        evaluate(expr, row)
+        ctx = EvalContext::with_catalog(catalog);
     }
+    if let Some(outer_row) = current_outer_row() {
+        ctx = ctx.with_outer_row(outer_row);
+    }
+    evaluate_with_ctx(expr, row, &ctx)
 }
 
 /// The main query executor
@@ -135,7 +154,8 @@ impl Executor {
                             let ctx = EvalContext::with_row_index(row_idx as i64);
                             evaluate_with_ctx(expr, row, &ctx)?
                         } else {
-                            evaluate(expr, row)?
+                            // Use eval_with_catalog to support outer column references in correlated subqueries
+                            eval_with_catalog(expr, row)?
                         };
                         output_row.push(value);
                     }
@@ -154,7 +174,8 @@ impl Executor {
                         let value = if has_subquery {
                             evaluate_with_subqueries(self, expr, &[])?
                         } else {
-                            evaluate(expr, &[])?
+                            // Use eval_with_catalog to support outer column references in correlated subqueries
+                            eval_with_catalog(expr, &[])?
                         };
                         output_row.push(value);
                     }
@@ -177,7 +198,8 @@ impl Executor {
                         let ctx = EvalContext::with_row_index(row_idx as i64);
                         evaluate_with_ctx(predicate, &row, &ctx)?
                     } else {
-                        evaluate(predicate, &row)?
+                        // Use eval_with_catalog to support outer column references in correlated subqueries
+                        eval_with_catalog(predicate, &row)?
                     };
                     if matches!(result, Value::Boolean(true)) {
                         output_rows.push(row);
@@ -1754,8 +1776,8 @@ fn evaluate_with_subqueries(
                 return Ok(Value::Null);
             }
 
-            // Execute subquery
-            let subquery_rows = executor.execute_operator(subquery)?;
+            // Execute subquery with outer row for correlated subqueries
+            let subquery_rows = with_outer_row(row.to_vec(), || executor.execute_operator(subquery))?;
 
             // Check if value is in subquery results
             let mut found = false;
@@ -1775,8 +1797,8 @@ fn evaluate_with_subqueries(
         }
 
         Expression::Exists { subquery, negated } => {
-            // Execute subquery
-            let subquery_rows = executor.execute_operator(subquery)?;
+            // Execute subquery with outer row for correlated subqueries
+            let subquery_rows = with_outer_row(row.to_vec(), || executor.execute_operator(subquery))?;
 
             let exists = !subquery_rows.is_empty();
             let result = if *negated { !exists } else { exists };
@@ -1784,8 +1806,8 @@ fn evaluate_with_subqueries(
         }
 
         Expression::Subquery(subquery) => {
-            // Execute scalar subquery
-            let subquery_rows = executor.execute_operator(subquery)?;
+            // Execute scalar subquery with outer row for correlated subqueries
+            let subquery_rows = with_outer_row(row.to_vec(), || executor.execute_operator(subquery))?;
 
             // Return the first column of the first row
             if let Some(first_row) = subquery_rows.first() {
@@ -1840,7 +1862,8 @@ fn evaluate_with_subqueries(
         }
 
         // Fall back to regular evaluate for non-subquery expressions
-        _ => evaluate(expr, row),
+        // Use eval_with_catalog to get outer row context for correlated subqueries
+        _ => eval_with_catalog(expr, row),
     }
 }
 
@@ -1890,6 +1913,7 @@ fn is_constant(expr: &Expression) -> bool {
     match expr {
         Expression::Constant(_) => true,
         Expression::ColumnRef { .. } => false,
+        Expression::OuterColumnRef { .. } => false, // Depends on outer row
         Expression::RowId { .. } => false,
         Expression::BinaryOp { left, right, .. } => is_constant(left) && is_constant(right),
         Expression::UnaryOp { expr, .. } => is_constant(expr),

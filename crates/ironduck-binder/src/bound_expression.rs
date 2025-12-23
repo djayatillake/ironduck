@@ -32,6 +32,7 @@ impl BoundExpression {
         match &self.expr {
             BoundExpressionKind::Constant(v) => v.to_string(),
             BoundExpressionKind::ColumnRef { name, .. } => name.clone(),
+            BoundExpressionKind::OuterColumnRef { name, .. } => name.clone(),
             BoundExpressionKind::BinaryOp { op, .. } => format!("{:?}", op),
             BoundExpressionKind::UnaryOp { op, .. } => format!("{:?}", op),
             BoundExpressionKind::Function { name, .. } => name.clone(),
@@ -60,6 +61,15 @@ pub enum BoundExpressionKind {
     /// Column reference
     ColumnRef {
         table_idx: usize,
+        column_idx: usize,
+        name: String,
+    },
+
+    /// Outer column reference (for correlated subqueries)
+    OuterColumnRef {
+        /// Depth level of the outer scope (0 = immediate parent, 1 = grandparent, etc.)
+        depth: usize,
+        /// Column index within the outer row
         column_idx: usize,
         name: String,
     },

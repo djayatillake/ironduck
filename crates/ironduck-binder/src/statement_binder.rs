@@ -480,6 +480,15 @@ pub fn bind_subquery(binder: &Binder, query: &sql::Query) -> Result<BoundSelect>
     bind_query_select(binder, query)
 }
 
+/// Bind a subquery with outer context (for correlated subqueries)
+pub fn bind_subquery_with_outer(
+    binder: &Binder,
+    query: &sql::Query,
+    outer_tables: &[BoundTableRef],
+) -> Result<BoundSelect> {
+    bind_query_select_with_outer(binder, query, outer_tables)
+}
+
 /// Bind a query to a BoundSelect (for non-set-operation queries)
 fn bind_query_select(binder: &Binder, query: &sql::Query) -> Result<BoundSelect> {
     bind_query_select_with_ctes(binder, query, &[])
@@ -503,6 +512,49 @@ fn bind_query_select_with_ctes(
 
     if let Some(order_by) = &query.order_by {
         let ctx = ExpressionBinderContext::new(&result.from);
+        for order in &order_by.exprs {
+            let expr = bind_expression(binder, &order.expr, &ctx)?;
+            result.order_by.push(BoundOrderBy {
+                expr,
+                ascending: order.asc.unwrap_or(true),
+                nulls_first: order.nulls_first.unwrap_or(false),
+            });
+        }
+    }
+
+    if let Some(limit) = &query.limit {
+        if let sql::Expr::Value(sql::Value::Number(n, _)) = limit {
+            result.limit = Some(n.parse().map_err(|_| Error::Parse("Invalid LIMIT".to_string()))?);
+        }
+    }
+
+    if let Some(offset) = &query.offset {
+        if let sql::Expr::Value(sql::Value::Number(n, _)) = &offset.value {
+            result.offset = Some(n.parse().map_err(|_| Error::Parse("Invalid OFFSET".to_string()))?);
+        }
+    }
+
+    Ok(result)
+}
+
+/// Bind a query to a BoundSelect with outer context (for correlated subqueries)
+fn bind_query_select_with_outer(
+    binder: &Binder,
+    query: &sql::Query,
+    outer_tables: &[BoundTableRef],
+) -> Result<BoundSelect> {
+    // Handle the body
+    let select = match query.body.as_ref() {
+        sql::SetExpr::Select(select) => bind_select_with_outer(binder, select, outer_tables)?,
+        sql::SetExpr::Values(values) => bind_values(binder, values)?,
+        _ => return Err(Error::NotImplemented("Complex query body".to_string())),
+    };
+
+    // Apply ORDER BY, LIMIT, OFFSET from the query
+    let mut result = select;
+
+    if let Some(order_by) = &query.order_by {
+        let ctx = ExpressionBinderContext::with_outer_tables(&result.from, outer_tables);
         for order in &order_by.exprs {
             let expr = bind_expression(binder, &order.expr, &ctx)?;
             result.order_by.push(BoundOrderBy {
@@ -687,6 +739,160 @@ fn bind_select_with_ctes(
     }
 
     // Now we can move from into result
+    result.from = from;
+
+    Ok(result)
+}
+
+/// Bind a SELECT clause with outer context (for correlated subqueries)
+fn bind_select_with_outer(
+    binder: &Binder,
+    select: &sql::Select,
+    outer_tables: &[BoundTableRef],
+) -> Result<BoundSelect> {
+    // First, bind FROM clause to know available columns
+    let from = bind_from_with_ctes(binder, &select.from, &[])?;
+
+    // Bind SELECT list with outer context
+    let mut select_list = Vec::new();
+    {
+        // Use outer tables context for expression binding
+        let ctx = ExpressionBinderContext {
+            tables: &from,
+            named_windows: &select.named_window,
+            outer_tables,
+        };
+        for item in &select.projection {
+            match item {
+                sql::SelectItem::UnnamedExpr(expr) => {
+                    let bound = bind_expression(binder, expr, &ctx)?;
+                    select_list.push(bound);
+                }
+                sql::SelectItem::ExprWithAlias { expr, alias } => {
+                    let mut bound = bind_expression(binder, expr, &ctx)?;
+                    bound.alias = Some(alias.value.clone());
+                    select_list.push(bound);
+                }
+                sql::SelectItem::Wildcard(options) => {
+                    // Expand * to all columns from all tables (only inner tables)
+                    let exclude_cols: Vec<String> = match &options.opt_exclude {
+                        Some(sql::ExcludeSelectItem::Single(ident)) => vec![ident.value.clone()],
+                        Some(sql::ExcludeSelectItem::Multiple(idents)) => {
+                            idents.iter().map(|i| i.value.clone()).collect()
+                        }
+                        None => vec![],
+                    };
+
+                    let replace_map: std::collections::HashMap<String, BoundExpression> = match &options.opt_replace {
+                        Some(replace_item) => {
+                            let mut map = std::collections::HashMap::new();
+                            for elem in &replace_item.items {
+                                let bound_expr = bind_expression(binder, &elem.expr, &ctx)?;
+                                map.insert(elem.column_name.value.to_uppercase(), bound_expr);
+                            }
+                            map
+                        }
+                        None => std::collections::HashMap::new(),
+                    };
+
+                    let mut global_col_offset = 0;
+                    for (table_idx, table_ref) in from.iter().enumerate() {
+                        expand_wildcard_with_options(table_ref, table_idx, &mut global_col_offset, &mut select_list, &exclude_cols, &replace_map);
+                    }
+                }
+                sql::SelectItem::QualifiedWildcard(name, options) => {
+                    let table_name = name.0.last()
+                        .map(|i| i.value.clone())
+                        .unwrap_or_default();
+
+                    let exclude_cols: Vec<String> = match &options.opt_exclude {
+                        Some(sql::ExcludeSelectItem::Single(ident)) => vec![ident.value.clone()],
+                        Some(sql::ExcludeSelectItem::Multiple(idents)) => {
+                            idents.iter().map(|i| i.value.clone()).collect()
+                        }
+                        None => vec![],
+                    };
+
+                    let replace_map: std::collections::HashMap<String, BoundExpression> = match &options.opt_replace {
+                        Some(replace_item) => {
+                            let mut map = std::collections::HashMap::new();
+                            for elem in &replace_item.items {
+                                let bound_expr = bind_expression(binder, &elem.expr, &ctx)?;
+                                map.insert(elem.column_name.value.to_uppercase(), bound_expr);
+                            }
+                            map
+                        }
+                        None => std::collections::HashMap::new(),
+                    };
+
+                    let mut found = false;
+                    let mut global_col_offset = 0;
+                    for (table_idx, table_ref) in from.iter().enumerate() {
+                        if expand_qualified_wildcard_with_options(table_ref, &table_name, table_idx, &mut global_col_offset, &mut select_list, &exclude_cols, &replace_map) {
+                            found = true;
+                        }
+                    }
+
+                    if !found {
+                        return Err(Error::TableNotFound(table_name));
+                    }
+                }
+            }
+        }
+    }
+
+    let mut result = BoundSelect::new(select_list);
+
+    // Bind DISTINCT or DISTINCT ON
+    result.distinct = match &select.distinct {
+        None => DistinctKind::None,
+        Some(sql::Distinct::Distinct) => DistinctKind::All,
+        Some(sql::Distinct::On(exprs)) => {
+            let ctx = ExpressionBinderContext::with_outer_tables(&from, outer_tables);
+            let mut bound_exprs = Vec::new();
+            for expr in exprs {
+                bound_exprs.push(bind_expression(binder, expr, &ctx)?);
+            }
+            DistinctKind::On(bound_exprs)
+        }
+    };
+
+    // Bind WHERE, GROUP BY, HAVING with outer context
+    {
+        let ctx = ExpressionBinderContext::with_outer_tables(&from, outer_tables);
+
+        // Bind WHERE clause
+        if let Some(selection) = &select.selection {
+            result.where_clause = Some(bind_expression(binder, selection, &ctx)?);
+        }
+
+        // Bind GROUP BY
+        match &select.group_by {
+            sql::GroupByExpr::All(_) => {
+                for select_expr in &result.select_list {
+                    if !expression_contains_aggregate(select_expr) {
+                        result.group_by.push(select_expr.clone());
+                    }
+                }
+            }
+            sql::GroupByExpr::Expressions(exprs, _) => {
+                for expr in exprs {
+                    result.group_by.push(bind_expression(binder, expr, &ctx)?);
+                }
+            }
+        }
+
+        // Bind HAVING
+        if let Some(having) = &select.having {
+            result.having = Some(bind_expression(binder, having, &ctx)?);
+        }
+
+        // Bind QUALIFY clause
+        if let Some(qualify) = &select.qualify {
+            result.qualify = Some(bind_expression(binder, qualify, &ctx)?);
+        }
+    }
+
     result.from = from;
 
     Ok(result)

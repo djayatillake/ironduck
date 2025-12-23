@@ -17,7 +17,7 @@ IronDuck is a **complete replication of DuckDB written in pure Rust**. The goal 
 
 We validate correctness by running DuckDB's official SQLLogicTest suite against IronDuck.
 
-**Current Status**: 100% (524/524 tests passing)
+**Current Status**: 100% (537/537 tests passing)
 
 #### What are SQLLogicTests?
 
@@ -78,7 +78,7 @@ DuckDB has 400+ built-in functions. Categories include:
 - [x] All aggregate functions with DISTINCT, ORDER BY, FILTER
 - [x] Window functions with PARTITION BY, ORDER BY, frame clauses
 - [x] Common Table Expressions (CTEs), including recursive
-- [ ] Correlated subqueries
+- [x] Correlated subqueries (scalar, EXISTS, IN)
 - [x] All JOIN types (INNER, LEFT, RIGHT, FULL, CROSS, SEMI, ANTI)
 - [x] SET operations (UNION, INTERSECT, EXCEPT) - including nested operations
 - [x] Complex types (LIST, STRUCT, MAP) - partial support
@@ -126,7 +126,6 @@ Features not yet implemented:
 - **Some INTERVAL syntax**: `INTERVAL 7 MINUTES` (use `INTERVAL '7' MINUTE`)
 - **Persistent storage**: Currently in-memory only
 - **Transactions**: BEGIN, COMMIT, ROLLBACK
-- **Correlated subqueries**: Complex correlated subquery patterns
 
 ## Contributing
 
