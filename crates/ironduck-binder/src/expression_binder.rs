@@ -553,28 +553,48 @@ pub fn bind_expression(
             }
         }
 
-        // Array subscript: arr[index]
+        // Array/Struct subscript: arr[index] or struct['field']
         sql::Expr::Subscript { expr, subscript } => {
-            let array_expr = bind_expression(_binder, expr, ctx)?;
+            let base_expr = bind_expression(_binder, expr, ctx)?;
             match subscript.as_ref() {
                 sql::Subscript::Index { index } => {
                     let index_expr = bind_expression(_binder, index, ctx)?;
-                    // Get element type from array type
-                    let element_type = match &array_expr.return_type {
-                        LogicalType::List(inner) => inner.as_ref().clone(),
-                        _ => LogicalType::Unknown,
-                    };
-                    Ok(BoundExpression::new(
-                        BoundExpressionKind::Function {
-                            name: "ARRAY_EXTRACT".to_string(),
-                            args: vec![array_expr, index_expr],
-                            is_aggregate: false,
-                            distinct: false,
-                            order_by: vec![],
-                            filter: None,
-                        },
-                        element_type,
-                    ))
+
+                    // Check if this is a struct access or array access
+                    let is_struct = matches!(&base_expr.return_type, LogicalType::Struct(_));
+                    let is_string_key = matches!(&index_expr.return_type, LogicalType::Varchar);
+
+                    if is_struct || is_string_key {
+                        // Struct field access
+                        Ok(BoundExpression::new(
+                            BoundExpressionKind::Function {
+                                name: "STRUCT_EXTRACT".to_string(),
+                                args: vec![base_expr, index_expr],
+                                is_aggregate: false,
+                                distinct: false,
+                                order_by: vec![],
+                                filter: None,
+                            },
+                            LogicalType::Unknown,
+                        ))
+                    } else {
+                        // Array element access
+                        let element_type = match &base_expr.return_type {
+                            LogicalType::List(inner) => inner.as_ref().clone(),
+                            _ => LogicalType::Unknown,
+                        };
+                        Ok(BoundExpression::new(
+                            BoundExpressionKind::Function {
+                                name: "ARRAY_EXTRACT".to_string(),
+                                args: vec![base_expr, index_expr],
+                                is_aggregate: false,
+                                distinct: false,
+                                order_by: vec![],
+                                filter: None,
+                            },
+                            element_type,
+                        ))
+                    }
                 }
                 sql::Subscript::Slice { lower_bound, upper_bound, stride } => {
                     let lower = lower_bound.as_ref()
@@ -587,7 +607,7 @@ pub fn bind_expression(
                         .map(|e| bind_expression(_binder, e, ctx))
                         .transpose()?;
 
-                    let mut args = vec![array_expr.clone()];
+                    let mut args = vec![base_expr.clone()];
                     if let Some(l) = lower {
                         args.push(l);
                     } else {
@@ -609,9 +629,79 @@ pub fn bind_expression(
                             order_by: vec![],
                             filter: None,
                         },
-                        array_expr.return_type,
+                        base_expr.return_type,
                     ))
                 }
+            }
+        }
+
+        // Dictionary/Struct literal: {'a': 1, 'b': 2}
+        sql::Expr::Dictionary(fields) => {
+            let mut keys = Vec::new();
+            let mut values = Vec::new();
+            for field in fields {
+                keys.push(field.key.value.clone());
+                let bound_value = bind_expression(_binder, &field.value, ctx)?;
+                values.push(bound_value);
+            }
+
+            // Convert to constant Struct if all values are constants
+            let all_constants = values.iter().all(|e| matches!(e.expr, BoundExpressionKind::Constant(_)));
+            if all_constants {
+                let struct_values: Vec<(String, Value)> = keys
+                    .into_iter()
+                    .zip(values.iter())
+                    .filter_map(|(k, v)| {
+                        if let BoundExpressionKind::Constant(val) = &v.expr {
+                            Some((k, val.clone()))
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+                Ok(BoundExpression::new(
+                    BoundExpressionKind::Constant(Value::Struct(struct_values)),
+                    LogicalType::Struct(vec![]),
+                ))
+            } else {
+                Err(Error::NotImplemented("Non-constant struct literals".to_string()))
+            }
+        }
+
+        // MapAccess: map['key'] or struct['field']
+        sql::Expr::MapAccess { column, keys } => {
+            let map_expr = bind_expression(_binder, column, ctx)?;
+            if let Some(key) = keys.first() {
+                let key_expr = match &key.key {
+                    sql::Expr::Value(sql::Value::SingleQuotedString(s)) => {
+                        BoundExpression::new(
+                            BoundExpressionKind::Constant(Value::Varchar(s.clone())),
+                            LogicalType::Varchar,
+                        )
+                    }
+                    sql::Expr::Value(sql::Value::Number(n, _)) => {
+                        let idx: i64 = n.parse().unwrap_or(0);
+                        BoundExpression::new(
+                            BoundExpressionKind::Constant(Value::BigInt(idx)),
+                            LogicalType::BigInt,
+                        )
+                    }
+                    other => bind_expression(_binder, other, ctx)?,
+                };
+
+                Ok(BoundExpression::new(
+                    BoundExpressionKind::Function {
+                        name: "STRUCT_EXTRACT".to_string(),
+                        args: vec![map_expr, key_expr],
+                        is_aggregate: false,
+                        distinct: false,
+                        order_by: vec![],
+                        filter: None,
+                    },
+                    LogicalType::Unknown,
+                ))
+            } else {
+                Err(Error::InvalidArguments("Map access requires a key".to_string()))
             }
         }
 
