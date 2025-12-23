@@ -1,0 +1,135 @@
+# Outer JOIN tests (LEFT, RIGHT)
+
+statement ok
+CREATE TABLE left_tbl (id INTEGER, val TEXT);
+
+statement ok
+INSERT INTO left_tbl VALUES (1, 'a'), (2, 'b'), (3, 'c');
+
+statement ok
+CREATE TABLE right_tbl (id INTEGER, data TEXT);
+
+statement ok
+INSERT INTO right_tbl VALUES (1, 'x'), (2, 'y');
+
+# Simple LEFT JOIN - all columns
+query ITIT
+SELECT * FROM left_tbl l LEFT JOIN right_tbl r ON l.id = r.id ORDER BY l.id;
+----
+1
+a
+1
+x
+2
+b
+2
+y
+3
+c
+NULL
+NULL
+
+# LEFT JOIN selecting specific columns
+query IT
+SELECT l.id, r.data FROM left_tbl l LEFT JOIN right_tbl r ON l.id = r.id ORDER BY l.id;
+----
+1
+x
+2
+y
+3
+NULL
+
+# LEFT JOIN with ORDER BY on nullable column
+query IT
+SELECT l.id, r.data FROM left_tbl l LEFT JOIN right_tbl r ON l.id = r.id ORDER BY r.data;
+----
+1
+x
+2
+y
+3
+NULL
+
+# LEFT JOIN with multiple ORDER BY columns including nullable
+query ITT
+SELECT l.id, l.val, r.data FROM left_tbl l LEFT JOIN right_tbl r ON l.id = r.id ORDER BY l.id, r.data;
+----
+1
+a
+x
+2
+b
+y
+3
+c
+NULL
+
+# RIGHT JOIN
+query ITIT
+SELECT * FROM left_tbl l RIGHT JOIN right_tbl r ON l.id = r.id ORDER BY r.id;
+----
+1
+a
+1
+x
+2
+b
+2
+y
+
+# More complex scenario with 3 columns each
+statement ok
+CREATE TABLE customers2 (id INTEGER, name TEXT, city TEXT);
+
+statement ok
+INSERT INTO customers2 VALUES (1, 'Alice', 'NYC'), (2, 'Bob', 'LA'), (3, 'Charlie', 'Chicago');
+
+statement ok
+CREATE TABLE orders2 (id INTEGER, customer_id INTEGER, amount INTEGER);
+
+statement ok
+INSERT INTO orders2 VALUES (101, 1, 100), (102, 1, 200), (103, 2, 150);
+
+# LEFT JOIN with 3 column tables
+query ITIIIT
+SELECT * FROM customers2 c LEFT JOIN orders2 o ON c.id = o.customer_id ORDER BY c.id, o.id;
+----
+1
+Alice
+NYC
+101
+1
+100
+1
+Alice
+NYC
+102
+1
+200
+2
+Bob
+LA
+103
+2
+150
+3
+Charlie
+Chicago
+NULL
+NULL
+NULL
+
+# LEFT JOIN selecting subset of columns
+query TI
+SELECT c.name, o.amount FROM customers2 c LEFT JOIN orders2 o ON c.id = o.customer_id ORDER BY c.id, o.amount;
+----
+Alice
+100
+Alice
+200
+Bob
+150
+Charlie
+NULL
+

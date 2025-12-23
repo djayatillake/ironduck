@@ -185,38 +185,20 @@ fn pushdown_projections(op: &LogicalOperator, needed: &HashSet<usize>) -> Logica
             }
         }
 
-        // For Join, split columns between left and right
+        // For Join, we cannot safely push projections because column indices
+        // in parent operators (Sort, Project) would become invalid.
+        // Keep all columns from both sides.
         LogicalOperator::Join {
             left,
             right,
             join_type,
             condition,
         } => {
+            // Keep all columns from both sides to preserve column indices
             let left_count = left.output_types().len();
-
-            let mut left_needed = HashSet::new();
-            let mut right_needed = HashSet::new();
-
-            for &idx in needed {
-                if idx < left_count {
-                    left_needed.insert(idx);
-                } else {
-                    right_needed.insert(idx - left_count);
-                }
-            }
-
-            // Also add columns needed by the join condition
-            if let Some(cond) = condition {
-                let mut cond_cols = HashSet::new();
-                collect_column_refs(cond, &mut cond_cols);
-                for idx in cond_cols {
-                    if idx < left_count {
-                        left_needed.insert(idx);
-                    } else {
-                        right_needed.insert(idx - left_count);
-                    }
-                }
-            }
+            let right_count = right.output_types().len();
+            let left_needed: HashSet<usize> = (0..left_count).collect();
+            let right_needed: HashSet<usize> = (0..right_count).collect();
 
             LogicalOperator::Join {
                 left: Box::new(pushdown_projections(left, &left_needed)),
