@@ -133,3 +133,89 @@ Bob
 Charlie
 NULL
 
+# FULL OUTER JOIN tests
+statement ok
+CREATE TABLE full_left (id INTEGER, lval TEXT);
+
+statement ok
+INSERT INTO full_left VALUES (1, 'a'), (2, 'b'), (3, 'c');
+
+statement ok
+CREATE TABLE full_right (id INTEGER, rval TEXT);
+
+statement ok
+INSERT INTO full_right VALUES (2, 'x'), (3, 'y'), (4, 'z');
+
+# FULL OUTER JOIN - all columns
+query ITIT
+SELECT * FROM full_left l FULL OUTER JOIN full_right r ON l.id = r.id ORDER BY COALESCE(l.id, r.id);
+----
+1
+a
+NULL
+NULL
+2
+b
+2
+x
+3
+c
+3
+y
+NULL
+NULL
+4
+z
+
+# FULL OUTER JOIN selecting specific columns
+query IT
+SELECT COALESCE(l.id, r.id) as id, COALESCE(l.lval, r.rval) as val FROM full_left l FULL OUTER JOIN full_right r ON l.id = r.id ORDER BY id;
+----
+1
+a
+2
+b
+3
+c
+4
+z
+
+# RIGHT JOIN with unmatched rows
+statement ok
+CREATE TABLE rj_left (id INTEGER, name TEXT);
+
+statement ok
+INSERT INTO rj_left VALUES (1, 'Alice'), (2, 'Bob');
+
+statement ok
+CREATE TABLE rj_right (id INTEGER, score INTEGER);
+
+statement ok
+INSERT INTO rj_right VALUES (2, 100), (3, 200), (4, 300);
+
+query ITII
+SELECT * FROM rj_left l RIGHT JOIN rj_right r ON l.id = r.id ORDER BY r.id;
+----
+2
+Bob
+2
+100
+NULL
+NULL
+3
+200
+NULL
+NULL
+4
+300
+
+# RIGHT JOIN with column selection
+query TI
+SELECT l.name, r.score FROM rj_left l RIGHT JOIN rj_right r ON l.id = r.id ORDER BY r.id;
+----
+Bob
+100
+NULL
+200
+NULL
+300
