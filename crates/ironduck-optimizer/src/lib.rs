@@ -7,7 +7,7 @@ use ironduck_planner::LogicalPlan;
 
 pub mod rules;
 
-use rules::{ConstantFolding, FilterPushdown, PredicateSimplification, ProjectionPushdown};
+use rules::{ConstantFolding, FilterPushdown, LimitPushdown, PredicateSimplification, ProjectionPushdown};
 
 /// All optimization rules in order of application
 fn get_rules() -> Vec<Box<dyn OptimizationRule>> {
@@ -16,6 +16,7 @@ fn get_rules() -> Vec<Box<dyn OptimizationRule>> {
         Box::new(PredicateSimplification),
         Box::new(FilterPushdown),
         Box::new(ProjectionPushdown),
+        Box::new(LimitPushdown),
     ]
 }
 
