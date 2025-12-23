@@ -1,0 +1,100 @@
+# Test date/time functions
+
+# Date extraction
+query I
+SELECT YEAR(DATE '2024-06-15');
+----
+2024
+
+query I
+SELECT MONTH(DATE '2024-06-15');
+----
+6
+
+query I
+SELECT DAY(DATE '2024-06-15');
+----
+15
+
+# DATE_PART / EXTRACT
+query I
+SELECT DATE_PART('year', DATE '2024-06-15');
+----
+2024
+
+query I
+SELECT DATE_PART('month', DATE '2024-06-15');
+----
+6
+
+query I
+SELECT DATE_PART('day', DATE '2024-06-15');
+----
+15
+
+query I
+SELECT EXTRACT(YEAR FROM DATE '2024-06-15');
+----
+2024
+
+# Day of week/year
+query I
+SELECT DAYOFWEEK(DATE '2024-06-15');
+----
+6
+
+query I
+SELECT DAYOFYEAR(DATE '2024-06-15');
+----
+167
+
+# Week
+query I
+SELECT WEEK(DATE '2024-06-15');
+----
+24
+
+# Last day of month
+query T
+SELECT LAST_DAY(DATE '2024-06-15');
+----
+2024-06-30
+
+# Day and month names
+query T
+SELECT DAYNAME(DATE '2024-06-15');
+----
+Saturday
+
+query T
+SELECT MONTHNAME(DATE '2024-06-15');
+----
+June
+
+# Date truncation (uses timestamp) - currently only DAY is supported
+query T
+SELECT DATE_TRUNC('day', TIMESTAMP '2024-06-15 10:30:00');
+----
+2024-06-15 00:00:00
+
+# Make date
+query T
+SELECT MAKE_DATE(2024, 6, 15);
+----
+2024-06-15
+
+# Quarter
+query I
+SELECT DATE_PART('quarter', DATE '2024-06-15');
+----
+2
+
+query I
+SELECT DATE_PART('quarter', DATE '2024-01-15');
+----
+1
+
+query I
+SELECT DATE_PART('quarter', DATE '2024-10-15');
+----
+4
