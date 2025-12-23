@@ -28,6 +28,15 @@ SELECT 1 WHERE FALSE OR TRUE;
 ----
 1
 
+# Test WHERE FALSE returns no rows (fixed: Filter correctly eliminates rows)
+query I
+SELECT 1 WHERE FALSE;
+----
+
+query I
+SELECT 1 WHERE 1 = 0;
+----
+
 # Test filter pushdown with tables
 statement ok
 CREATE TABLE opt_test (a INTEGER, b INTEGER, c TEXT);

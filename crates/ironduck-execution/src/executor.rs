@@ -142,8 +142,13 @@ impl Executor {
                     output_rows.push(output_row);
                 }
 
-                // Handle case of no input rows but constant expressions
-                if input_rows.is_empty() && expressions.iter().all(is_constant) {
+                // Handle case of DummyScan with constant expressions (SELECT 1)
+                // Note: We only do this for DummyScan, not for empty results from Filter
+                // because SELECT 1 WHERE FALSE should return no rows
+                if input_rows.is_empty()
+                    && expressions.iter().all(is_constant)
+                    && matches!(input.as_ref(), LogicalOperator::DummyScan)
+                {
                     let mut output_row = Vec::new();
                     for expr in expressions {
                         let value = if has_subquery {
