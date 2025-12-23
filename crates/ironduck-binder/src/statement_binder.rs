@@ -281,6 +281,7 @@ fn bind_recursive_cte(
                 offset: None,
                 distinct: if all { DistinctKind::None } else { DistinctKind::All },
                 ctes: Vec::new(),
+                values_rows: Vec::new(),
             };
 
             return Ok(BoundCTE {
@@ -911,10 +912,8 @@ fn bind_values(_binder: &Binder, values: &sql::Values) -> Result<BoundSelect> {
         all_rows.push(bound_row);
     }
 
-    // For VALUES, create a select with constant expressions
-    // The first row determines the column types
-    let select_list = all_rows.into_iter().next().unwrap_or_default();
-    Ok(BoundSelect::new(select_list))
+    // For VALUES, create a select with all rows
+    Ok(BoundSelect::new_values(all_rows))
 }
 
 /// Collect all base tables from a table reference (for building expression context)
@@ -1237,8 +1236,22 @@ fn bind_table_factor_with_ctes(
                 .map(|a| a.name.value.clone())
                 .unwrap_or_else(|| "subquery".to_string());
 
+            // Get column aliases if provided (e.g., AS t(id, name))
+            let column_aliases: Vec<String> = alias
+                .as_ref()
+                .map(|a| a.columns.iter().map(|c| c.name.value.clone()).collect())
+                .unwrap_or_default();
+
             match bound_stmt {
-                BoundStatement::Select(sel) => {
+                BoundStatement::Select(mut sel) => {
+                    // Apply column aliases to select_list if provided
+                    if !column_aliases.is_empty() {
+                        for (i, col_alias) in column_aliases.iter().enumerate() {
+                            if i < sel.select_list.len() {
+                                sel.select_list[i].alias = Some(col_alias.clone());
+                            }
+                        }
+                    }
                     Ok(BoundTableRef::Subquery {
                         subquery: Box::new(sel),
                         alias: alias_name,
@@ -1246,8 +1259,18 @@ fn bind_table_factor_with_ctes(
                 }
                 BoundStatement::SetOperation(set_op) => {
                     // Get column info from the left operand
-                    let column_names = set_op.left.output_names();
+                    let mut column_names = set_op.left.output_names();
                     let column_types = set_op.left.output_types();
+
+                    // Apply column aliases if provided
+                    if !column_aliases.is_empty() {
+                        for (i, col_alias) in column_aliases.iter().enumerate() {
+                            if i < column_names.len() {
+                                column_names[i] = col_alias.clone();
+                            }
+                        }
+                    }
+
                     Ok(BoundTableRef::SetOperationSubquery {
                         set_operation: Box::new(set_op),
                         alias: alias_name,

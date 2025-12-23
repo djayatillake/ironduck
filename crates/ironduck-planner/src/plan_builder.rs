@@ -232,6 +232,50 @@ fn build_set_operation_plan(set_op: &BoundSetOperation) -> Result<LogicalPlan> {
 fn build_select_plan(select: &BoundSelect) -> Result<LogicalPlan> {
     let output_names = select.output_names();
 
+    // Check if this is a VALUES clause
+    if !select.values_rows.is_empty() {
+        // Build a Values operator
+        let values: Vec<Vec<super::Expression>> = select
+            .values_rows
+            .iter()
+            .map(|row| row.iter().map(convert_expression).collect())
+            .collect();
+        let output_types = select.output_types();
+
+        let mut plan = super::LogicalOperator::Values { values, output_types };
+
+        // Apply ORDER BY if present
+        if !select.order_by.is_empty() {
+            let order_by: Vec<_> = select
+                .order_by
+                .iter()
+                .map(|o| super::OrderByExpression {
+                    expr: convert_expression(&o.expr),
+                    ascending: o.ascending,
+                    nulls_first: o.nulls_first,
+                })
+                .collect();
+            plan = super::LogicalOperator::Sort {
+                input: Box::new(plan),
+                order_by,
+            };
+        }
+
+        // Apply LIMIT/OFFSET if present
+        if select.limit.is_some() || select.offset.is_some() {
+            plan = super::LogicalOperator::Limit {
+                input: Box::new(plan),
+                limit: select.limit,
+                offset: select.offset,
+            };
+        }
+
+        return Ok(LogicalPlan {
+            root: plan,
+            output_names,
+        });
+    }
+
     // Start with the source (FROM clause)
     // Pass CTEs so recursive CTE references can be resolved
     let mut plan = build_from_plan_with_ctes(&select.from, &select.ctes)?;

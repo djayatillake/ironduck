@@ -101,6 +101,8 @@ pub struct BoundSelect {
     /// CTEs (Common Table Expressions) used in this query
     /// Includes recursive CTEs with their base and recursive cases
     pub ctes: Vec<BoundCTE>,
+    /// VALUES rows (for VALUES clause)
+    pub values_rows: Vec<Vec<BoundExpression>>,
 }
 
 /// DISTINCT mode
@@ -128,6 +130,27 @@ impl BoundSelect {
             offset: None,
             distinct: DistinctKind::None,
             ctes: Vec::new(),
+            values_rows: Vec::new(),
+        }
+    }
+
+    /// Create a new BoundSelect for VALUES clause
+    pub fn new_values(values_rows: Vec<Vec<BoundExpression>>) -> Self {
+        // Use the first row as the select_list for column types
+        let select_list = values_rows.first().cloned().unwrap_or_default();
+        BoundSelect {
+            select_list,
+            from: Vec::new(),
+            where_clause: None,
+            group_by: Vec::new(),
+            having: None,
+            qualify: None,
+            order_by: Vec::new(),
+            limit: None,
+            offset: None,
+            distinct: DistinctKind::None,
+            ctes: Vec::new(),
+            values_rows,
         }
     }
 
