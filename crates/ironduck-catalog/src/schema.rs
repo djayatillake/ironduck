@@ -126,4 +126,42 @@ impl Schema {
         }
         Ok(())
     }
+
+    /// Modify a table by applying a mutation function
+    /// This replaces the Arc<Table> with an updated clone
+    pub fn alter_table<F>(&self, name: &str, f: F) -> Result<()>
+    where
+        F: FnOnce(&mut Table),
+    {
+        let mut tables = self.tables.write();
+        let name_lower = name.to_lowercase();
+        if let Some(table_arc) = tables.get(&name_lower) {
+            let mut table: Table = table_arc.as_ref().clone();
+            f(&mut table);
+            tables.insert(name_lower, Arc::new(table));
+            Ok(())
+        } else {
+            Err(Error::TableNotFound(name.to_string()))
+        }
+    }
+
+    /// Rename a table
+    pub fn rename_table(&self, old_name: &str, new_name: &str) -> Result<()> {
+        let mut tables = self.tables.write();
+        let old_name_lower = old_name.to_lowercase();
+        let new_name_lower = new_name.to_lowercase();
+
+        if tables.contains_key(&new_name_lower) {
+            return Err(Error::TableAlreadyExists(new_name.to_string()));
+        }
+
+        if let Some(table_arc) = tables.remove(&old_name_lower) {
+            let mut table: Table = table_arc.as_ref().clone();
+            table.name = new_name_lower.clone();
+            tables.insert(new_name_lower, Arc::new(table));
+            Ok(())
+        } else {
+            Err(Error::TableNotFound(old_name.to_string()))
+        }
+    }
 }

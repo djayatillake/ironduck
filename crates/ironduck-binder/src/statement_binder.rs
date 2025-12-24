@@ -2,11 +2,11 @@
 
 use super::expression_binder::{bind_data_type, bind_expression, ExpressionBinderContext};
 use super::{
-    BoundCTE, BoundColumnDef, BoundCreateSchema, BoundCreateSequence, BoundCreateTable,
-    BoundCreateView, BoundDelete, BoundDrop, BoundExpression, BoundInsert, BoundJoinType,
-    BoundOrderBy, BoundRecursiveCTE, BoundSelect, BoundSetOperation, BoundStatement,
-    BoundTableRef, BoundUpdate, Binder, DistinctKind, DropObjectType, SetOperand,
-    SetOperationType, TableFunctionType,
+    AlterTableOperation, BoundAlterTable, BoundCTE, BoundColumnDef, BoundCreateSchema,
+    BoundCreateSequence, BoundCreateTable, BoundCreateView, BoundDelete, BoundDrop,
+    BoundExpression, BoundInsert, BoundJoinType, BoundOrderBy, BoundRecursiveCTE,
+    BoundSelect, BoundSetOperation, BoundStatement, BoundTableRef, BoundUpdate, Binder,
+    DistinctKind, DropObjectType, SetOperand, SetOperationType, TableFunctionType,
 };
 use ironduck_common::{Error, Result};
 use sqlparser::ast as sql;
@@ -102,8 +102,154 @@ pub fn bind_statement(binder: &Binder, stmt: &sql::Statement) -> Result<BoundSta
         sql::Statement::Savepoint { .. } => Ok(BoundStatement::NoOp),
         sql::Statement::ReleaseSavepoint { .. } => Ok(BoundStatement::NoOp),
 
+        // ALTER TABLE
+        sql::Statement::AlterTable { name, if_exists: _, operations, .. } => {
+            bind_alter_table(binder, name, operations)
+        }
+
         _ => Err(Error::NotImplemented(format!("Statement: {:?}", stmt))),
     }
+}
+
+/// Bind ALTER TABLE statement
+fn bind_alter_table(
+    binder: &Binder,
+    name: &sql::ObjectName,
+    operations: &[sql::AlterTableOperation],
+) -> Result<BoundStatement> {
+    let parts: Vec<_> = name.0.iter().map(|i| i.value.clone()).collect();
+    let (schema, table_name) = if parts.len() == 2 {
+        (parts[0].clone(), parts[1].clone())
+    } else {
+        (binder.current_schema().to_string(), parts[0].clone())
+    };
+
+    // Verify table exists
+    let _table = binder.catalog().get_table(&schema, &table_name)
+        .ok_or_else(|| Error::TableNotFound(format!("{}.{}", schema, table_name)))?;
+
+    // We only support one operation at a time for now
+    if operations.is_empty() {
+        return Err(Error::InvalidArguments("ALTER TABLE requires at least one operation".to_string()));
+    }
+
+    let operation = &operations[0];
+    let bound_op = match operation {
+        sql::AlterTableOperation::AddColumn { column_def, .. } => {
+            // Bind the column definition inline (similar to CREATE TABLE logic)
+            let data_type = bind_data_type(&column_def.data_type)?;
+            let nullable = !column_def.options.iter().any(|opt| {
+                matches!(opt.option, sql::ColumnOption::NotNull)
+            });
+
+            let mut is_primary_key = false;
+            let mut is_unique = false;
+            let mut default_expr = None;
+            let mut check_expr = None;
+
+            for opt in &column_def.options {
+                match &opt.option {
+                    sql::ColumnOption::Unique { is_primary, .. } => {
+                        if *is_primary {
+                            is_primary_key = true;
+                        } else {
+                            is_unique = true;
+                        }
+                    }
+                    sql::ColumnOption::Default(expr) => {
+                        let ctx = ExpressionBinderContext::empty();
+                        default_expr = Some(bind_expression(binder, expr, &ctx)?);
+                    }
+                    sql::ColumnOption::Check(expr) => {
+                        let col_ref = BoundTableRef::BaseTable {
+                            schema: "".to_string(),
+                            name: "".to_string(),
+                            alias: None,
+                            column_names: vec![column_def.name.value.clone()],
+                            column_types: vec![data_type.clone()],
+                        };
+                        let refs = vec![col_ref];
+                        let ctx = ExpressionBinderContext::new(&refs);
+                        check_expr = Some(bind_expression(binder, expr, &ctx)?);
+                    }
+                    _ => {}
+                }
+            }
+
+            let col = BoundColumnDef {
+                name: column_def.name.value.clone(),
+                data_type,
+                nullable,
+                default: default_expr,
+                is_primary_key,
+                is_unique,
+                check: check_expr,
+            };
+            AlterTableOperation::AddColumn { column: col }
+        }
+        sql::AlterTableOperation::DropColumn { column_name, if_exists, .. } => {
+            AlterTableOperation::DropColumn {
+                column_name: column_name.value.clone(),
+                if_exists: *if_exists,
+            }
+        }
+        sql::AlterTableOperation::RenameColumn { old_column_name, new_column_name } => {
+            AlterTableOperation::RenameColumn {
+                old_name: old_column_name.value.clone(),
+                new_name: new_column_name.value.clone(),
+            }
+        }
+        sql::AlterTableOperation::RenameTable { table_name: new_name } => {
+            AlterTableOperation::RenameTable {
+                new_name: new_name.0.iter().map(|i| i.value.clone()).collect::<Vec<_>>().join("."),
+            }
+        }
+        sql::AlterTableOperation::AlterColumn { column_name, op } => {
+            match op {
+                sql::AlterColumnOperation::SetDataType { data_type, .. } => {
+                    let logical_type = bind_data_type(data_type)?;
+                    AlterTableOperation::AlterColumnType {
+                        column_name: column_name.value.clone(),
+                        new_type: logical_type,
+                    }
+                }
+                sql::AlterColumnOperation::SetDefault { value } => {
+                    let ctx = ExpressionBinderContext::empty();
+                    let default_expr = bind_expression(binder, value, &ctx)?;
+                    AlterTableOperation::SetColumnDefault {
+                        column_name: column_name.value.clone(),
+                        default: Some(default_expr),
+                    }
+                }
+                sql::AlterColumnOperation::DropDefault => {
+                    AlterTableOperation::SetColumnDefault {
+                        column_name: column_name.value.clone(),
+                        default: None,
+                    }
+                }
+                sql::AlterColumnOperation::SetNotNull => {
+                    AlterTableOperation::SetColumnNotNull {
+                        column_name: column_name.value.clone(),
+                        not_null: true,
+                    }
+                }
+                sql::AlterColumnOperation::DropNotNull => {
+                    AlterTableOperation::SetColumnNotNull {
+                        column_name: column_name.value.clone(),
+                        not_null: false,
+                    }
+                }
+                _ => return Err(Error::NotImplemented(format!("ALTER COLUMN operation: {:?}", op))),
+            }
+        }
+        _ => return Err(Error::NotImplemented(format!("ALTER TABLE operation: {:?}", operation))),
+    };
+
+    Ok(BoundStatement::AlterTable(BoundAlterTable {
+        schema,
+        table_name,
+        operation: bound_op,
+    }))
 }
 
 /// Bind a query - returns either a Select or SetOperation

@@ -1,9 +1,10 @@
 //! Plan builder - converts bound statements to logical plans
 
-use super::{LogicalOperator, LogicalPlan, SetOperationType};
+use super::{AlterTableOp, LogicalOperator, LogicalPlan, SetOperationType};
 use ironduck_binder::{
-    BoundCTE, BoundDelete, BoundExpression, BoundExpressionKind, BoundSelect, BoundSetOperation,
-    BoundStatement, BoundTableRef, BoundUpdate, DistinctKind, SetOperand,
+    AlterTableOperation, BoundCTE, BoundDelete, BoundExpression, BoundExpressionKind,
+    BoundSelect, BoundSetOperation, BoundStatement, BoundTableRef, BoundUpdate, DistinctKind,
+    SetOperand,
 };
 use ironduck_common::{Error, LogicalType, Result, Value};
 
@@ -105,6 +106,17 @@ pub fn build_plan(statement: &BoundStatement) -> Result<LogicalPlan> {
             },
             vec!["Success".to_string()],
         )),
+        BoundStatement::AlterTable(alter) => {
+            let operation = convert_alter_table_operation(&alter.operation);
+            Ok(LogicalPlan::new(
+                LogicalOperator::AlterTable {
+                    schema: alter.schema.clone(),
+                    table_name: alter.table_name.clone(),
+                    operation,
+                },
+                vec!["Success".to_string()],
+            ))
+        }
         BoundStatement::Delete(delete) => {
             let predicate = delete.where_clause.as_ref().map(convert_expression);
 
@@ -2122,4 +2134,53 @@ fn find_matching_output_column(
     }
 
     None
+}
+
+/// Convert bound AlterTableOperation to planner AlterTableOp
+fn convert_alter_table_operation(op: &AlterTableOperation) -> AlterTableOp {
+    match op {
+        AlterTableOperation::AddColumn { column } => {
+            AlterTableOp::AddColumn {
+                name: column.name.clone(),
+                data_type: column.data_type.clone(),
+                nullable: column.nullable,
+                default: column.default.as_ref().map(convert_expression),
+            }
+        }
+        AlterTableOperation::DropColumn { column_name, if_exists } => {
+            AlterTableOp::DropColumn {
+                column_name: column_name.clone(),
+                if_exists: *if_exists,
+            }
+        }
+        AlterTableOperation::RenameColumn { old_name, new_name } => {
+            AlterTableOp::RenameColumn {
+                old_name: old_name.clone(),
+                new_name: new_name.clone(),
+            }
+        }
+        AlterTableOperation::RenameTable { new_name } => {
+            AlterTableOp::RenameTable {
+                new_name: new_name.clone(),
+            }
+        }
+        AlterTableOperation::AlterColumnType { column_name, new_type } => {
+            AlterTableOp::AlterColumnType {
+                column_name: column_name.clone(),
+                new_type: new_type.clone(),
+            }
+        }
+        AlterTableOperation::SetColumnDefault { column_name, default } => {
+            AlterTableOp::SetColumnDefault {
+                column_name: column_name.clone(),
+                default: default.as_ref().map(convert_expression),
+            }
+        }
+        AlterTableOperation::SetColumnNotNull { column_name, not_null } => {
+            AlterTableOp::SetColumnNotNull {
+                column_name: column_name.clone(),
+                not_null: *not_null,
+            }
+        }
+    }
 }

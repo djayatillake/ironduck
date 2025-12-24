@@ -199,6 +199,23 @@ impl Catalog {
     pub fn list_schemas(&self) -> Vec<String> {
         self.schemas.read().keys().cloned().collect()
     }
+
+    /// Alter a table by applying a mutation function
+    pub fn alter_table<F>(&self, schema_name: &str, table_name: &str, f: F) -> Result<()>
+    where
+        F: FnOnce(&mut Table),
+    {
+        let schema = self.get_schema(schema_name)
+            .ok_or_else(|| Error::SchemaNotFound(schema_name.to_string()))?;
+        schema.alter_table(table_name, f)
+    }
+
+    /// Rename a table
+    pub fn rename_table(&self, schema_name: &str, old_name: &str, new_name: &str) -> Result<()> {
+        let schema = self.get_schema(schema_name)
+            .ok_or_else(|| Error::SchemaNotFound(schema_name.to_string()))?;
+        schema.rename_table(old_name, new_name)
+    }
 }
 
 impl Default for Catalog {

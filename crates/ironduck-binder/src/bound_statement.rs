@@ -16,6 +16,7 @@ pub enum BoundStatement {
     CreateView(BoundCreateView),
     CreateSequence(BoundCreateSequence),
     Drop(BoundDrop),
+    AlterTable(BoundAlterTable),
     Explain(Box<BoundStatement>),
     /// No-op statement (PRAGMA, SET, etc.)
     NoOp,
@@ -402,6 +403,52 @@ pub enum DropObjectType {
     Table,
     Schema,
     View,
+}
+
+/// Bound ALTER TABLE statement
+#[derive(Debug, Clone)]
+pub struct BoundAlterTable {
+    pub schema: String,
+    pub table_name: String,
+    pub operation: AlterTableOperation,
+}
+
+/// ALTER TABLE operations
+#[derive(Debug, Clone)]
+pub enum AlterTableOperation {
+    /// ADD COLUMN
+    AddColumn {
+        column: BoundColumnDef,
+    },
+    /// DROP COLUMN
+    DropColumn {
+        column_name: String,
+        if_exists: bool,
+    },
+    /// RENAME COLUMN
+    RenameColumn {
+        old_name: String,
+        new_name: String,
+    },
+    /// RENAME TABLE
+    RenameTable {
+        new_name: String,
+    },
+    /// ALTER COLUMN TYPE
+    AlterColumnType {
+        column_name: String,
+        new_type: LogicalType,
+    },
+    /// SET/DROP DEFAULT
+    SetColumnDefault {
+        column_name: String,
+        default: Option<BoundExpression>,
+    },
+    /// SET/DROP NOT NULL
+    SetColumnNotNull {
+        column_name: String,
+        not_null: bool,
+    },
 }
 
 /// Bound Common Table Expression (CTE)

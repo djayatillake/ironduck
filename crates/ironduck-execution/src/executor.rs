@@ -873,6 +873,116 @@ impl Executor {
                 Ok(vec![vec![Value::Varchar(format!("Dropped {} {}", object_type, name))]])
             }
 
+            LogicalOperator::AlterTable {
+                schema,
+                table_name,
+                operation,
+            } => {
+                use ironduck_planner::AlterTableOp;
+
+                // Get the table
+                let table_data = self
+                    .storage
+                    .get(schema, table_name)
+                    .ok_or_else(|| Error::TableNotFound(table_name.clone()))?;
+
+                match operation {
+                    AlterTableOp::AddColumn { name, data_type, nullable, default } => {
+                        // Add the column to storage
+                        let default_val = default.as_ref()
+                            .map(|e| evaluate(e, &[]))
+                            .transpose()?
+                            .unwrap_or(Value::Null);
+                        table_data.add_column(name, data_type.clone(), default_val.clone());
+
+                        // Update the catalog
+                        let col_name = name.clone();
+                        let col_type = data_type.clone();
+                        let col_nullable = *nullable;
+                        let col_default = default_val;
+                        self.catalog.alter_table(schema, table_name, |t| {
+                            let next_id = t.columns.len() as u32;
+                            let mut col = ironduck_catalog::Column::new(next_id, col_name, col_type);
+                            col.nullable = col_nullable;
+                            if col_default != Value::Null {
+                                col.default_value = Some(col_default);
+                            }
+                            t.add_column(col);
+                        })?;
+
+                        Ok(vec![vec![Value::Varchar(format!("Added column {} to {}", name, table_name))]])
+                    }
+                    AlterTableOp::DropColumn { column_name, if_exists } => {
+                        // Update storage
+                        let dropped = table_data.drop_column(column_name);
+
+                        if dropped {
+                            // Update the catalog
+                            let col_name = column_name.clone();
+                            self.catalog.alter_table(schema, table_name, |t| {
+                                t.drop_column(&col_name);
+                            })?;
+                            Ok(vec![vec![Value::Varchar(format!("Dropped column {} from {}", column_name, table_name))]])
+                        } else if *if_exists {
+                            Ok(vec![vec![Value::Varchar(format!("Column {} does not exist (skipped)", column_name))]])
+                        } else {
+                            Err(Error::ColumnNotFound(column_name.clone()))
+                        }
+                    }
+                    AlterTableOp::RenameColumn { old_name, new_name } => {
+                        if table_data.rename_column(old_name, new_name) {
+                            // Update the catalog
+                            let old = old_name.clone();
+                            let new = new_name.clone();
+                            self.catalog.alter_table(schema, table_name, |t| {
+                                t.rename_column(&old, &new);
+                            })?;
+                            Ok(vec![vec![Value::Varchar(format!("Renamed column {} to {}", old_name, new_name))]])
+                        } else {
+                            Err(Error::ColumnNotFound(old_name.clone()))
+                        }
+                    }
+                    AlterTableOp::RenameTable { new_name } => {
+                        // Update storage
+                        self.storage.rename_table(schema, table_name, new_name);
+                        // Update catalog
+                        self.catalog.rename_table(schema, table_name, new_name)?;
+                        Ok(vec![vec![Value::Varchar(format!("Renamed table {} to {}", table_name, new_name))]])
+                    }
+                    AlterTableOp::AlterColumnType { column_name, new_type } => {
+                        if table_data.alter_column_type(column_name, new_type.clone()) {
+                            // Update the catalog
+                            let col_name = column_name.clone();
+                            let col_type = new_type.clone();
+                            self.catalog.alter_table(schema, table_name, |t| {
+                                t.alter_column_type(&col_name, col_type);
+                            })?;
+                            Ok(vec![vec![Value::Varchar(format!("Changed column {} type to {:?}", column_name, new_type))]])
+                        } else {
+                            Err(Error::ColumnNotFound(column_name.clone()))
+                        }
+                    }
+                    AlterTableOp::SetColumnDefault { column_name, default } => {
+                        let msg = if default.is_some() {
+                            format!("Set default for column {}", column_name)
+                        } else {
+                            format!("Dropped default for column {}", column_name)
+                        };
+                        // Note: defaults are not enforced in current in-memory storage
+                        Ok(vec![vec![Value::Varchar(msg)]])
+                    }
+                    AlterTableOp::SetColumnNotNull { column_name, not_null } => {
+                        let msg = if *not_null {
+                            format!("Set NOT NULL for column {}", column_name)
+                        } else {
+                            format!("Dropped NOT NULL for column {}", column_name)
+                        };
+                        // Note: constraints are not enforced in current in-memory storage
+                        Ok(vec![vec![Value::Varchar(msg)]])
+                    }
+                }
+            }
+
             LogicalOperator::Delete {
                 schema,
                 table,
@@ -2002,6 +2112,9 @@ fn format_plan(op: &LogicalOperator, indent: usize) -> String {
         }
         LogicalOperator::Drop { name, .. } => {
             format!("{}Drop: {}", prefix, name)
+        }
+        LogicalOperator::AlterTable { table_name, operation, .. } => {
+            format!("{}AlterTable: {} ({:?})", prefix, table_name, operation)
         }
         LogicalOperator::SetOperation { left, right, op, all } => {
             format!(

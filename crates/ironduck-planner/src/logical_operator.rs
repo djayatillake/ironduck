@@ -152,6 +152,13 @@ pub enum LogicalOperator {
         if_exists: bool,
     },
 
+    /// ALTER TABLE
+    AlterTable {
+        schema: String,
+        table_name: String,
+        operation: AlterTableOp,
+    },
+
     /// Set operation (UNION, INTERSECT, EXCEPT)
     SetOperation {
         left: Box<LogicalOperator>,
@@ -315,6 +322,7 @@ impl LogicalOperator {
             LogicalOperator::Delete { .. } => vec![LogicalType::BigInt],
             LogicalOperator::Update { .. } => vec![LogicalType::BigInt],
             LogicalOperator::Drop { .. } => vec![LogicalType::Varchar],
+            LogicalOperator::AlterTable { .. } => vec![LogicalType::Varchar],
             LogicalOperator::SetOperation { left, .. } => left.output_types(),
             LogicalOperator::Window { output_types, .. } => output_types.clone(),
             LogicalOperator::Explain { .. } => vec![LogicalType::Varchar],
@@ -357,6 +365,47 @@ pub enum JoinType {
     Cross,
     Semi,
     Anti,
+}
+
+/// ALTER TABLE operation types
+#[derive(Debug, Clone)]
+pub enum AlterTableOp {
+    /// ADD COLUMN
+    AddColumn {
+        name: String,
+        data_type: LogicalType,
+        nullable: bool,
+        default: Option<Expression>,
+    },
+    /// DROP COLUMN
+    DropColumn {
+        column_name: String,
+        if_exists: bool,
+    },
+    /// RENAME COLUMN
+    RenameColumn {
+        old_name: String,
+        new_name: String,
+    },
+    /// RENAME TABLE
+    RenameTable {
+        new_name: String,
+    },
+    /// ALTER COLUMN TYPE
+    AlterColumnType {
+        column_name: String,
+        new_type: LogicalType,
+    },
+    /// SET/DROP DEFAULT
+    SetColumnDefault {
+        column_name: String,
+        default: Option<Expression>,
+    },
+    /// SET/DROP NOT NULL
+    SetColumnNotNull {
+        column_name: String,
+        not_null: bool,
+    },
 }
 
 /// An expression in the logical plan
