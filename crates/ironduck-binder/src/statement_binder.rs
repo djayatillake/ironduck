@@ -1052,6 +1052,8 @@ fn collect_tables_from_ref(table_ref: &BoundTableRef) -> Vec<BoundTableRef> {
         BoundTableRef::SetOperationSubquery { .. } => vec![table_ref.clone()],
         BoundTableRef::TableFunction { .. } => vec![table_ref.clone()],
         BoundTableRef::RecursiveCTERef { .. } => vec![table_ref.clone()],
+        BoundTableRef::Pivot { source, .. } => collect_tables_from_ref(source),
+        BoundTableRef::Unpivot { source, .. } => collect_tables_from_ref(source),
         BoundTableRef::Empty => vec![],
     }
 }
@@ -1461,7 +1463,132 @@ fn bind_table_factor_with_ctes_and_outer(
             })
         }
 
+        sql::TableFactor::Pivot {
+            table,
+            aggregate_functions,
+            value_column,
+            value_source,
+            alias,
+            ..
+        } => {
+            // Recursively bind the source table
+            let source = bind_table_factor_with_ctes_and_outer(binder, table, ctes, outer_tables)?;
+
+            // Get the aggregate function and its argument
+            if aggregate_functions.is_empty() {
+                return Err(Error::InvalidArguments("PIVOT requires at least one aggregate function".to_string()));
+            }
+
+            let agg_expr = &aggregate_functions[0].expr;
+            let (agg_name, agg_arg) = match agg_expr {
+                sql::Expr::Function(func) => {
+                    let name = func.name.to_string().to_uppercase();
+                    let arg = match &func.args {
+                        sql::FunctionArguments::None => {
+                            // COUNT(*) case
+                            BoundExpression::new(
+                                super::bound_expression::BoundExpressionKind::Constant(ironduck_common::Value::BigInt(1)),
+                                ironduck_common::LogicalType::BigInt,
+                            )
+                        }
+                        sql::FunctionArguments::Subquery(_) => {
+                            return Err(Error::NotImplemented("Subquery in PIVOT aggregate".to_string()));
+                        }
+                        sql::FunctionArguments::List(list) => {
+                            if list.args.is_empty() {
+                                BoundExpression::new(
+                                    super::bound_expression::BoundExpressionKind::Constant(ironduck_common::Value::BigInt(1)),
+                                    ironduck_common::LogicalType::BigInt,
+                                )
+                            } else {
+                                let arg_expr = match &list.args[0] {
+                                    sql::FunctionArg::Unnamed(sql::FunctionArgExpr::Expr(e)) => e,
+                                    sql::FunctionArg::Named { arg: sql::FunctionArgExpr::Expr(e), .. } => e,
+                                    sql::FunctionArg::Unnamed(sql::FunctionArgExpr::Wildcard) |
+                                    sql::FunctionArg::Named { arg: sql::FunctionArgExpr::Wildcard, .. } => {
+                                        // COUNT(*) case
+                                        return Ok(BoundTableRef::Pivot {
+                                            source: Box::new(source),
+                                            aggregate_function: name,
+                                            aggregate_arg: BoundExpression::new(
+                                                super::bound_expression::BoundExpressionKind::Constant(ironduck_common::Value::BigInt(1)),
+                                                ironduck_common::LogicalType::BigInt,
+                                            ),
+                                            value_column: value_column.iter().map(|i| i.value.clone()).collect::<Vec<_>>().join("."),
+                                            pivot_values: extract_pivot_values(value_source)?,
+                                            alias: alias.as_ref().map(|a| a.name.value.clone()),
+                                        });
+                                    }
+                                    _ => return Err(Error::NotImplemented("Unsupported PIVOT aggregate argument".to_string())),
+                                };
+                                // Create a simple context for binding
+                                let refs = vec![source.clone()];
+                                let ctx = ExpressionBinderContext::new(&refs);
+                                bind_expression(binder, arg_expr, &ctx)?
+                            }
+                        }
+                    };
+                    (name, arg)
+                }
+                _ => return Err(Error::InvalidArguments("PIVOT requires aggregate function".to_string())),
+            };
+
+            let pivot_column = value_column.iter().map(|i| i.value.clone()).collect::<Vec<_>>().join(".");
+            let pivot_vals = extract_pivot_values(value_source)?;
+
+            Ok(BoundTableRef::Pivot {
+                source: Box::new(source),
+                aggregate_function: agg_name,
+                aggregate_arg: agg_arg,
+                value_column: pivot_column,
+                pivot_values: pivot_vals,
+                alias: alias.as_ref().map(|a| a.name.value.clone()),
+            })
+        }
+
+        sql::TableFactor::Unpivot {
+            table,
+            value,
+            name,
+            columns,
+            alias,
+        } => {
+            // Recursively bind the source table
+            let source = bind_table_factor_with_ctes_and_outer(binder, table, ctes, outer_tables)?;
+
+            Ok(BoundTableRef::Unpivot {
+                source: Box::new(source),
+                value_column: value.value.clone(),
+                name_column: name.value.clone(),
+                unpivot_columns: columns.iter().map(|c| c.value.clone()).collect(),
+                alias: alias.as_ref().map(|a| a.name.value.clone()),
+            })
+        }
+
         _ => Err(Error::NotImplemented(format!("Table factor: {:?}", factor))),
+    }
+}
+
+/// Extract pivot values from PivotValueSource
+fn extract_pivot_values(value_source: &sql::PivotValueSource) -> Result<Vec<String>> {
+    match value_source {
+        sql::PivotValueSource::List(exprs) => {
+            exprs.iter().map(|expr_with_alias| {
+                match &expr_with_alias.expr {
+                    sql::Expr::Value(sql::Value::SingleQuotedString(s)) => Ok(s.clone()),
+                    sql::Expr::Value(sql::Value::DoubleQuotedString(s)) => Ok(s.clone()),
+                    sql::Expr::Value(sql::Value::Number(n, _)) => Ok(n.clone()),
+                    sql::Expr::Identifier(ident) => Ok(ident.value.clone()),
+                    _ => Err(Error::NotImplemented(format!("Unsupported PIVOT value: {:?}", expr_with_alias.expr))),
+                }
+            }).collect()
+        }
+        sql::PivotValueSource::Any(_) => {
+            Err(Error::NotImplemented("PIVOT with ANY not supported".to_string()))
+        }
+        sql::PivotValueSource::Subquery(_) => {
+            Err(Error::NotImplemented("PIVOT with subquery not supported".to_string()))
+        }
     }
 }
 
@@ -2076,6 +2203,12 @@ fn expand_qualified_wildcard(
             *col_offset += column_names.len();
             matches
         }
+        BoundTableRef::Pivot { source, .. } => {
+            expand_qualified_wildcard(source, target_name, table_idx, col_offset, select_list)
+        }
+        BoundTableRef::Unpivot { source, .. } => {
+            expand_qualified_wildcard(source, target_name, table_idx, col_offset, select_list)
+        }
         BoundTableRef::Empty => false,
     }
 }
@@ -2219,6 +2352,12 @@ fn expand_qualified_wildcard_with_skip(
             }
             *col_offset += column_names.len();
             matches
+        }
+        BoundTableRef::Pivot { source, .. } => {
+            expand_qualified_wildcard_with_skip(source, target_name, table_idx, col_offset, select_list, skip_columns)
+        }
+        BoundTableRef::Unpivot { source, .. } => {
+            expand_qualified_wildcard_with_skip(source, target_name, table_idx, col_offset, select_list, skip_columns)
         }
         BoundTableRef::Empty => false,
     }
@@ -2378,6 +2517,12 @@ fn expand_qualified_wildcard_with_options(
             *col_offset += column_names.len();
             matches
         }
+        BoundTableRef::Pivot { source, .. } => {
+            expand_qualified_wildcard_with_options(source, target_name, table_idx, col_offset, select_list, exclude_columns, replace_map)
+        }
+        BoundTableRef::Unpivot { source, .. } => {
+            expand_qualified_wildcard_with_options(source, target_name, table_idx, col_offset, select_list, exclude_columns, replace_map)
+        }
         BoundTableRef::Empty => false,
     }
 }
@@ -2403,6 +2548,12 @@ fn matches_table_name(table_ref: &BoundTableRef, name: &str) -> bool {
         }
         BoundTableRef::RecursiveCTERef { cte_name, alias, .. } => {
             alias.eq_ignore_ascii_case(name) || cte_name.eq_ignore_ascii_case(name)
+        }
+        BoundTableRef::Pivot { alias, .. } => {
+            alias.as_ref().map(|a| a.eq_ignore_ascii_case(name)).unwrap_or(false)
+        }
+        BoundTableRef::Unpivot { alias, .. } => {
+            alias.as_ref().map(|a| a.eq_ignore_ascii_case(name)).unwrap_or(false)
         }
         BoundTableRef::Empty => false,
     }
@@ -2566,6 +2717,139 @@ fn expand_wildcard_with_options(
             }
             *col_offset += column_names.len();
         }
+        BoundTableRef::Pivot { source, aggregate_arg, value_column, pivot_values, .. } => {
+            // For PIVOT, we need to produce: group columns + pivot value columns
+            let source_cols = get_table_ref_columns(source);
+            let source_types = get_table_ref_types(source);
+            let value_column_lower = value_column.to_lowercase();
+
+            // Find the aggregate arg column name if it's a column ref
+            let agg_arg_name = match &aggregate_arg.expr {
+                super::BoundExpressionKind::ColumnRef { name, .. } => Some(name.to_lowercase()),
+                _ => None,
+            };
+
+            let mut local_col_idx = 0;
+            // Add group columns (source columns except value_column and aggregate_arg)
+            for (idx, (name, typ)) in source_cols.iter().zip(source_types.iter()).enumerate() {
+                let c_lower = name.to_lowercase();
+                if c_lower != value_column_lower && agg_arg_name.as_ref().map_or(true, |an| c_lower != *an) {
+                    let should_exclude = exclude_columns.iter().any(|ec| ec.eq_ignore_ascii_case(name));
+                    if !should_exclude {
+                        if let Some(replacement) = replace_map.get(&name.to_uppercase()) {
+                            let mut replaced = replacement.clone();
+                            replaced.alias = Some(name.clone());
+                            select_list.push(replaced);
+                        } else {
+                            select_list.push(BoundExpression::new(
+                                super::BoundExpressionKind::ColumnRef {
+                                    table_idx,
+                                    column_idx: *col_offset + local_col_idx,
+                                    name: name.clone(),
+                                },
+                                typ.clone(),
+                            ));
+                        }
+                    }
+                    local_col_idx += 1;
+                }
+            }
+
+            // Add pivot value columns
+            for pivot_val in pivot_values {
+                let should_exclude = exclude_columns.iter().any(|ec| ec.eq_ignore_ascii_case(pivot_val));
+                if !should_exclude {
+                    if let Some(replacement) = replace_map.get(&pivot_val.to_uppercase()) {
+                        let mut replaced = replacement.clone();
+                        replaced.alias = Some(pivot_val.clone());
+                        select_list.push(replaced);
+                    } else {
+                        select_list.push(BoundExpression::new(
+                            super::BoundExpressionKind::ColumnRef {
+                                table_idx,
+                                column_idx: *col_offset + local_col_idx,
+                                name: pivot_val.clone(),
+                            },
+                            ironduck_common::LogicalType::Unknown,
+                        ));
+                    }
+                }
+                local_col_idx += 1;
+            }
+            *col_offset += local_col_idx;
+        }
+        BoundTableRef::Unpivot { source, value_column, name_column, unpivot_columns, .. } => {
+            // For UNPIVOT, we need to produce: keep columns + name column + value column
+            let source_cols = get_table_ref_columns(source);
+            let source_types = get_table_ref_types(source);
+            let unpivot_lower: Vec<String> = unpivot_columns.iter().map(|c| c.to_lowercase()).collect();
+
+            let mut local_col_idx = 0;
+            // Add keep columns (source columns not being unpivoted)
+            for (name, typ) in source_cols.iter().zip(source_types.iter()) {
+                if !unpivot_lower.contains(&name.to_lowercase()) {
+                    let should_exclude = exclude_columns.iter().any(|ec| ec.eq_ignore_ascii_case(name));
+                    if !should_exclude {
+                        if let Some(replacement) = replace_map.get(&name.to_uppercase()) {
+                            let mut replaced = replacement.clone();
+                            replaced.alias = Some(name.clone());
+                            select_list.push(replaced);
+                        } else {
+                            select_list.push(BoundExpression::new(
+                                super::BoundExpressionKind::ColumnRef {
+                                    table_idx,
+                                    column_idx: *col_offset + local_col_idx,
+                                    name: name.clone(),
+                                },
+                                typ.clone(),
+                            ));
+                        }
+                    }
+                    local_col_idx += 1;
+                }
+            }
+
+            // Add name column first (contains column names)
+            let should_exclude_name = exclude_columns.iter().any(|ec| ec.eq_ignore_ascii_case(name_column));
+            if !should_exclude_name {
+                if let Some(replacement) = replace_map.get(&name_column.to_uppercase()) {
+                    let mut replaced = replacement.clone();
+                    replaced.alias = Some(name_column.clone());
+                    select_list.push(replaced);
+                } else {
+                    select_list.push(BoundExpression::new(
+                        super::BoundExpressionKind::ColumnRef {
+                            table_idx,
+                            column_idx: *col_offset + local_col_idx,
+                            name: name_column.clone(),
+                        },
+                        ironduck_common::LogicalType::Varchar,
+                    ));
+                }
+            }
+            local_col_idx += 1;
+
+            // Add value column second (contains values)
+            let should_exclude_value = exclude_columns.iter().any(|ec| ec.eq_ignore_ascii_case(value_column));
+            if !should_exclude_value {
+                if let Some(replacement) = replace_map.get(&value_column.to_uppercase()) {
+                    let mut replaced = replacement.clone();
+                    replaced.alias = Some(value_column.clone());
+                    select_list.push(replaced);
+                } else {
+                    select_list.push(BoundExpression::new(
+                        super::BoundExpressionKind::ColumnRef {
+                            table_idx,
+                            column_idx: *col_offset + local_col_idx,
+                            name: value_column.clone(),
+                        },
+                        ironduck_common::LogicalType::Unknown,
+                    ));
+                }
+            }
+            local_col_idx += 1;
+            *col_offset += local_col_idx;
+        }
         BoundTableRef::Empty => {}
     }
 }
@@ -2677,6 +2961,12 @@ fn expand_wildcard_rec_with_skip(
             }
             *col_offset += local_col_idx;
         }
+        BoundTableRef::Pivot { source, .. } => {
+            expand_wildcard_rec_with_skip(source, table_idx, col_offset, select_list, skip_columns);
+        }
+        BoundTableRef::Unpivot { source, .. } => {
+            expand_wildcard_rec_with_skip(source, table_idx, col_offset, select_list, skip_columns);
+        }
         BoundTableRef::Empty => {}
     }
 }
@@ -2760,6 +3050,106 @@ fn get_table_ref_columns(table_ref: &BoundTableRef) -> Vec<String> {
             vec![column_alias.clone().unwrap_or_else(|| "column".to_string())]
         }
         BoundTableRef::RecursiveCTERef { column_names, .. } => column_names.clone(),
+        BoundTableRef::Pivot { source, aggregate_arg, value_column, pivot_values, .. } => {
+            // For pivot, output is: group columns + pivot value columns
+            // Group columns = all source columns EXCEPT value_column and aggregate_arg column
+            let source_cols = get_table_ref_columns(source);
+            let value_column_lower = value_column.to_lowercase();
+
+            // Find the aggregate arg column name if it's a column ref
+            let agg_arg_name = match &aggregate_arg.expr {
+                super::BoundExpressionKind::ColumnRef { name, .. } => Some(name.to_lowercase()),
+                _ => None,
+            };
+
+            // Filter to get only group columns
+            let mut cols: Vec<String> = source_cols.into_iter()
+                .filter(|c| {
+                    let c_lower = c.to_lowercase();
+                    c_lower != value_column_lower && agg_arg_name.as_ref().map_or(true, |an| c_lower != *an)
+                })
+                .collect();
+
+            // Add pivot value columns
+            cols.extend(pivot_values.iter().cloned());
+            cols
+        }
+        BoundTableRef::Unpivot { source, value_column, name_column, unpivot_columns, .. } => {
+            let source_cols = get_table_ref_columns(source);
+            let unpivot_lower: Vec<String> = unpivot_columns.iter().map(|c| c.to_lowercase()).collect();
+            let mut cols: Vec<String> = source_cols.into_iter()
+                .filter(|c| !unpivot_lower.contains(&c.to_lowercase()))
+                .collect();
+            // Order: keep columns, then name column (column names), then value column (values)
+            cols.push(name_column.clone());
+            cols.push(value_column.clone());
+            cols
+        }
+        BoundTableRef::Empty => vec![],
+    }
+}
+
+/// Get column types from a bound table reference
+fn get_table_ref_types(table_ref: &BoundTableRef) -> Vec<ironduck_common::LogicalType> {
+    match table_ref {
+        BoundTableRef::BaseTable { column_types, .. } => column_types.clone(),
+        BoundTableRef::Subquery { subquery, .. } => subquery.output_types(),
+        BoundTableRef::SetOperationSubquery { column_types, .. } => column_types.clone(),
+        BoundTableRef::Join { left, right, .. } => {
+            let mut types = get_table_ref_types(left);
+            types.extend(get_table_ref_types(right));
+            types
+        }
+        BoundTableRef::TableFunction { .. } => vec![ironduck_common::LogicalType::Unknown],
+        BoundTableRef::RecursiveCTERef { column_types, .. } => column_types.clone(),
+        BoundTableRef::Pivot { source, aggregate_arg, value_column, pivot_values, .. } => {
+            let source_cols = get_table_ref_columns(source);
+            let source_types = get_table_ref_types(source);
+            let value_column_lower = value_column.to_lowercase();
+
+            let agg_arg_name = match &aggregate_arg.expr {
+                super::BoundExpressionKind::ColumnRef { name, .. } => Some(name.to_lowercase()),
+                _ => None,
+            };
+
+            // Get types for group columns
+            let mut types: Vec<ironduck_common::LogicalType> = source_cols.iter()
+                .enumerate()
+                .filter(|(_, c)| {
+                    let c_lower = c.to_lowercase();
+                    c_lower != value_column_lower && agg_arg_name.as_ref().map_or(true, |an| c_lower != *an)
+                })
+                .map(|(i, _)| source_types.get(i).cloned().unwrap_or(ironduck_common::LogicalType::Unknown))
+                .collect();
+
+            // Add types for pivot value columns
+            for _ in pivot_values {
+                types.push(ironduck_common::LogicalType::Unknown);
+            }
+            types
+        }
+        BoundTableRef::Unpivot { source, unpivot_columns, .. } => {
+            let source_types = get_table_ref_types(source);
+            let source_cols = get_table_ref_columns(source);
+            let unpivot_lower: Vec<String> = unpivot_columns.iter().map(|c| c.to_lowercase()).collect();
+            let mut types: Vec<ironduck_common::LogicalType> = source_cols.iter()
+                .enumerate()
+                .filter(|(_, c)| !unpivot_lower.contains(&c.to_lowercase()))
+                .map(|(i, _)| source_types.get(i).cloned().unwrap_or(ironduck_common::LogicalType::Unknown))
+                .collect();
+            // Order: keep columns, then name column (varchar), then value column (from source)
+            // Name column is always varchar
+            types.push(ironduck_common::LogicalType::Varchar);
+            // Value column type - take from first unpivoted column
+            if let Some(first_unpivot) = source_cols.iter()
+                .enumerate()
+                .find(|(_, c)| unpivot_lower.contains(&c.to_lowercase())) {
+                types.push(source_types.get(first_unpivot.0).cloned().unwrap_or(ironduck_common::LogicalType::Unknown));
+            } else {
+                types.push(ironduck_common::LogicalType::Unknown);
+            }
+            types
+        }
         BoundTableRef::Empty => vec![],
     }
 }

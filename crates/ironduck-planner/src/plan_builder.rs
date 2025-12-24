@@ -967,6 +967,229 @@ fn build_table_ref_plan(table_ref: &BoundTableRef) -> Result<LogicalOperator> {
             let plan = build_set_operation_plan(set_operation)?;
             Ok(plan.root)
         }
+
+        BoundTableRef::Pivot {
+            source,
+            aggregate_function,
+            aggregate_arg,
+            value_column,
+            pivot_values,
+            ..
+        } => {
+            // Build the source plan
+            let source_plan = build_table_ref_plan(source)?;
+
+            // Get column info from source
+            let source_output = get_table_ref_columns(source);
+            let source_types = get_table_ref_types(source);
+
+            // Find the value column index
+            let value_column_lower = value_column.to_lowercase();
+            let value_column_index = source_output.iter()
+                .position(|c| c.to_lowercase() == value_column_lower)
+                .unwrap_or(0);
+
+            // Find the aggregate arg column index (if it's a column ref)
+            let agg_arg_index = match &aggregate_arg.expr {
+                ironduck_binder::BoundExpressionKind::ColumnRef { column_idx, .. } => Some(*column_idx),
+                _ => None,
+            };
+
+            // Group columns are all columns except the value column and aggregate arg
+            let group_columns: Vec<(String, ironduck_common::LogicalType, usize)> = source_output.iter()
+                .enumerate()
+                .filter(|(idx, _)| *idx != value_column_index && agg_arg_index.map_or(true, |ai| *idx != ai))
+                .map(|(idx, name)| (name.clone(), source_types.get(idx).cloned().unwrap_or(ironduck_common::LogicalType::Unknown), idx))
+                .collect();
+
+            // Convert aggregate function name to AggregateFunction
+            let agg_func = convert_aggregate_function(aggregate_function)?;
+
+            Ok(LogicalOperator::Pivot {
+                input: Box::new(source_plan),
+                aggregate_function: agg_func,
+                aggregate_arg: convert_expression(aggregate_arg),
+                value_column: value_column.clone(),
+                value_column_index,
+                pivot_values: pivot_values.clone(),
+                group_columns,
+            })
+        }
+
+        BoundTableRef::Unpivot {
+            source,
+            value_column,
+            name_column,
+            unpivot_columns,
+            ..
+        } => {
+            // Build the source plan
+            let source_plan = build_table_ref_plan(source)?;
+
+            // Get column info from source
+            let source_output = get_table_ref_columns(source);
+            let source_types = get_table_ref_types(source);
+
+            // Find indices of columns to unpivot
+            let unpivot_lower: Vec<String> = unpivot_columns.iter().map(|c| c.to_lowercase()).collect();
+            let unpivot_cols: Vec<(String, usize, ironduck_common::LogicalType)> = source_output.iter()
+                .enumerate()
+                .filter(|(_, name)| unpivot_lower.contains(&name.to_lowercase()))
+                .map(|(idx, name)| (name.clone(), idx, source_types.get(idx).cloned().unwrap_or(ironduck_common::LogicalType::Unknown)))
+                .collect();
+
+            // Keep columns are all columns not being unpivoted
+            let keep_cols: Vec<(String, usize, ironduck_common::LogicalType)> = source_output.iter()
+                .enumerate()
+                .filter(|(_, name)| !unpivot_lower.contains(&name.to_lowercase()))
+                .map(|(idx, name)| (name.clone(), idx, source_types.get(idx).cloned().unwrap_or(ironduck_common::LogicalType::Unknown)))
+                .collect();
+
+            Ok(LogicalOperator::Unpivot {
+                input: Box::new(source_plan),
+                value_column: value_column.clone(),
+                name_column: name_column.clone(),
+                unpivot_columns: unpivot_cols,
+                keep_columns: keep_cols,
+            })
+        }
+    }
+}
+
+/// Convert aggregate function name to AggregateFunction enum
+fn convert_aggregate_function(name: &str) -> Result<super::AggregateFunction> {
+    match name.to_uppercase().as_str() {
+        "SUM" => Ok(super::AggregateFunction::Sum),
+        "COUNT" => Ok(super::AggregateFunction::Count),
+        "AVG" => Ok(super::AggregateFunction::Avg),
+        "MIN" => Ok(super::AggregateFunction::Min),
+        "MAX" => Ok(super::AggregateFunction::Max),
+        "FIRST" => Ok(super::AggregateFunction::First),
+        "LAST" => Ok(super::AggregateFunction::Last),
+        "STRING_AGG" | "LISTAGG" | "GROUP_CONCAT" => Ok(super::AggregateFunction::StringAgg),
+        "ARRAY_AGG" | "LIST" => Ok(super::AggregateFunction::ArrayAgg),
+        _ => Err(ironduck_common::Error::NotImplemented(format!("Aggregate function {} in PIVOT", name))),
+    }
+}
+
+/// Get column names from a bound table reference
+fn get_table_ref_columns(table_ref: &BoundTableRef) -> Vec<String> {
+    match table_ref {
+        BoundTableRef::BaseTable { column_names, .. } => column_names.clone(),
+        BoundTableRef::Subquery { subquery, .. } => subquery.output_names(),
+        BoundTableRef::Join { left, right, .. } => {
+            let mut cols = get_table_ref_columns(left);
+            cols.extend(get_table_ref_columns(right));
+            cols
+        }
+        BoundTableRef::TableFunction { alias, column_alias, .. } => {
+            vec![column_alias.clone().unwrap_or_else(|| alias.clone().unwrap_or_else(|| "value".to_string()))]
+        }
+        BoundTableRef::RecursiveCTERef { column_names, .. } => column_names.clone(),
+        BoundTableRef::SetOperationSubquery { column_names, .. } => column_names.clone(),
+        BoundTableRef::Pivot { source, aggregate_arg, value_column, pivot_values, .. } => {
+            // For pivot, output is: group columns + pivot value columns
+            // Group columns = all source columns EXCEPT value_column and aggregate_arg column
+            let source_cols = get_table_ref_columns(source);
+            let value_column_lower = value_column.to_lowercase();
+
+            // Find the aggregate arg column name if it's a column ref
+            let agg_arg_name = match &aggregate_arg.expr {
+                ironduck_binder::BoundExpressionKind::ColumnRef { name, .. } => Some(name.to_lowercase()),
+                _ => None,
+            };
+
+            // Filter to get only group columns
+            let mut cols: Vec<String> = source_cols.into_iter()
+                .filter(|c| {
+                    let c_lower = c.to_lowercase();
+                    c_lower != value_column_lower && agg_arg_name.as_ref().map_or(true, |an| c_lower != *an)
+                })
+                .collect();
+
+            // Add pivot value columns
+            cols.extend(pivot_values.iter().cloned());
+            cols
+        }
+        BoundTableRef::Unpivot { source, value_column, name_column, unpivot_columns, .. } => {
+            let source_cols = get_table_ref_columns(source);
+            let unpivot_lower: Vec<String> = unpivot_columns.iter().map(|c| c.to_lowercase()).collect();
+            let mut cols: Vec<String> = source_cols.into_iter()
+                .filter(|c| !unpivot_lower.contains(&c.to_lowercase()))
+                .collect();
+            // Order: keep columns, then name column (column names), then value column (values)
+            cols.push(name_column.clone());
+            cols.push(value_column.clone());
+            cols
+        }
+        BoundTableRef::Empty => vec![],
+    }
+}
+
+/// Get column types from a bound table reference
+fn get_table_ref_types(table_ref: &BoundTableRef) -> Vec<ironduck_common::LogicalType> {
+    match table_ref {
+        BoundTableRef::BaseTable { column_types, .. } => column_types.clone(),
+        BoundTableRef::Subquery { subquery, .. } => subquery.output_types(),
+        BoundTableRef::Join { left, right, .. } => {
+            let mut types = get_table_ref_types(left);
+            types.extend(get_table_ref_types(right));
+            types
+        }
+        BoundTableRef::TableFunction { .. } => vec![ironduck_common::LogicalType::Unknown],
+        BoundTableRef::RecursiveCTERef { column_types, .. } => column_types.clone(),
+        BoundTableRef::SetOperationSubquery { column_types, .. } => column_types.clone(),
+        BoundTableRef::Pivot { source, aggregate_arg, value_column, pivot_values, .. } => {
+            // For pivot, types are: group column types + one for each pivot value
+            let source_cols = get_table_ref_columns(source);
+            let source_types = get_table_ref_types(source);
+            let value_column_lower = value_column.to_lowercase();
+
+            // Find the aggregate arg column name if it's a column ref
+            let agg_arg_name = match &aggregate_arg.expr {
+                ironduck_binder::BoundExpressionKind::ColumnRef { name, .. } => Some(name.to_lowercase()),
+                _ => None,
+            };
+
+            // Get types for group columns
+            let mut types: Vec<ironduck_common::LogicalType> = source_cols.iter()
+                .enumerate()
+                .filter(|(_, c)| {
+                    let c_lower = c.to_lowercase();
+                    c_lower != value_column_lower && agg_arg_name.as_ref().map_or(true, |an| c_lower != *an)
+                })
+                .map(|(i, _)| source_types.get(i).cloned().unwrap_or(ironduck_common::LogicalType::Unknown))
+                .collect();
+
+            // Add types for pivot value columns (aggregate result type, typically numeric)
+            for _ in pivot_values {
+                types.push(ironduck_common::LogicalType::Unknown);
+            }
+            types
+        }
+        BoundTableRef::Unpivot { source, unpivot_columns, .. } => {
+            let source_types = get_table_ref_types(source);
+            let source_cols = get_table_ref_columns(source);
+            let unpivot_lower: Vec<String> = unpivot_columns.iter().map(|c| c.to_lowercase()).collect();
+            let mut types: Vec<ironduck_common::LogicalType> = source_cols.iter()
+                .enumerate()
+                .filter(|(_, c)| !unpivot_lower.contains(&c.to_lowercase()))
+                .map(|(i, _)| source_types.get(i).cloned().unwrap_or(ironduck_common::LogicalType::Unknown))
+                .collect();
+            // Order: keep columns, then name column (varchar), then value column (from source)
+            // Name column is always varchar
+            types.push(ironduck_common::LogicalType::Varchar);
+            // Value column type - take from first unpivoted column
+            if let Some(first_unpivot) = source_cols.iter()
+                .enumerate()
+                .find(|(_, c)| unpivot_lower.contains(&c.to_lowercase())) {
+                types.push(source_types.get(first_unpivot.0).cloned().unwrap_or(ironduck_common::LogicalType::Unknown));
+            } else {
+                types.push(ironduck_common::LogicalType::Unknown);
+            }
+            types
+        }
+        BoundTableRef::Empty => vec![],
     }
 }
 

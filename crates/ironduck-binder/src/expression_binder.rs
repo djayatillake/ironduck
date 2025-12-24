@@ -956,6 +956,12 @@ fn collect_base_tables_rec(table_ref: &BoundTableRef, result: &mut Vec<(String, 
         BoundTableRef::SetOperationSubquery { alias, column_names, column_types, .. } => {
             result.push((alias.clone(), Some(alias.clone()), column_names.clone(), column_types.clone()));
         }
+        BoundTableRef::Pivot { source, .. } => {
+            collect_base_tables_rec(source, result);
+        }
+        BoundTableRef::Unpivot { source, .. } => {
+            collect_base_tables_rec(source, result);
+        }
         BoundTableRef::Empty => {}
     }
 }

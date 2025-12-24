@@ -223,6 +223,34 @@ pub enum BoundTableRef {
         /// Column types from the CTE
         column_types: Vec<LogicalType>,
     },
+    /// PIVOT operation - transforms rows to columns
+    Pivot {
+        /// The source table/subquery
+        source: Box<BoundTableRef>,
+        /// Aggregate function (e.g., SUM, COUNT)
+        aggregate_function: String,
+        /// Argument to the aggregate function
+        aggregate_arg: BoundExpression,
+        /// Column to pivot on (the FOR column)
+        value_column: String,
+        /// Values to create columns for (the IN values)
+        pivot_values: Vec<String>,
+        /// Alias for the result
+        alias: Option<String>,
+    },
+    /// UNPIVOT operation - transforms columns to rows
+    Unpivot {
+        /// The source table/subquery
+        source: Box<BoundTableRef>,
+        /// Name for the value column
+        value_column: String,
+        /// Name for the name column
+        name_column: String,
+        /// Columns to unpivot
+        unpivot_columns: Vec<String>,
+        /// Alias for the result
+        alias: Option<String>,
+    },
     /// Empty (for SELECT without FROM)
     Empty,
 }

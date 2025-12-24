@@ -1,0 +1,85 @@
+# Test PIVOT and UNPIVOT operations
+
+# Create a test table for pivot
+statement ok
+CREATE TABLE sales (
+    product VARCHAR,
+    quarter VARCHAR,
+    amount INTEGER
+);
+
+statement ok
+INSERT INTO sales VALUES
+    ('Widget', 'Q1', 100),
+    ('Widget', 'Q2', 150),
+    ('Widget', 'Q3', 120),
+    ('Widget', 'Q4', 180),
+    ('Gadget', 'Q1', 200),
+    ('Gadget', 'Q2', 180),
+    ('Gadget', 'Q3', 220),
+    ('Gadget', 'Q4', 240);
+
+# Basic PIVOT - transform rows to columns
+query TIIII
+SELECT *
+FROM sales
+PIVOT (
+    SUM(amount)
+    FOR quarter IN ('Q1', 'Q2', 'Q3', 'Q4')
+)
+ORDER BY product;
+----
+Gadget
+200
+180
+220
+240
+Widget
+100
+150
+120
+180
+
+# Create a table for UNPIVOT
+statement ok
+CREATE TABLE quarterly_sales (
+    product VARCHAR,
+    Q1 INTEGER,
+    Q2 INTEGER,
+    Q3 INTEGER,
+    Q4 INTEGER
+);
+
+statement ok
+INSERT INTO quarterly_sales VALUES
+    ('Widget', 100, 150, 120, 180),
+    ('Gadget', 200, 180, 220, 240);
+
+# Basic UNPIVOT - transform columns to rows (without ORDER BY on new columns)
+query TTI
+SELECT * FROM quarterly_sales UNPIVOT (amount FOR quarter IN (Q1, Q2, Q3, Q4));
+----
+Widget
+Q1
+100
+Widget
+Q2
+150
+Widget
+Q3
+120
+Widget
+Q4
+180
+Gadget
+Q1
+200
+Gadget
+Q2
+180
+Gadget
+Q3
+220
+Gadget
+Q4
+240

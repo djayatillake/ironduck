@@ -212,6 +212,38 @@ pub enum LogicalOperator {
         column_name: String,
         output_type: LogicalType,
     },
+
+    /// PIVOT operation - transforms rows to columns based on pivot values
+    Pivot {
+        /// Source operator to pivot
+        input: Box<LogicalOperator>,
+        /// Aggregate function name (e.g., SUM, COUNT)
+        aggregate_function: AggregateFunction,
+        /// Expression to aggregate
+        aggregate_arg: Expression,
+        /// Name of the column to pivot on
+        value_column: String,
+        /// Index of the value column in the input
+        value_column_index: usize,
+        /// Values to create columns for
+        pivot_values: Vec<String>,
+        /// Columns that are not the value column or aggregate arg (GROUP BY columns)
+        group_columns: Vec<(String, LogicalType, usize)>,
+    },
+
+    /// UNPIVOT operation - transforms columns to rows
+    Unpivot {
+        /// Source operator to unpivot
+        input: Box<LogicalOperator>,
+        /// Name for the value column (contains the values from unpivoted columns)
+        value_column: String,
+        /// Name for the name column (contains the column names)
+        name_column: String,
+        /// Columns to unpivot (name, index, type)
+        unpivot_columns: Vec<(String, usize, LogicalType)>,
+        /// Columns to keep (non-unpivoted columns): (name, index, type)
+        keep_columns: Vec<(String, usize, LogicalType)>,
+    },
 }
 
 /// Types of table-valued functions
@@ -290,6 +322,28 @@ impl LogicalOperator {
             LogicalOperator::RecursiveCTEScan { output_types, .. } => output_types.clone(),
             LogicalOperator::NoOp => vec![LogicalType::Varchar],
             LogicalOperator::TableFunction { output_type, .. } => vec![output_type.clone()],
+            LogicalOperator::Pivot { group_columns, pivot_values, .. } => {
+                // Output types: group columns + one column for each pivot value
+                let mut types: Vec<LogicalType> = group_columns.iter().map(|(_, t, _)| t.clone()).collect();
+                // Each pivot value column has the aggregate's output type (usually numeric)
+                for _ in pivot_values {
+                    types.push(LogicalType::Unknown); // Will be refined during execution
+                }
+                types
+            }
+            LogicalOperator::Unpivot { keep_columns, unpivot_columns, .. } => {
+                // Output types: keep columns + name column + value column
+                let mut types: Vec<LogicalType> = keep_columns.iter().map(|(_, _, t)| t.clone()).collect();
+                // Name column is always varchar
+                types.push(LogicalType::Varchar);
+                // Value column type is the common type of all unpivoted columns
+                if let Some((_, _, first_type)) = unpivot_columns.first() {
+                    types.push(first_type.clone());
+                } else {
+                    types.push(LogicalType::Unknown);
+                }
+                types
+            }
         }
     }
 }

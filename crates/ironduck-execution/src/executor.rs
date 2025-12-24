@@ -1708,7 +1708,153 @@ impl Executor {
                     )))
                 }
             }
+
+            LogicalOperator::Pivot {
+                input,
+                aggregate_function,
+                aggregate_arg,
+                value_column: _,
+                value_column_index,
+                pivot_values,
+                group_columns,
+            } => {
+                let input_rows = self.execute_operator(input)?;
+
+                // Group rows by the group columns - use String key since Value doesn't implement Hash
+                let mut groups: std::collections::HashMap<String, (Vec<Value>, Vec<Vec<Value>>)> = std::collections::HashMap::new();
+
+                for row in &input_rows {
+                    let group_key_values: Vec<Value> = group_columns.iter()
+                        .map(|(_, _, idx)| row.get(*idx).cloned().unwrap_or(Value::Null))
+                        .collect();
+                    let group_key = format!("{:?}", group_key_values);
+                    groups.entry(group_key).or_insert_with(|| (group_key_values.clone(), Vec::new())).1.push(row.clone());
+                }
+
+                // For each group, compute aggregates for each pivot value
+                let mut result = Vec::new();
+
+                for (_key, (group_key_values, group_rows)) in groups {
+                    let mut output_row = group_key_values;
+
+                    // For each pivot value, filter rows and compute aggregate
+                    for pivot_val in pivot_values {
+                        // Filter rows where value_column matches pivot_val
+                        let matching_rows: Vec<&Vec<Value>> = group_rows.iter()
+                            .filter(|row| {
+                                if let Some(val) = row.get(*value_column_index) {
+                                    val.to_string() == *pivot_val || format!("{:?}", val) == *pivot_val
+                                } else {
+                                    false
+                                }
+                            })
+                            .collect();
+
+                        // Compute aggregate on matching rows
+                        let agg_result = if matching_rows.is_empty() {
+                            Value::Null
+                        } else {
+                            let agg_values: Vec<Value> = matching_rows.iter()
+                                .map(|row| evaluate(aggregate_arg, row).unwrap_or(Value::Null))
+                                .collect();
+                            compute_pivot_aggregate(aggregate_function, &agg_values)
+                        };
+
+                        output_row.push(agg_result);
+                    }
+
+                    result.push(output_row);
+                }
+
+                Ok(result)
+            }
+
+            LogicalOperator::Unpivot {
+                input,
+                value_column: _,
+                name_column: _,
+                unpivot_columns,
+                keep_columns,
+            } => {
+                let input_rows = self.execute_operator(input)?;
+                let mut result = Vec::new();
+
+                for row in &input_rows {
+                    // For each unpivot column, create a new row
+                    for (col_name, col_idx, _) in unpivot_columns {
+                        let mut output_row = Vec::new();
+
+                        // Add keep columns
+                        for (_, idx, _) in keep_columns {
+                            output_row.push(row.get(*idx).cloned().unwrap_or(Value::Null));
+                        }
+
+                        // Order: keep columns, then name column (column name), then value column (value)
+                        // Add name column (the column name) first
+                        output_row.push(Value::Varchar(col_name.clone()));
+
+                        // Add value column (the actual value from the unpivoted column) second
+                        output_row.push(row.get(*col_idx).cloned().unwrap_or(Value::Null));
+
+                        result.push(output_row);
+                    }
+                }
+
+                Ok(result)
+            }
         }
+    }
+}
+
+/// Compute a simple aggregate value from a list of values (for PIVOT)
+fn compute_pivot_aggregate(func: &ironduck_planner::AggregateFunction, values: &[Value]) -> Value {
+    use ironduck_planner::AggregateFunction;
+
+    match func {
+        AggregateFunction::Count => Value::BigInt(values.len() as i64),
+        AggregateFunction::Sum => {
+            let mut sum = 0.0f64;
+            let mut has_value = false;
+            for v in values {
+                if let Some(n) = v.as_f64() {
+                    sum += n;
+                    has_value = true;
+                }
+            }
+            if has_value { Value::Double(sum) } else { Value::Null }
+        }
+        AggregateFunction::Avg => {
+            let mut sum = 0.0f64;
+            let mut count = 0;
+            for v in values {
+                if let Some(n) = v.as_f64() {
+                    sum += n;
+                    count += 1;
+                }
+            }
+            if count > 0 { Value::Double(sum / count as f64) } else { Value::Null }
+        }
+        AggregateFunction::Min => {
+            values.iter()
+                .filter(|v| !matches!(v, Value::Null))
+                .min_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+                .cloned()
+                .unwrap_or(Value::Null)
+        }
+        AggregateFunction::Max => {
+            values.iter()
+                .filter(|v| !matches!(v, Value::Null))
+                .max_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+                .cloned()
+                .unwrap_or(Value::Null)
+        }
+        AggregateFunction::First => {
+            values.first().cloned().unwrap_or(Value::Null)
+        }
+        AggregateFunction::Last => {
+            values.last().cloned().unwrap_or(Value::Null)
+        }
+        _ => Value::Null,
     }
 }
 
@@ -1902,6 +2048,28 @@ fn format_plan(op: &LogicalOperator, indent: usize) -> String {
         }
         LogicalOperator::RecursiveCTEScan { cte_name, .. } => {
             format!("{}RecursiveCTEScan: {}", prefix, cte_name)
+        }
+        LogicalOperator::Pivot { input, aggregate_function, value_column, pivot_values, .. } => {
+            format!(
+                "{}Pivot ({:?}({}) FOR {} IN ({}))\n{}",
+                prefix,
+                aggregate_function,
+                value_column,
+                value_column,
+                pivot_values.join(", "),
+                format_plan(input, indent + 1)
+            )
+        }
+        LogicalOperator::Unpivot { input, value_column, name_column, unpivot_columns, .. } => {
+            let col_names: Vec<_> = unpivot_columns.iter().map(|(name, _, _)| name.as_str()).collect();
+            format!(
+                "{}Unpivot ({} FOR {} IN ({}))\n{}",
+                prefix,
+                value_column,
+                name_column,
+                col_names.join(", "),
+                format_plan(input, indent + 1)
+            )
         }
     }
 }
