@@ -570,6 +570,7 @@ impl Executor {
                 schema,
                 name,
                 columns,
+                default_values,
                 if_not_exists,
                 source,
             } => {
@@ -582,8 +583,16 @@ impl Executor {
                     }
                 }
 
-                // Create the table in catalog
-                self.catalog.create_table(schema, name, columns.clone())?;
+                // Evaluate default value expressions
+                let defaults: Vec<Option<Value>> = default_values
+                    .iter()
+                    .map(|opt_expr| {
+                        opt_expr.as_ref().map(|expr| evaluate(expr, &[]).unwrap_or(Value::Null))
+                    })
+                    .collect();
+
+                // Create the table in catalog with defaults
+                self.catalog.create_table_with_defaults(schema, name, columns.clone(), defaults)?;
 
                 // Create storage for the table
                 let types: Vec<_> = columns.iter().map(|(_, t)| t.clone()).collect();
@@ -664,7 +673,7 @@ impl Executor {
             LogicalOperator::Insert {
                 schema,
                 table,
-                columns,
+                columns: insert_columns,
                 values,
                 source,
             } => {
@@ -674,35 +683,88 @@ impl Executor {
                     .get_table(schema, table)
                     .ok_or_else(|| Error::TableNotFound(table.clone()))?;
 
-                // Get column types
+                // Get column types and defaults
                 let types: Vec<_> = table_info.columns.iter().map(|c| c.logical_type.clone()).collect();
+                let defaults: Vec<Option<Value>> = table_info.columns.iter().map(|c| c.default_value.clone()).collect();
+                let table_column_names: Vec<_> = table_info.columns.iter().map(|c| c.name.to_lowercase()).collect();
 
                 // Get or create storage
                 let table_data = self.storage.get_or_create(schema, table, &types);
 
                 let mut count = 0;
 
+                // Build column mapping if we have a partial column list
+                let column_indices: Option<Vec<usize>> = if !insert_columns.is_empty() {
+                    Some(insert_columns.iter().map(|col| {
+                        table_column_names.iter().position(|tc| tc == &col.to_lowercase())
+                            .unwrap_or(0) // fallback
+                    }).collect())
+                } else {
+                    None
+                };
+
                 // Handle INSERT ... SELECT ...
                 if let Some(source_op) = source {
                     let source_rows = self.execute_operator(source_op)?;
-                    for row in source_rows {
+                    for source_row in source_rows {
+                        let row = if let Some(indices) = &column_indices {
+                            // Partial column list - map values to correct positions
+                            let mut full_row = vec![Value::Null; types.len()];
+                            for (val_idx, &col_idx) in indices.iter().enumerate() {
+                                if val_idx < source_row.len() && col_idx < full_row.len() {
+                                    full_row[col_idx] = coerce_value(source_row[val_idx].clone(), &types[col_idx])?;
+                                }
+                            }
+                            // Fill in defaults for missing columns
+                            for (idx, val) in full_row.iter_mut().enumerate() {
+                                if *val == Value::Null {
+                                    if let Some(default) = &defaults[idx] {
+                                        *val = default.clone();
+                                    }
+                                }
+                            }
+                            full_row
+                        } else {
+                            source_row
+                        };
                         table_data.insert(row);
                         count += 1;
                     }
                 } else {
                     // Handle INSERT ... VALUES (...)
                     for row_exprs in values {
-                        let mut row = Vec::new();
-                        for (idx, expr) in row_exprs.iter().enumerate() {
-                            let val = evaluate(expr, &[])?;
-                            // Coerce to target column type
-                            let coerced = if idx < types.len() {
-                                coerce_value(val, &types[idx])?
-                            } else {
-                                val
-                            };
-                            row.push(coerced);
-                        }
+                        let row = if let Some(indices) = &column_indices {
+                            // Partial column list - map values to correct positions
+                            let mut full_row = vec![Value::Null; types.len()];
+                            for (val_idx, &col_idx) in indices.iter().enumerate() {
+                                if val_idx < row_exprs.len() && col_idx < full_row.len() {
+                                    let val = evaluate(&row_exprs[val_idx], &[])?;
+                                    full_row[col_idx] = coerce_value(val, &types[col_idx])?;
+                                }
+                            }
+                            // Fill in defaults for missing columns
+                            for (idx, val) in full_row.iter_mut().enumerate() {
+                                if *val == Value::Null {
+                                    if let Some(default) = &defaults[idx] {
+                                        *val = default.clone();
+                                    }
+                                }
+                            }
+                            full_row
+                        } else {
+                            // Full row - evaluate all expressions
+                            let mut row = Vec::new();
+                            for (idx, expr) in row_exprs.iter().enumerate() {
+                                let val = evaluate(expr, &[])?;
+                                let coerced = if idx < types.len() {
+                                    coerce_value(val, &types[idx])?
+                                } else {
+                                    val
+                                };
+                                row.push(coerced);
+                            }
+                            row
+                        };
                         table_data.insert(row);
                         count += 1;
                     }
@@ -2724,16 +2786,26 @@ fn compute_aggregate(
         }
 
         PercentileCont => {
-            // PERCENTILE_CONT(percentile, column) - continuous percentile with interpolation
-            // First arg is percentile (0.0-1.0), second arg is the column
-            if args.len() < 2 {
+            // PERCENTILE_CONT(percentile) WITHIN GROUP (ORDER BY column) - continuous percentile
+            // OR PERCENTILE_CONT(percentile, column) for backwards compatibility
+            // First arg is percentile (0.0-1.0)
+            if args.is_empty() {
                 return Ok(Value::Null);
             }
             let percentile = evaluate(&args[0], &[])?.as_f64().unwrap_or(0.5);
 
+            // Get the column expression: either from args[1] or from ORDER BY (WITHIN GROUP)
+            let column_expr = if args.len() >= 2 {
+                &args[1]
+            } else if !agg.order_by.is_empty() {
+                &agg.order_by[0].0
+            } else {
+                return Ok(Value::Null);
+            };
+
             let mut values: Vec<f64> = Vec::new();
             for row in rows {
-                let val = evaluate(&args[1], row)?;
+                let val = evaluate(column_expr, row)?;
                 if let Some(f) = val.as_f64() {
                     values.push(f);
                 }
@@ -2763,16 +2835,26 @@ fn compute_aggregate(
         }
 
         PercentileDisc => {
-            // PERCENTILE_DISC(percentile, column) - discrete percentile (returns actual value)
-            // First arg is percentile (0.0-1.0), second arg is the column
-            if args.len() < 2 {
+            // PERCENTILE_DISC(percentile) WITHIN GROUP (ORDER BY column) - discrete percentile
+            // OR PERCENTILE_DISC(percentile, column) for backwards compatibility
+            // First arg is percentile (0.0-1.0)
+            if args.is_empty() {
                 return Ok(Value::Null);
             }
             let percentile = evaluate(&args[0], &[])?.as_f64().unwrap_or(0.5);
 
+            // Get the column expression: either from args[1] or from ORDER BY (WITHIN GROUP)
+            let column_expr = if args.len() >= 2 {
+                &args[1]
+            } else if !agg.order_by.is_empty() {
+                &agg.order_by[0].0
+            } else {
+                return Ok(Value::Null);
+            };
+
             let mut values: Vec<Value> = Vec::new();
             for row in rows {
-                let val = evaluate(&args[1], row)?;
+                let val = evaluate(column_expr, row)?;
                 if !val.is_null() {
                     values.push(val);
                 }

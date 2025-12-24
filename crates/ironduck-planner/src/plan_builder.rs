@@ -29,6 +29,11 @@ pub fn build_plan(statement: &BoundStatement) -> Result<LogicalPlan> {
                         .iter()
                         .map(|c| (c.name.clone(), c.data_type.clone()))
                         .collect(),
+                    default_values: create
+                        .columns
+                        .iter()
+                        .map(|c| c.default.as_ref().map(convert_expression))
+                        .collect(),
                     if_not_exists: create.if_not_exists,
                     source,
                 },

@@ -1,0 +1,43 @@
+# Percentile and Mode aggregate tests
+
+statement ok
+CREATE TABLE numbers (x INTEGER);
+
+statement ok
+INSERT INTO numbers VALUES (1), (2), (3), (4), (5), (6), (7), (8), (9), (10);
+
+# MEDIAN
+query R
+SELECT MEDIAN(x) FROM numbers;
+----
+5.5
+
+# PERCENTILE_CONT
+query R
+SELECT PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY x) FROM numbers;
+----
+5.5
+
+query R
+SELECT PERCENTILE_CONT(0.25) WITHIN GROUP (ORDER BY x) FROM numbers;
+----
+3.25
+
+# PERCENTILE_DISC
+query I
+SELECT PERCENTILE_DISC(0.5) WITHIN GROUP (ORDER BY x) FROM numbers;
+----
+5
+
+# MODE
+statement ok
+CREATE TABLE modes (v VARCHAR);
+
+statement ok
+INSERT INTO modes VALUES ('a'), ('b'), ('a'), ('c'), ('a'), ('b');
+
+query T
+SELECT MODE(v) FROM modes;
+----
+a
+

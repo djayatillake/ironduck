@@ -1033,7 +1033,7 @@ fn bind_function(
     };
 
     // Extract ORDER BY clause for ordered aggregates (e.g., SUM(x ORDER BY y))
-    let order_by: Vec<(BoundExpression, bool, bool)> = match &func.args {
+    let mut order_by: Vec<(BoundExpression, bool, bool)> = match &func.args {
         sql::FunctionArguments::List(arg_list) => {
             let mut order_by_exprs = Vec::new();
             for clause in &arg_list.clauses {
@@ -1050,6 +1050,17 @@ fn bind_function(
         }
         _ => vec![],
     };
+
+    // Handle WITHIN GROUP (ORDER BY ...) syntax for ordered-set aggregates
+    // e.g., PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY x)
+    if !func.within_group.is_empty() {
+        for order_expr in &func.within_group {
+            let bound_expr = bind_expression(binder, &order_expr.expr, ctx)?;
+            let ascending = order_expr.asc.unwrap_or(true);
+            let nulls_first = order_expr.nulls_first.unwrap_or(!ascending);
+            order_by.push((bound_expr, ascending, nulls_first));
+        }
+    }
 
     // Extract FILTER clause for aggregates (e.g., SUM(x) FILTER (WHERE y > 0))
     let filter: Option<Box<BoundExpression>> = match &func.filter {

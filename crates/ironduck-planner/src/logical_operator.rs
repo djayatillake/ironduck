@@ -79,6 +79,8 @@ pub enum LogicalOperator {
         schema: String,
         name: String,
         columns: Vec<(String, LogicalType)>,
+        /// Default values for each column (None if no default)
+        default_values: Vec<Option<Expression>>,
         if_not_exists: bool,
         /// For CREATE TABLE ... AS SELECT ...
         source: Option<Box<LogicalOperator>>,

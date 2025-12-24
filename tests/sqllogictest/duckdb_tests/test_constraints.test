@@ -1,0 +1,69 @@
+# Table constraint tests
+
+# PRIMARY KEY column definition
+statement ok
+CREATE TABLE pk_test (id INTEGER PRIMARY KEY, name VARCHAR);
+
+statement ok
+INSERT INTO pk_test VALUES (1, 'Alice'), (2, 'Bob');
+
+query IT
+SELECT * FROM pk_test ORDER BY id;
+----
+1
+Alice
+2
+Bob
+
+# UNIQUE column definition
+statement ok
+CREATE TABLE unique_test (id INTEGER, email VARCHAR UNIQUE);
+
+statement ok
+INSERT INTO unique_test VALUES (1, 'alice@test.com'), (2, 'bob@test.com');
+
+query IT
+SELECT * FROM unique_test ORDER BY id;
+----
+1
+alice@test.com
+2
+bob@test.com
+
+# DEFAULT values
+statement ok
+CREATE TABLE default_test (id INTEGER, status VARCHAR DEFAULT 'active');
+
+statement ok
+INSERT INTO default_test (id) VALUES (1), (2);
+
+query IT
+SELECT * FROM default_test ORDER BY id;
+----
+1
+active
+2
+active
+
+statement ok
+INSERT INTO default_test VALUES (3, 'inactive');
+
+query IT
+SELECT * FROM default_test WHERE id = 3;
+----
+3
+inactive
+
+# CHECK constraint (parsing only - enforcement TODO)
+statement ok
+CREATE TABLE check_test (id INTEGER, age INTEGER CHECK (age >= 0));
+
+statement ok
+INSERT INTO check_test VALUES (1, 25);
+
+query II
+SELECT * FROM check_test;
+----
+1
+25
+

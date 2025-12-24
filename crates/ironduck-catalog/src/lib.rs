@@ -3,7 +3,7 @@
 //! The catalog manages database objects: schemas, tables, columns, functions.
 
 use hashbrown::HashMap;
-use ironduck_common::{Error, LogicalType, Result};
+use ironduck_common::{Error, LogicalType, Result, Value};
 use parking_lot::RwLock;
 use std::sync::Arc;
 
@@ -87,6 +87,18 @@ impl Catalog {
         table_name: &str,
         columns: Vec<(String, LogicalType)>,
     ) -> Result<TableId> {
+        let defaults: Vec<Option<Value>> = vec![None; columns.len()];
+        self.create_table_with_defaults(schema_name, table_name, columns, defaults)
+    }
+
+    /// Create a table in the given schema with default values
+    pub fn create_table_with_defaults(
+        &self,
+        schema_name: &str,
+        table_name: &str,
+        columns: Vec<(String, LogicalType)>,
+        default_values: Vec<Option<Value>>,
+    ) -> Result<TableId> {
         let schema = self
             .get_schema(schema_name)
             .ok_or_else(|| Error::SchemaNotFound(schema_name.to_string()))?;
@@ -100,7 +112,7 @@ impl Catalog {
                 name,
                 logical_type,
                 nullable: true,
-                default_value: None,
+                default_value: default_values.get(idx).cloned().flatten(),
             })
             .collect();
 

@@ -1660,6 +1660,9 @@ fn bind_create_table(binder: &Binder, create: &sql::CreateTable) -> Result<Bound
                 data_type: expr.return_type.clone(),
                 nullable: true,
                 default: None,
+                is_primary_key: false,
+                is_unique: false,
+                check: None,
             }
         }).collect();
 
@@ -1680,11 +1683,52 @@ fn bind_create_table(binder: &Binder, create: &sql::CreateTable) -> Result<Bound
             matches!(opt.option, sql::ColumnOption::NotNull)
         });
 
+        // Check for PRIMARY KEY and UNIQUE constraints
+        let mut is_primary_key = false;
+        let mut is_unique = false;
+        let mut default_expr = None;
+        let mut check_expr = None;
+
+        for opt in &col.options {
+            match &opt.option {
+                sql::ColumnOption::Unique { is_primary, .. } => {
+                    if *is_primary {
+                        is_primary_key = true;
+                    } else {
+                        is_unique = true;
+                    }
+                }
+                sql::ColumnOption::Default(expr) => {
+                    // Bind the default expression (in empty context since it can't reference other columns)
+                    let ctx = ExpressionBinderContext::empty();
+                    default_expr = Some(bind_expression(binder, expr, &ctx)?);
+                }
+                sql::ColumnOption::Check(expr) => {
+                    // Bind the CHECK expression with column context
+                    // Create a context with just this column for self-references
+                    let col_ref = BoundTableRef::BaseTable {
+                        schema: "".to_string(),
+                        name: "".to_string(),
+                        alias: None,
+                        column_names: vec![col.name.value.clone()],
+                        column_types: vec![data_type.clone()],
+                    };
+                    let refs = vec![col_ref];
+                    let ctx = ExpressionBinderContext::new(&refs);
+                    check_expr = Some(bind_expression(binder, expr, &ctx)?);
+                }
+                _ => {}
+            }
+        }
+
         columns.push(BoundColumnDef {
             name: col.name.value.clone(),
             data_type,
             nullable,
-            default: None, // TODO: Handle defaults
+            default: default_expr,
+            is_primary_key,
+            is_unique,
+            check: check_expr,
         });
     }
 

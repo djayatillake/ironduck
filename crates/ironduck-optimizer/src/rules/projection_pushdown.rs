@@ -293,12 +293,14 @@ fn pushdown_projections(op: &LogicalOperator, needed: &HashSet<usize>) -> Logica
             schema,
             name,
             columns,
+            default_values,
             if_not_exists,
             source,
         } => LogicalOperator::CreateTable {
             schema: schema.clone(),
             name: name.clone(),
             columns: columns.clone(),
+            default_values: default_values.clone(),
             if_not_exists: *if_not_exists,
             source: source.as_ref().map(|s| {
                 let col_count = s.output_types().len();

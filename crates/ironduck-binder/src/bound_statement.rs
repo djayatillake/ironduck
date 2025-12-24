@@ -319,6 +319,12 @@ pub struct BoundColumnDef {
     pub data_type: LogicalType,
     pub nullable: bool,
     pub default: Option<BoundExpression>,
+    /// Whether this column is a primary key
+    pub is_primary_key: bool,
+    /// Whether this column has a UNIQUE constraint
+    pub is_unique: bool,
+    /// CHECK constraint expression (if any)
+    pub check: Option<BoundExpression>,
 }
 
 /// Bound CREATE SCHEMA statement
