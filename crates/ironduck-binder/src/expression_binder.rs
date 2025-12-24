@@ -938,7 +938,7 @@ fn collect_base_tables_rec(table_ref: &BoundTableRef, result: &mut Vec<(String, 
             collect_base_tables_rec(left, result);
             collect_base_tables_rec(right, result);
         }
-        BoundTableRef::Subquery { subquery, alias } => {
+        BoundTableRef::Subquery { subquery, alias, .. } => {
             // Extract column names from the subquery's select list
             let column_names: Vec<String> = subquery.select_list.iter().map(|e| e.name()).collect();
             let column_types: Vec<LogicalType> = subquery.select_list.iter().map(|e| e.return_type.clone()).collect();

@@ -291,7 +291,13 @@ fn build_select_plan(select: &BoundSelect) -> Result<LogicalPlan> {
     // Check if we have aggregates
     let has_aggregates = select.select_list.iter().any(has_aggregate);
     let has_group_by = !select.group_by.is_empty();
+    let has_grouping_sets = !select.grouping_sets.is_empty();
     let has_having_aggregates = select.having.as_ref().map_or(false, has_aggregate);
+
+    // Handle GROUPING SETS / ROLLUP / CUBE
+    if has_grouping_sets {
+        return build_grouping_sets_plan(select, plan, &output_names);
+    }
 
     if has_aggregates || has_group_by || has_having_aggregates {
         // Build aggregate plan
@@ -385,16 +391,23 @@ fn build_select_plan(select: &BoundSelect) -> Result<LogicalPlan> {
             output_types,
         };
     } else {
-        // Check for window functions
-        let has_windows = select.select_list.iter().any(has_window_function);
+        // Check for window functions in SELECT or QUALIFY
+        let has_windows = select.select_list.iter().any(has_window_function)
+            || select.qualify.as_ref().map_or(false, has_window_function);
 
         if has_windows {
-            // Extract window expressions
-            let window_exprs: Vec<_> = select
+            // Extract window expressions from SELECT list
+            let mut window_exprs: Vec<_> = select
                 .select_list
                 .iter()
                 .filter_map(extract_window_expression)
                 .collect();
+
+            // Also extract window functions from QUALIFY clause
+            let select_window_count = window_exprs.len();
+            if let Some(qualify) = &select.qualify {
+                extract_all_window_expressions(qualify, &mut window_exprs);
+            }
 
             // Get input types for the Window operator
             let input_types = plan.output_types();
@@ -425,6 +438,7 @@ fn build_select_plan(select: &BoundSelect) -> Result<LogicalPlan> {
                     qualify,
                     &select.select_list,
                     input_cols,
+                    select_window_count,
                 );
                 plan = LogicalOperator::Filter {
                     input: Box::new(plan),
@@ -549,6 +563,217 @@ fn build_select_plan(select: &BoundSelect) -> Result<LogicalPlan> {
     }
 
     Ok(LogicalPlan::new(plan, output_names))
+}
+
+/// Build a plan for GROUPING SETS / ROLLUP / CUBE queries.
+/// Each grouping set results in a separate aggregate, and all are combined via UNION ALL.
+fn build_grouping_sets_plan(
+    select: &BoundSelect,
+    input_plan: LogicalOperator,
+    output_names: &[String],
+) -> Result<LogicalPlan> {
+    // Collect aggregates from SELECT list
+    let mut aggregates: Vec<_> = select
+        .select_list
+        .iter()
+        .filter_map(|expr| extract_aggregate(expr))
+        .collect();
+
+    // Also collect aggregates from HAVING clause
+    let having_agg_start = aggregates.len();
+    if let Some(having) = &select.having {
+        collect_aggregates_from_expr(having, &mut aggregates);
+    }
+
+    // Get all unique grouping columns across all grouping sets
+    // These define the canonical column order for the output
+    let all_group_exprs: Vec<super::Expression> = select
+        .grouping_sets
+        .iter()
+        .flatten()
+        .map(convert_expression)
+        .collect::<Vec<_>>();
+
+    // Deduplicate while preserving order
+    let mut unique_group_exprs: Vec<super::Expression> = Vec::new();
+    for expr in &all_group_exprs {
+        if !unique_group_exprs.iter().any(|e| expressions_equal(e, expr)) {
+            unique_group_exprs.push(expr.clone());
+        }
+    }
+    let num_unique_groups = unique_group_exprs.len();
+
+    // Build a plan for each grouping set
+    let mut grouping_set_plans: Vec<LogicalOperator> = Vec::new();
+
+    for grouping_set in &select.grouping_sets {
+        // Convert this grouping set's expressions
+        let gs_exprs: Vec<super::Expression> = grouping_set.iter().map(convert_expression).collect();
+        let gs_len = gs_exprs.len();
+
+        // Build the aggregate for this grouping set
+        let agg_plan = LogicalOperator::Aggregate {
+            input: Box::new(input_plan.clone()),
+            group_by: gs_exprs.clone(),
+            aggregates: aggregates.clone(),
+        };
+
+        // Apply HAVING filter if present
+        let filtered_plan = if let Some(having) = &select.having {
+            let having_predicate = convert_having_expression(
+                having,
+                &gs_exprs,
+                gs_len,
+                &select.select_list,
+                having_agg_start,
+            );
+            LogicalOperator::Filter {
+                input: Box::new(agg_plan),
+                predicate: having_predicate,
+            }
+        } else {
+            agg_plan
+        };
+
+        // Build projection that maps columns to canonical positions
+        // For columns in this grouping set: reference from aggregate output
+        // For columns not in this grouping set: NULL
+        // For aggregates: reference from aggregate output
+        let mut expressions = Vec::new();
+        let mut agg_idx = 0;
+
+        for (idx, bound_expr) in select.select_list.iter().enumerate() {
+            if is_aggregate_expr(bound_expr) {
+                // This is an aggregate - reference it from aggregate output
+                expressions.push(super::Expression::ColumnRef {
+                    table_index: 0,
+                    column_index: gs_len + agg_idx,
+                    name: output_names.get(idx).cloned().unwrap_or_default(),
+                });
+                agg_idx += 1;
+            } else if has_aggregate(bound_expr) {
+                // Expression wrapping an aggregate
+                let agg_ref = super::Expression::ColumnRef {
+                    table_index: 0,
+                    column_index: gs_len + agg_idx,
+                    name: output_names.get(idx).cloned().unwrap_or_default(),
+                };
+                let wrapped = wrap_aggregate_reference(bound_expr, agg_ref);
+                expressions.push(wrapped);
+                agg_idx += 1;
+            } else {
+                // This should be a group by column
+                let converted = convert_expression(bound_expr);
+
+                // Check if this column is in the current grouping set
+                if let Some(pos) = gs_exprs.iter().position(|g| expressions_equal(g, &converted)) {
+                    // Column is in this grouping set - reference it
+                    expressions.push(super::Expression::ColumnRef {
+                        table_index: 0,
+                        column_index: pos,
+                        name: output_names.get(idx).cloned().unwrap_or_default(),
+                    });
+                } else {
+                    // Column is NOT in this grouping set - use NULL
+                    expressions.push(super::Expression::Constant(Value::Null));
+                }
+            }
+        }
+
+        let output_types: Vec<_> = select
+            .select_list
+            .iter()
+            .map(|e| e.return_type.clone())
+            .collect();
+
+        let projected_plan = LogicalOperator::Project {
+            input: Box::new(filtered_plan),
+            expressions,
+            output_names: output_names.to_vec(),
+            output_types,
+        };
+
+        grouping_set_plans.push(projected_plan);
+    }
+
+    // Combine all grouping set plans with UNION ALL
+    let mut result_plan = grouping_set_plans.remove(0);
+    for plan in grouping_set_plans {
+        result_plan = LogicalOperator::SetOperation {
+            left: Box::new(result_plan),
+            right: Box::new(plan),
+            op: SetOperationType::Union,
+            all: true, // UNION ALL to preserve duplicates
+        };
+    }
+
+    // Apply ORDER BY if present
+    if !select.order_by.is_empty() {
+        let order_by: Vec<_> = select
+            .order_by
+            .iter()
+            .map(|o| super::OrderByExpression {
+                expr: convert_order_by_expression(&o.expr, &unique_group_exprs, num_unique_groups, &select.select_list),
+                ascending: o.ascending,
+                nulls_first: o.nulls_first,
+            })
+            .collect();
+
+        result_plan = LogicalOperator::Sort {
+            input: Box::new(result_plan),
+            order_by,
+        };
+    }
+
+    // Apply LIMIT/OFFSET if present
+    if select.limit.is_some() || select.offset.is_some() {
+        result_plan = LogicalOperator::Limit {
+            input: Box::new(result_plan),
+            limit: select.limit,
+            offset: select.offset,
+        };
+    }
+
+    // Apply DISTINCT
+    match &select.distinct {
+        DistinctKind::None => {}
+        DistinctKind::All => {
+            result_plan = LogicalOperator::Distinct {
+                input: Box::new(result_plan),
+                on_exprs: None,
+            };
+        }
+        DistinctKind::On(exprs) => {
+            let on_exprs: Vec<_> = exprs.iter().map(convert_expression).collect();
+            result_plan = LogicalOperator::Distinct {
+                input: Box::new(result_plan),
+                on_exprs: Some(on_exprs),
+            };
+        }
+    }
+
+    Ok(LogicalPlan::new(result_plan, output_names.to_vec()))
+}
+
+/// Convert ORDER BY expression for grouping sets queries
+fn convert_order_by_expression(
+    expr: &BoundExpression,
+    group_by: &[super::Expression],
+    _num_group_by: usize,
+    _select_list: &[BoundExpression],
+) -> super::Expression {
+    let converted = convert_expression(expr);
+
+    // If this is a group by column, reference it directly
+    if let Some(pos) = group_by.iter().position(|g| expressions_equal(g, &converted)) {
+        return super::Expression::ColumnRef {
+            table_index: 0,
+            column_index: pos,
+            name: expr.name(),
+        };
+    }
+
+    converted
 }
 
 /// Build plan for FROM clause
@@ -1244,6 +1469,42 @@ fn has_window_function(expr: &BoundExpression) -> bool {
     }
 }
 
+/// Recursively extract all window expressions from an expression (e.g., in QUALIFY)
+fn extract_all_window_expressions(
+    expr: &BoundExpression,
+    result: &mut Vec<super::WindowExpression>,
+) {
+    match &expr.expr {
+        BoundExpressionKind::WindowFunction { .. } => {
+            if let Some(win_expr) = extract_window_expression(expr) {
+                result.push(win_expr);
+            }
+        }
+        BoundExpressionKind::BinaryOp { left, right, .. } => {
+            extract_all_window_expressions(left, result);
+            extract_all_window_expressions(right, result);
+        }
+        BoundExpressionKind::UnaryOp { expr: inner, .. } => {
+            extract_all_window_expressions(inner, result);
+        }
+        BoundExpressionKind::Function { args, .. } => {
+            for arg in args {
+                extract_all_window_expressions(arg, result);
+            }
+        }
+        BoundExpressionKind::Case { when_clauses, else_result, .. } => {
+            for (cond, res) in when_clauses {
+                extract_all_window_expressions(cond, result);
+                extract_all_window_expressions(res, result);
+            }
+            if let Some(else_res) = else_result {
+                extract_all_window_expressions(else_res, result);
+            }
+        }
+        _ => {}
+    }
+}
+
 /// Extract window expression from bound expression
 fn extract_window_expression(expr: &BoundExpression) -> Option<super::WindowExpression> {
     match &expr.expr {
@@ -1498,16 +1759,19 @@ fn convert_having_expression(
 /// Convert QUALIFY expression with proper window function column references
 /// The QUALIFY clause filters rows after window functions are computed.
 /// Window functions are at columns [input_cols..input_cols + num_windows]
+/// select_window_count is the number of window functions from the SELECT list
 fn convert_qualify_expression(
     expr: &BoundExpression,
     select_list: &[BoundExpression],
     input_cols: usize,
+    select_window_count: usize,
 ) -> super::Expression {
     fn convert_inner(
         expr: &BoundExpression,
         select_list: &[BoundExpression],
         input_cols: usize,
-        window_idx: &mut usize,
+        select_window_count: usize,
+        qualify_window_idx: &mut usize,
     ) -> super::Expression {
         match &expr.expr {
             BoundExpressionKind::WindowFunction { name, .. } => {
@@ -1527,9 +1791,9 @@ fn convert_qualify_expression(
                     }
                 }
                 // Not found in SELECT - it's a window function in QUALIFY only
-                // Reference based on position
-                let idx = *window_idx;
-                *window_idx += 1;
+                // These are positioned after select window functions
+                let idx = select_window_count + *qualify_window_idx;
+                *qualify_window_idx += 1;
                 super::Expression::ColumnRef {
                     table_index: 0,
                     column_index: input_cols + idx,
@@ -1547,16 +1811,16 @@ fn convert_qualify_expression(
             BoundExpressionKind::BinaryOp { left, op, right } => {
                 let logical_op = convert_binary_op(op);
                 super::Expression::BinaryOp {
-                    left: Box::new(convert_inner(left, select_list, input_cols, window_idx)),
+                    left: Box::new(convert_inner(left, select_list, input_cols, select_window_count, qualify_window_idx)),
                     op: logical_op,
-                    right: Box::new(convert_inner(right, select_list, input_cols, window_idx)),
+                    right: Box::new(convert_inner(right, select_list, input_cols, select_window_count, qualify_window_idx)),
                 }
             }
             BoundExpressionKind::UnaryOp { op, expr: inner } => {
                 let logical_op = convert_unary_op(op);
                 super::Expression::UnaryOp {
                     op: logical_op,
-                    expr: Box::new(convert_inner(inner, select_list, input_cols, window_idx)),
+                    expr: Box::new(convert_inner(inner, select_list, input_cols, select_window_count, qualify_window_idx)),
                 }
             }
             BoundExpressionKind::Constant(v) => super::Expression::Constant(v.clone()),
@@ -1564,8 +1828,8 @@ fn convert_qualify_expression(
         }
     }
 
-    let mut window_idx = 0;
-    convert_inner(expr, select_list, input_cols, &mut window_idx)
+    let mut qualify_window_idx = 0;
+    convert_inner(expr, select_list, input_cols, select_window_count, &mut qualify_window_idx)
 }
 
 /// Find a matching output column for an ORDER BY expression

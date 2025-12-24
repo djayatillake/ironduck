@@ -84,8 +84,11 @@ pub struct BoundSelect {
     pub from: Vec<BoundTableRef>,
     /// WHERE clause
     pub where_clause: Option<BoundExpression>,
-    /// GROUP BY expressions
+    /// GROUP BY expressions (simple group by)
     pub group_by: Vec<BoundExpression>,
+    /// GROUPING SETS (for ROLLUP, CUBE, GROUPING SETS)
+    /// Each inner Vec is one grouping set combination
+    pub grouping_sets: Vec<Vec<BoundExpression>>,
     /// HAVING clause
     pub having: Option<BoundExpression>,
     /// QUALIFY clause (filters after window functions are evaluated)
@@ -123,6 +126,7 @@ impl BoundSelect {
             from: Vec::new(),
             where_clause: None,
             group_by: Vec::new(),
+            grouping_sets: Vec::new(),
             having: None,
             qualify: None,
             order_by: Vec::new(),
@@ -143,6 +147,7 @@ impl BoundSelect {
             from: Vec::new(),
             where_clause: None,
             group_by: Vec::new(),
+            grouping_sets: Vec::new(),
             having: None,
             qualify: None,
             order_by: Vec::new(),
@@ -180,6 +185,8 @@ pub enum BoundTableRef {
     Subquery {
         subquery: Box<BoundSelect>,
         alias: String,
+        /// Whether this is a lateral subquery (can reference preceding tables)
+        is_lateral: bool,
     },
     /// Set operation subquery (e.g., (SELECT ... UNION SELECT ...) AS alias)
     SetOperationSubquery {

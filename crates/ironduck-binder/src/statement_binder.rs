@@ -185,6 +185,29 @@ fn bind_query(binder: &Binder, query: &sql::Query) -> Result<BoundStatement> {
     }
 }
 
+/// Bind a query with outer tables for LATERAL support
+/// Outer tables are passed to the SELECT binding as additional context
+fn bind_query_with_outer(
+    binder: &Binder,
+    query: &sql::Query,
+    outer_tables: &[BoundTableRef],
+) -> Result<BoundStatement> {
+    // First, bind any CTEs
+    let ctes = bind_ctes(binder, &query.with)?;
+
+    // For LATERAL, we only support simple SELECT (not set operations for now)
+    match query.body.as_ref() {
+        sql::SetExpr::Select(select) => {
+            let bound = bind_select_with_outer(binder, select, &ctes, outer_tables)?;
+            Ok(BoundStatement::Select(bound))
+        }
+        _ => {
+            // Fall back to regular binding for complex cases
+            bind_query(binder, query)
+        }
+    }
+}
+
 /// Bind CTEs from WITH clause
 fn bind_ctes(binder: &Binder, with: &Option<sql::With>) -> Result<Vec<BoundCTE>> {
     let Some(with_clause) = with else {
@@ -278,9 +301,11 @@ fn bind_recursive_cte(
                 from: vec![BoundTableRef::Subquery {
                     subquery: Box::new(left_select),
                     alias: "union_left".to_string(),
+                    is_lateral: false,
                 }],
                 where_clause: None,
                 group_by: Vec::new(),
+                grouping_sets: Vec::new(),
                 having: None,
                 qualify: None,
                 order_by: Vec::new(),
@@ -553,7 +578,7 @@ fn bind_query_select_with_outer(
 ) -> Result<BoundSelect> {
     // Handle the body
     let select = match query.body.as_ref() {
-        sql::SetExpr::Select(select) => bind_select_with_outer(binder, select, outer_tables)?,
+        sql::SetExpr::Select(select) => bind_select_with_outer(binder, select, &[], outer_tables)?,
         sql::SetExpr::Values(values) => bind_values(binder, values)?,
         _ => return Err(Error::NotImplemented("Complex query body".to_string())),
     };
@@ -730,7 +755,56 @@ fn bind_select_with_ctes(
             }
             sql::GroupByExpr::Expressions(exprs, _) => {
                 for expr in exprs {
-                    result.group_by.push(bind_expression(binder, expr, &ctx)?);
+                    // Check for ROLLUP, CUBE, GROUPING SETS
+                    match expr {
+                        sql::Expr::Rollup(groups) => {
+                            // ROLLUP(a, b) = GROUPING SETS((a, b), (a), ())
+                            let bound_groups: Vec<Vec<BoundExpression>> = groups
+                                .iter()
+                                .map(|g| g.iter().map(|e| bind_expression(binder, e, &ctx)).collect::<Result<Vec<_>>>())
+                                .collect::<Result<Vec<_>>>()?;
+
+                            // Generate all prefix combinations
+                            let flat_groups: Vec<BoundExpression> = bound_groups.into_iter().flatten().collect();
+                            for i in (0..=flat_groups.len()).rev() {
+                                result.grouping_sets.push(flat_groups[..i].to_vec());
+                            }
+                        }
+                        sql::Expr::Cube(groups) => {
+                            // CUBE(a, b) = all combinations: (a, b), (a), (b), ()
+                            let bound_groups: Vec<Vec<BoundExpression>> = groups
+                                .iter()
+                                .map(|g| g.iter().map(|e| bind_expression(binder, e, &ctx)).collect::<Result<Vec<_>>>())
+                                .collect::<Result<Vec<_>>>()?;
+
+                            let flat_groups: Vec<BoundExpression> = bound_groups.into_iter().flatten().collect();
+                            let n = flat_groups.len();
+                            // Generate all 2^n combinations
+                            for mask in 0..(1 << n) {
+                                let mut combo = Vec::new();
+                                for i in 0..n {
+                                    if (mask & (1 << i)) != 0 {
+                                        combo.push(flat_groups[i].clone());
+                                    }
+                                }
+                                result.grouping_sets.push(combo);
+                            }
+                        }
+                        sql::Expr::GroupingSets(sets) => {
+                            // Direct GROUPING SETS
+                            for set in sets {
+                                let bound_set: Vec<BoundExpression> = set
+                                    .iter()
+                                    .map(|e| bind_expression(binder, e, &ctx))
+                                    .collect::<Result<Vec<_>>>()?;
+                                result.grouping_sets.push(bound_set);
+                            }
+                        }
+                        _ => {
+                            // Regular GROUP BY expression
+                            result.group_by.push(bind_expression(binder, expr, &ctx)?);
+                        }
+                    }
                 }
             }
         }
@@ -752,14 +826,15 @@ fn bind_select_with_ctes(
     Ok(result)
 }
 
-/// Bind a SELECT clause with outer context (for correlated subqueries)
+/// Bind a SELECT clause with outer context (for correlated subqueries and LATERAL joins)
 fn bind_select_with_outer(
     binder: &Binder,
     select: &sql::Select,
+    ctes: &[BoundCTE],
     outer_tables: &[BoundTableRef],
 ) -> Result<BoundSelect> {
     // First, bind FROM clause to know available columns
-    let from = bind_from_with_ctes(binder, &select.from, &[])?;
+    let from = bind_from_with_ctes(binder, &select.from, ctes)?;
 
     // Bind SELECT list with outer context
     let mut select_list = Vec::new();
@@ -885,7 +960,48 @@ fn bind_select_with_outer(
             }
             sql::GroupByExpr::Expressions(exprs, _) => {
                 for expr in exprs {
-                    result.group_by.push(bind_expression(binder, expr, &ctx)?);
+                    // Check for ROLLUP, CUBE, GROUPING SETS
+                    match expr {
+                        sql::Expr::Rollup(groups) => {
+                            let bound_groups: Vec<Vec<BoundExpression>> = groups
+                                .iter()
+                                .map(|g| g.iter().map(|e| bind_expression(binder, e, &ctx)).collect::<Result<Vec<_>>>())
+                                .collect::<Result<Vec<_>>>()?;
+                            let flat_groups: Vec<BoundExpression> = bound_groups.into_iter().flatten().collect();
+                            for i in (0..=flat_groups.len()).rev() {
+                                result.grouping_sets.push(flat_groups[..i].to_vec());
+                            }
+                        }
+                        sql::Expr::Cube(groups) => {
+                            let bound_groups: Vec<Vec<BoundExpression>> = groups
+                                .iter()
+                                .map(|g| g.iter().map(|e| bind_expression(binder, e, &ctx)).collect::<Result<Vec<_>>>())
+                                .collect::<Result<Vec<_>>>()?;
+                            let flat_groups: Vec<BoundExpression> = bound_groups.into_iter().flatten().collect();
+                            let n = flat_groups.len();
+                            for mask in 0..(1 << n) {
+                                let mut combo = Vec::new();
+                                for i in 0..n {
+                                    if (mask & (1 << i)) != 0 {
+                                        combo.push(flat_groups[i].clone());
+                                    }
+                                }
+                                result.grouping_sets.push(combo);
+                            }
+                        }
+                        sql::Expr::GroupingSets(sets) => {
+                            for set in sets {
+                                let bound_set: Vec<BoundExpression> = set
+                                    .iter()
+                                    .map(|e| bind_expression(binder, e, &ctx))
+                                    .collect::<Result<Vec<_>>>()?;
+                                result.grouping_sets.push(bound_set);
+                            }
+                        }
+                        _ => {
+                            result.group_by.push(bind_expression(binder, expr, &ctx)?);
+                        }
+                    }
                 }
             }
         }
@@ -958,12 +1074,18 @@ fn bind_from_with_ctes(
 
     let mut result = Vec::new();
     for table_with_joins in from {
-        let base = bind_table_factor_with_ctes(binder, &table_with_joins.relation, ctes)?;
+        // Collect preceding tables for LATERAL support
+        let preceding_tables: Vec<BoundTableRef> = result.clone();
+        let base = bind_table_factor_with_ctes_and_outer(binder, &table_with_joins.relation, ctes, &preceding_tables)?;
 
         // Handle joins
         let mut current = base;
         for join in &table_with_joins.joins {
-            let right = bind_table_factor_with_ctes(binder, &join.relation, ctes)?;
+            // For LATERAL in joins, the left side becomes the preceding context
+            let left_tables = collect_tables_from_ref(&current);
+            let mut all_preceding: Vec<BoundTableRef> = preceding_tables.clone();
+            all_preceding.extend(left_tables);
+            let right = bind_table_factor_with_ctes_and_outer(binder, &join.relation, ctes, &all_preceding)?;
             let join_type = match &join.join_operator {
                 sql::JoinOperator::Inner(_) => BoundJoinType::Inner,
                 sql::JoinOperator::LeftOuter(_) => BoundJoinType::Left,
@@ -1129,6 +1251,16 @@ fn bind_table_factor_with_ctes(
     factor: &sql::TableFactor,
     ctes: &[BoundCTE],
 ) -> Result<BoundTableRef> {
+    bind_table_factor_with_ctes_and_outer(binder, factor, ctes, &[])
+}
+
+/// Bind a table factor with optional outer tables for LATERAL support
+fn bind_table_factor_with_ctes_and_outer(
+    binder: &Binder,
+    factor: &sql::TableFactor,
+    ctes: &[BoundCTE],
+    outer_tables: &[BoundTableRef],
+) -> Result<BoundTableRef> {
     match factor {
         sql::TableFactor::Table { name, alias, args, .. } => {
             let parts: Vec<_> = name.0.iter().map(|i| i.value.clone()).collect();
@@ -1175,6 +1307,7 @@ fn bind_table_factor_with_ctes(
                     return Ok(BoundTableRef::Subquery {
                         subquery: Box::new(cte.query.clone()),
                         alias: alias_name,
+                        is_lateral: false,
                     });
                 }
             }
@@ -1226,6 +1359,7 @@ fn bind_table_factor_with_ctes(
                     return Ok(BoundTableRef::Subquery {
                         subquery: Box::new(bound_select),
                         alias: alias_name,
+                        is_lateral: false,
                     });
                 } else {
                     return Err(Error::Internal("View query is not a SELECT".to_string()));
@@ -1236,8 +1370,7 @@ fn bind_table_factor_with_ctes(
             Err(Error::TableNotFound(table_name.clone()))
         }
 
-        sql::TableFactor::Derived { subquery, alias, .. } => {
-            let bound_stmt = bind_query(binder, subquery)?;
+        sql::TableFactor::Derived { lateral, subquery, alias, .. } => {
             let alias_name = alias
                 .as_ref()
                 .map(|a| a.name.value.clone())
@@ -1248,6 +1381,13 @@ fn bind_table_factor_with_ctes(
                 .as_ref()
                 .map(|a| a.columns.iter().map(|c| c.name.value.clone()).collect())
                 .unwrap_or_default();
+
+            // For LATERAL subqueries, we need to bind with outer tables in context
+            let bound_stmt = if *lateral && !outer_tables.is_empty() {
+                bind_query_with_outer(binder, subquery, outer_tables)?
+            } else {
+                bind_query(binder, subquery)?
+            };
 
             match bound_stmt {
                 BoundStatement::Select(mut sel) => {
@@ -1262,6 +1402,7 @@ fn bind_table_factor_with_ctes(
                     Ok(BoundTableRef::Subquery {
                         subquery: Box::new(sel),
                         alias: alias_name,
+                        is_lateral: *lateral,
                     })
                 }
                 BoundStatement::SetOperation(set_op) => {
@@ -1814,7 +1955,7 @@ fn expand_qualified_wildcard(
             *col_offset += column_names.len();
             matches
         }
-        BoundTableRef::Subquery { subquery, alias } => {
+        BoundTableRef::Subquery { subquery, alias, .. } => {
             let matches = alias.eq_ignore_ascii_case(target_name);
 
             if matches {
@@ -1940,7 +2081,7 @@ fn expand_qualified_wildcard_with_skip(
             *col_offset += local_col_idx;
             matches
         }
-        BoundTableRef::Subquery { subquery, alias } => {
+        BoundTableRef::Subquery { subquery, alias, .. } => {
             let matches = alias.eq_ignore_ascii_case(target_name);
 
             let mut local_col_idx = 0;
@@ -2084,7 +2225,7 @@ fn expand_qualified_wildcard_with_options(
             *col_offset += column_names.len();
             matches
         }
-        BoundTableRef::Subquery { subquery, alias } => {
+        BoundTableRef::Subquery { subquery, alias, .. } => {
             let matches = alias.eq_ignore_ascii_case(target_name);
 
             if matches {

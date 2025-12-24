@@ -1,0 +1,36 @@
+# QUALIFY clause tests
+
+statement ok
+CREATE TABLE sales (id INTEGER, region VARCHAR, amount INTEGER);
+
+statement ok
+INSERT INTO sales VALUES (1, 'North', 100), (2, 'North', 200), (3, 'South', 150), (4, 'South', 250);
+
+# QUALIFY with ROW_NUMBER
+query III
+SELECT id, region, amount FROM sales QUALIFY ROW_NUMBER() OVER (PARTITION BY region ORDER BY amount DESC) = 1;
+----
+2
+North
+200
+4
+South
+250
+
+# QUALIFY with RANK
+query III rowsort
+SELECT id, region, amount FROM sales QUALIFY RANK() OVER (PARTITION BY region ORDER BY amount DESC) <= 2;
+----
+1
+North
+100
+2
+North
+200
+3
+South
+150
+4
+South
+250
+
