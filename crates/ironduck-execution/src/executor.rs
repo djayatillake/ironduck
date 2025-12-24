@@ -1036,6 +1036,97 @@ impl Executor {
                 }
             }
 
+            LogicalOperator::Copy {
+                to,
+                source,
+                file_path,
+                format,
+                header,
+                delimiter,
+            } => {
+                use ironduck_planner::{CopyFormatKind, CopySourceKind};
+
+                if *to {
+                    // COPY TO - export data to file
+                    let rows = match source.as_ref() {
+                        CopySourceKind::Table { schema, name, columns, .. } => {
+                            // Read from table
+                            let table_data = self
+                                .storage
+                                .get(schema, name)
+                                .ok_or_else(|| Error::TableNotFound(name.clone()))?;
+                            let table_info = self
+                                .catalog
+                                .get_table(schema, name)
+                                .ok_or_else(|| Error::TableNotFound(name.clone()))?;
+
+                            let all_rows = table_data.scan();
+
+                            // If specific columns requested, filter them
+                            if columns.is_empty() {
+                                all_rows
+                            } else {
+                                let col_indices: Vec<usize> = columns.iter()
+                                    .filter_map(|c| table_info.columns.iter().position(|tc| tc.name.eq_ignore_ascii_case(c)))
+                                    .collect();
+                                all_rows.into_iter()
+                                    .map(|row| col_indices.iter().map(|&i| row.get(i).cloned().unwrap_or(Value::Null)).collect())
+                                    .collect()
+                            }
+                        }
+                        CopySourceKind::Query(plan) => {
+                            // Execute the query
+                            self.execute_operator(plan)?
+                        }
+                    };
+
+                    // Write to file
+                    let count = rows.len();
+                    match format {
+                        CopyFormatKind::Csv => {
+                            write_csv_file(file_path, &rows, *header, *delimiter)?;
+                        }
+                        CopyFormatKind::Parquet => {
+                            return Err(Error::NotImplemented("COPY TO PARQUET".to_string()));
+                        }
+                    }
+
+                    Ok(vec![vec![Value::BigInt(count as i64)]])
+                } else {
+                    // COPY FROM - import data from file
+                    match source.as_ref() {
+                        CopySourceKind::Table { schema, name, columns, .. } => {
+                            // Read from file
+                            let rows = match format {
+                                CopyFormatKind::Csv => {
+                                    read_csv_file(file_path, *header, *delimiter)?
+                                }
+                                CopyFormatKind::Parquet => {
+                                    read_parquet_file(file_path)?
+                                }
+                            };
+
+                            // Get table data
+                            let table_data = self
+                                .storage
+                                .get(schema, name)
+                                .ok_or_else(|| Error::TableNotFound(name.clone()))?;
+
+                            // Insert all rows
+                            let count = rows.len();
+                            for row in rows {
+                                table_data.insert(row);
+                            }
+
+                            Ok(vec![vec![Value::BigInt(count as i64)]])
+                        }
+                        CopySourceKind::Query(_) => {
+                            Err(Error::InvalidArguments("COPY FROM with query source".to_string()))
+                        }
+                    }
+                }
+            }
+
             LogicalOperator::Delete {
                 schema,
                 table,
@@ -2244,6 +2335,10 @@ fn format_plan(op: &LogicalOperator, indent: usize) -> String {
                 col_names.join(", "),
                 format_plan(input, indent + 1)
             )
+        }
+        LogicalOperator::Copy { to, file_path, format, .. } => {
+            let direction = if *to { "TO" } else { "FROM" };
+            format!("{}Copy {} '{}' ({:?})", prefix, direction, file_path, format)
         }
     }
 }
@@ -4665,5 +4760,79 @@ fn arrow_array_to_value(array: &std::sync::Arc<dyn arrow::array::Array>, row_idx
                 .map_err(|e| Error::Execution(format!("Failed to format array: {}", e)))?;
             Ok(Value::Varchar(formatter.value(row_idx).to_string()))
         }
+    }
+}
+
+/// Write rows to a CSV file
+fn write_csv_file(path: &str, rows: &[Vec<Value>], _header: bool, delimiter: char) -> Result<()> {
+    use std::fs::File;
+    use std::io::Write;
+
+    let mut file = File::create(path)
+        .map_err(|e| Error::Execution(format!("Failed to create file '{}': {}", path, e)))?;
+
+    for row in rows {
+        let line: Vec<String> = row.iter().map(|v| format_value_for_csv(v, delimiter)).collect();
+        writeln!(file, "{}", line.join(&delimiter.to_string()))
+            .map_err(|e| Error::Execution(format!("Failed to write to file: {}", e)))?;
+    }
+
+    Ok(())
+}
+
+/// Format a Value for CSV output
+fn format_value_for_csv(value: &Value, delimiter: char) -> String {
+    match value {
+        Value::Null => "".to_string(),
+        Value::Boolean(b) => if *b { "true".to_string() } else { "false".to_string() },
+        Value::TinyInt(i) => i.to_string(),
+        Value::SmallInt(i) => i.to_string(),
+        Value::Integer(i) => i.to_string(),
+        Value::BigInt(i) => i.to_string(),
+        Value::HugeInt(i) => i.to_string(),
+        Value::UTinyInt(i) => i.to_string(),
+        Value::USmallInt(i) => i.to_string(),
+        Value::UInteger(i) => i.to_string(),
+        Value::UBigInt(i) => i.to_string(),
+        Value::UHugeInt(i) => i.to_string(),
+        Value::Float(f) => f.to_string(),
+        Value::Double(d) => d.to_string(),
+        Value::Decimal(d) => d.to_string(),
+        Value::Varchar(s) => {
+            // Escape quotes and wrap in quotes if contains delimiter or quote
+            if s.contains(delimiter) || s.contains('"') || s.contains('\n') {
+                format!("\"{}\"", s.replace('"', "\"\""))
+            } else {
+                s.clone()
+            }
+        }
+        Value::Blob(b) => {
+            // Convert bytes to hex string
+            let hex: String = b.iter().map(|byte| format!("{:02x}", byte)).collect();
+            format!("0x{}", hex)
+        }
+        Value::Date(d) => d.format("%Y-%m-%d").to_string(),
+        Value::Time(t) => t.format("%H:%M:%S").to_string(),
+        Value::TimeTz(t, _offset) => t.format("%H:%M:%S").to_string(),
+        Value::Timestamp(ts) => ts.format("%Y-%m-%d %H:%M:%S").to_string(),
+        Value::TimestampTz(ts) => ts.format("%Y-%m-%d %H:%M:%S UTC").to_string(),
+        Value::Interval(i) => format!("{:?}", i),
+        Value::List(items) => {
+            let inner: Vec<String> = items.iter().map(|v| format_value_for_csv(v, delimiter)).collect();
+            format!("[{}]", inner.join(","))
+        }
+        Value::Struct(fields) => {
+            let inner: Vec<String> = fields.iter()
+                .map(|(k, v)| format!("{}:{}", k, format_value_for_csv(v, delimiter)))
+                .collect();
+            format!("{{{}}}", inner.join(","))
+        }
+        Value::Map(pairs) => {
+            let inner: Vec<String> = pairs.iter()
+                .map(|(k, v)| format!("{}=>{}", format_value_for_csv(k, delimiter), format_value_for_csv(v, delimiter)))
+                .collect();
+            format!("{{{}}}", inner.join(","))
+        }
+        Value::Uuid(u) => u.to_string(),
     }
 }

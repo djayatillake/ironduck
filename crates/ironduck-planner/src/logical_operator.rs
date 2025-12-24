@@ -253,6 +253,43 @@ pub enum LogicalOperator {
         /// Columns to keep (non-unpivoted columns): (name, index, type)
         keep_columns: Vec<(String, usize, LogicalType)>,
     },
+
+    /// COPY operation - bulk data import/export
+    Copy {
+        /// True = COPY TO (export), False = COPY FROM (import)
+        to: bool,
+        /// Source: either a table scan or a query plan
+        source: Box<CopySourceKind>,
+        /// Target file path
+        file_path: String,
+        /// File format type
+        format: CopyFormatKind,
+        /// Whether file has header (for CSV)
+        header: bool,
+        /// Delimiter character (for CSV)
+        delimiter: char,
+    },
+}
+
+/// Source for COPY operation
+#[derive(Debug, Clone)]
+pub enum CopySourceKind {
+    /// Copy from/to a table
+    Table {
+        schema: String,
+        name: String,
+        columns: Vec<String>,
+        column_types: Vec<LogicalType>,
+    },
+    /// Copy from a query (COPY TO only)
+    Query(Box<LogicalOperator>),
+}
+
+/// File format for COPY
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CopyFormatKind {
+    Csv,
+    Parquet,
 }
 
 /// Types of table-valued functions
@@ -371,6 +408,10 @@ impl LogicalOperator {
                     types.push(LogicalType::Unknown);
                 }
                 types
+            }
+            LogicalOperator::Copy { .. } => {
+                // Returns count of rows copied
+                vec![LogicalType::BigInt]
             }
         }
     }

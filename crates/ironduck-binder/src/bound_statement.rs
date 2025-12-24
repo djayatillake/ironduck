@@ -17,6 +17,7 @@ pub enum BoundStatement {
     CreateSequence(BoundCreateSequence),
     Drop(BoundDrop),
     AlterTable(BoundAlterTable),
+    Copy(BoundCopy),
     Explain(Box<BoundStatement>),
     /// No-op statement (PRAGMA, SET, etc.)
     NoOp,
@@ -516,4 +517,48 @@ pub struct BoundRecursiveCTE {
     pub recursive_case: BoundSelect,
     /// Whether to use UNION ALL (true) or UNION (false) semantics
     pub union_all: bool,
+}
+
+/// Bound COPY statement for bulk data import/export
+#[derive(Debug, Clone)]
+pub struct BoundCopy {
+    /// Direction: true = COPY TO (export), false = COPY FROM (import)
+    pub to: bool,
+    /// Source for COPY TO: table name or query result
+    pub source: CopySource,
+    /// File path for import/export
+    pub file_path: String,
+    /// File format options
+    pub format: CopyFormat,
+}
+
+/// Source of data for COPY operation
+#[derive(Debug, Clone)]
+pub enum CopySource {
+    /// Copy from/to a table
+    Table {
+        schema: String,
+        name: String,
+        columns: Vec<String>,
+    },
+    /// Copy from a query (COPY TO only)
+    Query(Box<BoundSelect>),
+}
+
+/// File format for COPY operations
+#[derive(Debug, Clone)]
+pub struct CopyFormat {
+    /// Format type (CSV, Parquet, etc.)
+    pub format_type: CopyFormatType,
+    /// Whether file has header row (for CSV)
+    pub header: bool,
+    /// Delimiter character (for CSV)
+    pub delimiter: char,
+}
+
+/// Supported file formats for COPY
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CopyFormatType {
+    Csv,
+    Parquet,
 }

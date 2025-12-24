@@ -1,10 +1,10 @@
 //! Plan builder - converts bound statements to logical plans
 
-use super::{AlterTableOp, LogicalOperator, LogicalPlan, SetOperationType};
+use super::{AlterTableOp, CopyFormatKind, CopySourceKind, LogicalOperator, LogicalPlan, SetOperationType};
 use ironduck_binder::{
-    AlterTableOperation, BoundCTE, BoundDelete, BoundExpression, BoundExpressionKind,
-    BoundSelect, BoundSetOperation, BoundStatement, BoundTableRef, BoundUpdate, DistinctKind,
-    SetOperand,
+    AlterTableOperation, BoundCTE, BoundCopy, BoundDelete, BoundExpression, BoundExpressionKind,
+    BoundSelect, BoundSetOperation, BoundStatement, BoundTableRef, BoundUpdate, CopyFormatType,
+    CopySource, DistinctKind, SetOperand,
 };
 use ironduck_common::{Error, LogicalType, Result, Value};
 
@@ -155,6 +155,7 @@ pub fn build_plan(statement: &BoundStatement) -> Result<LogicalPlan> {
                 vec!["plan".to_string()],
             ))
         }
+        BoundStatement::Copy(copy) => build_copy_plan(copy),
         BoundStatement::NoOp => {
             // No-op statements (PRAGMA, SET, etc.) produce an empty result
             Ok(LogicalPlan::new(
@@ -163,6 +164,43 @@ pub fn build_plan(statement: &BoundStatement) -> Result<LogicalPlan> {
             ))
         }
     }
+}
+
+/// Build a plan for COPY statement
+fn build_copy_plan(copy: &BoundCopy) -> Result<LogicalPlan> {
+    // Convert source
+    let source = match &copy.source {
+        CopySource::Table { schema, name, columns } => {
+            CopySourceKind::Table {
+                schema: schema.clone(),
+                name: name.clone(),
+                columns: columns.clone(),
+                column_types: vec![], // Will be populated during execution
+            }
+        }
+        CopySource::Query(query) => {
+            let query_plan = build_select_plan(query)?;
+            CopySourceKind::Query(Box::new(query_plan.root))
+        }
+    };
+
+    // Convert format
+    let format = match copy.format.format_type {
+        CopyFormatType::Csv => CopyFormatKind::Csv,
+        CopyFormatType::Parquet => CopyFormatKind::Parquet,
+    };
+
+    Ok(LogicalPlan::new(
+        LogicalOperator::Copy {
+            to: copy.to,
+            source: Box::new(source),
+            file_path: copy.file_path.clone(),
+            format,
+            header: copy.format.header,
+            delimiter: copy.format.delimiter,
+        },
+        vec!["Count".to_string()],
+    ))
 }
 
 /// Build a plan for a SetOperand (either a SELECT or a nested set operation)

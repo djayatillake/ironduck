@@ -2,11 +2,12 @@
 
 use super::expression_binder::{bind_data_type, bind_expression, ExpressionBinderContext};
 use super::{
-    AlterTableOperation, BoundAlterTable, BoundCTE, BoundColumnDef, BoundCreateSchema,
+    AlterTableOperation, BoundAlterTable, BoundCTE, BoundColumnDef, BoundCopy, BoundCreateSchema,
     BoundCreateSequence, BoundCreateTable, BoundCreateView, BoundDelete, BoundDrop,
     BoundExpression, BoundInsert, BoundJoinType, BoundOrderBy, BoundRecursiveCTE,
     BoundSelect, BoundSetOperation, BoundStatement, BoundTableRef, BoundUpdate, Binder,
-    DistinctKind, DropObjectType, FileTableType, SetOperand, SetOperationType, TableFunctionType,
+    CopyFormat, CopyFormatType, CopySource, DistinctKind, DropObjectType, FileTableType,
+    SetOperand, SetOperationType, TableFunctionType,
 };
 use ironduck_common::{Error, LogicalType, Result};
 use sqlparser::ast as sql;
@@ -105,6 +106,11 @@ pub fn bind_statement(binder: &Binder, stmt: &sql::Statement) -> Result<BoundSta
         // ALTER TABLE
         sql::Statement::AlterTable { name, if_exists: _, operations, .. } => {
             bind_alter_table(binder, name, operations)
+        }
+
+        // COPY statement
+        sql::Statement::Copy { source, to, target, options, .. } => {
+            bind_copy(binder, source, *to, target, options)
         }
 
         _ => Err(Error::NotImplemented(format!("Statement: {:?}", stmt))),
@@ -249,6 +255,112 @@ fn bind_alter_table(
         schema,
         table_name,
         operation: bound_op,
+    }))
+}
+
+/// Bind COPY statement
+fn bind_copy(
+    binder: &Binder,
+    source: &sql::CopySource,
+    to: bool,
+    target: &sql::CopyTarget,
+    options: &[sql::CopyOption],
+) -> Result<BoundStatement> {
+    // Parse file path from target
+    let file_path = match target {
+        sql::CopyTarget::File { filename } => filename.clone(),
+        sql::CopyTarget::Stdout => {
+            return Err(Error::NotImplemented("COPY TO STDOUT".to_string()));
+        }
+        sql::CopyTarget::Stdin => {
+            return Err(Error::NotImplemented("COPY FROM STDIN".to_string()));
+        }
+        _ => {
+            return Err(Error::NotImplemented(format!("COPY target: {:?}", target)));
+        }
+    };
+
+    // Parse options
+    let mut format_type = CopyFormatType::Csv; // Default to CSV
+    let mut header = true; // Default to header
+    let mut delimiter = ','; // Default delimiter
+
+    for opt in options {
+        match opt {
+            sql::CopyOption::Format(fmt) => {
+                match fmt.value.to_uppercase().as_str() {
+                    "CSV" => format_type = CopyFormatType::Csv,
+                    "PARQUET" => format_type = CopyFormatType::Parquet,
+                    _ => return Err(Error::NotImplemented(format!("COPY format: {}", fmt))),
+                }
+            }
+            sql::CopyOption::Header(h) => {
+                header = *h;
+            }
+            sql::CopyOption::Delimiter(d) => {
+                delimiter = *d;
+            }
+            _ => {} // Ignore other options for now
+        }
+    }
+
+    // Bind the source
+    let copy_source = match source {
+        sql::CopySource::Table { table_name, columns } => {
+            let parts: Vec<_> = table_name.0.iter().map(|i| i.value.clone()).collect();
+            let (schema, name) = if parts.len() == 2 {
+                (parts[0].clone(), parts[1].clone())
+            } else {
+                (binder.current_schema().to_string(), parts[0].clone())
+            };
+
+            // Verify table exists
+            let _table = binder.catalog().get_table(&schema, &name)
+                .ok_or_else(|| Error::TableNotFound(format!("{}.{}", schema, name)))?;
+
+            let col_names: Vec<String> = columns.iter().map(|c| c.value.clone()).collect();
+
+            CopySource::Table {
+                schema,
+                name,
+                columns: col_names,
+            }
+        }
+        sql::CopySource::Query(query) => {
+            if !to {
+                return Err(Error::InvalidArguments("COPY FROM with query source".to_string()));
+            }
+            // Bind the query
+            let bound = bind_query(binder, query)?;
+            match bound {
+                BoundStatement::Select(sel) => CopySource::Query(Box::new(sel)),
+                BoundStatement::SetOperation(set_op) => {
+                    // For set operations, wrap in a select-like structure
+                    // Convert first operand to get schema
+                    let select = match *set_op.left {
+                        SetOperand::Select(sel) => sel,
+                        SetOperand::SetOperation(_) => {
+                            return Err(Error::NotImplemented(
+                                "COPY from nested set operation".to_string()
+                            ));
+                        }
+                    };
+                    CopySource::Query(Box::new(select))
+                }
+                _ => return Err(Error::InvalidArguments("Invalid COPY source".to_string())),
+            }
+        }
+    };
+
+    Ok(BoundStatement::Copy(BoundCopy {
+        to,
+        source: copy_source,
+        file_path,
+        format: CopyFormat {
+            format_type,
+            header,
+            delimiter,
+        },
     }))
 }
 
