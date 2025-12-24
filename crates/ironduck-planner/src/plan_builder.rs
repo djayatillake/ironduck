@@ -964,6 +964,33 @@ fn build_table_ref_plan(table_ref: &BoundTableRef) -> Result<LogicalOperator> {
                         output_type: ironduck_common::LogicalType::BigInt,
                     })
                 }
+                ironduck_binder::TableFunctionType::ReadCsv { path, has_header, delimiter } => {
+                    // Note: column_names and column_types are populated during execution
+                    // since we need to read the file to know the schema
+                    Ok(LogicalOperator::TableFunction {
+                        function: super::TableFunctionKind::ReadCsv {
+                            path: path.clone(),
+                            has_header: *has_header,
+                            delimiter: *delimiter,
+                            column_names: vec![],  // Populated during execution
+                            column_types: vec![],  // Populated during execution
+                        },
+                        column_name: "csv".to_string(),
+                        output_type: ironduck_common::LogicalType::Unknown,
+                    })
+                }
+                ironduck_binder::TableFunctionType::ReadParquet { path } => {
+                    // Note: column_names and column_types are populated during execution
+                    Ok(LogicalOperator::TableFunction {
+                        function: super::TableFunctionKind::ReadParquet {
+                            path: path.clone(),
+                            column_names: vec![],  // Populated during execution
+                            column_types: vec![],  // Populated during execution
+                        },
+                        column_name: "parquet".to_string(),
+                        output_type: ironduck_common::LogicalType::Unknown,
+                    })
+                }
             }
         }
 
@@ -1069,6 +1096,46 @@ fn build_table_ref_plan(table_ref: &BoundTableRef) -> Result<LogicalOperator> {
                 keep_columns: keep_cols,
             })
         }
+
+        BoundTableRef::FileTableFunction {
+            path,
+            file_type,
+            column_names,
+            column_types,
+            ..
+        } => {
+            match file_type {
+                ironduck_binder::FileTableType::Csv { has_header, delimiter } => {
+                    Ok(LogicalOperator::TableFunction {
+                        function: super::TableFunctionKind::ReadCsv {
+                            path: path.clone(),
+                            has_header: *has_header,
+                            delimiter: *delimiter,
+                            column_names: column_names.clone(),
+                            column_types: column_types.clone(),
+                        },
+                        column_name: "csv".to_string(),
+                        output_type: ironduck_common::LogicalType::Unknown,
+                    })
+                }
+                ironduck_binder::FileTableType::Parquet => {
+                    Ok(LogicalOperator::TableFunction {
+                        function: super::TableFunctionKind::ReadParquet {
+                            path: path.clone(),
+                            column_names: column_names.clone(),
+                            column_types: column_types.clone(),
+                        },
+                        column_name: "parquet".to_string(),
+                        output_type: ironduck_common::LogicalType::Unknown,
+                    })
+                }
+            }
+        }
+
+        BoundTableRef::Empty => {
+            // Empty table for SELECT without FROM
+            Ok(LogicalOperator::DummyScan)
+        }
     }
 }
 
@@ -1138,6 +1205,7 @@ fn get_table_ref_columns(table_ref: &BoundTableRef) -> Vec<String> {
             cols.push(value_column.clone());
             cols
         }
+        BoundTableRef::FileTableFunction { column_names, .. } => column_names.clone(),
         BoundTableRef::Empty => vec![],
     }
 }
@@ -1205,6 +1273,7 @@ fn get_table_ref_types(table_ref: &BoundTableRef) -> Vec<ironduck_common::Logica
             }
             types
         }
+        BoundTableRef::FileTableFunction { column_types, .. } => column_types.clone(),
         BoundTableRef::Empty => vec![],
     }
 }

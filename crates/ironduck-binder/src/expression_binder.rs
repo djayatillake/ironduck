@@ -962,6 +962,10 @@ fn collect_base_tables_rec(table_ref: &BoundTableRef, result: &mut Vec<(String, 
         BoundTableRef::Unpivot { source, .. } => {
             collect_base_tables_rec(source, result);
         }
+        BoundTableRef::FileTableFunction { path, alias, column_names, column_types, .. } => {
+            let table_name = alias.clone().unwrap_or_else(|| path.clone());
+            result.push((table_name.clone(), alias.clone(), column_names.clone(), column_types.clone()));
+        }
         BoundTableRef::Empty => {}
     }
 }

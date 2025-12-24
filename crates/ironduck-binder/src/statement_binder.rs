@@ -6,9 +6,9 @@ use super::{
     BoundCreateSequence, BoundCreateTable, BoundCreateView, BoundDelete, BoundDrop,
     BoundExpression, BoundInsert, BoundJoinType, BoundOrderBy, BoundRecursiveCTE,
     BoundSelect, BoundSetOperation, BoundStatement, BoundTableRef, BoundUpdate, Binder,
-    DistinctKind, DropObjectType, SetOperand, SetOperationType, TableFunctionType,
+    DistinctKind, DropObjectType, FileTableType, SetOperand, SetOperationType, TableFunctionType,
 };
-use ironduck_common::{Error, Result};
+use ironduck_common::{Error, LogicalType, Result};
 use sqlparser::ast as sql;
 
 /// Bind a statement
@@ -1200,6 +1200,7 @@ fn collect_tables_from_ref(table_ref: &BoundTableRef) -> Vec<BoundTableRef> {
         BoundTableRef::RecursiveCTERef { .. } => vec![table_ref.clone()],
         BoundTableRef::Pivot { source, .. } => collect_tables_from_ref(source),
         BoundTableRef::Unpivot { source, .. } => collect_tables_from_ref(source),
+        BoundTableRef::FileTableFunction { .. } => vec![table_ref.clone()],
         BoundTableRef::Empty => vec![],
     }
 }
@@ -1486,7 +1487,10 @@ fn bind_table_factor_with_ctes_and_outer(
             if let Some(table_args) = args {
                 if parts.len() == 1 {
                     let func_name = parts[0].to_uppercase();
-                    if matches!(func_name.as_str(), "RANGE" | "GENERATE_SERIES" | "UNNEST" | "GENERATE_SUBSCRIPTS") {
+                    if matches!(func_name.as_str(),
+                        "RANGE" | "GENERATE_SERIES" | "UNNEST" | "GENERATE_SUBSCRIPTS" |
+                        "READ_CSV" | "READ_CSV_AUTO" | "READ_PARQUET"
+                    ) {
                         // TableFunctionArgs.args is already Vec<FunctionArg>
                         return bind_table_function(binder, name, &table_args.args, alias);
                     }
@@ -1974,7 +1978,169 @@ fn bind_table_function(
                 column_alias,
             })
         }
+        "READ_CSV" | "READ_CSV_AUTO" => {
+            // read_csv(path) or read_csv(path, header=true, delimiter=',', ...)
+            // Extract the file path from the first argument
+            let path = args.first()
+                .and_then(|arg| match arg {
+                    sql::FunctionArg::Unnamed(sql::FunctionArgExpr::Expr(sql::Expr::Value(v))) => {
+                        match v {
+                            sql::Value::SingleQuotedString(s) |
+                            sql::Value::DoubleQuotedString(s) => Some(s.clone()),
+                            _ => None,
+                        }
+                    }
+                    _ => None,
+                })
+                .ok_or_else(|| Error::InvalidArguments("read_csv() requires a file path as first argument".to_string()))?;
+
+            // Parse optional arguments (header, delimiter, etc.)
+            let mut has_header = true;  // Default: has header
+            let mut delimiter = ',';    // Default: comma
+
+            for arg in args.iter().skip(1) {
+                if let sql::FunctionArg::Named { name, arg, .. } = arg {
+                    let name_str = name.value.to_lowercase();
+                    match name_str.as_str() {
+                        "header" | "has_header" => {
+                            if let sql::FunctionArgExpr::Expr(sql::Expr::Value(v)) = arg {
+                                has_header = match v {
+                                    sql::Value::Boolean(b) => *b,
+                                    sql::Value::SingleQuotedString(s) => s.to_lowercase() == "true",
+                                    _ => true,
+                                };
+                            }
+                        }
+                        "delimiter" | "delim" | "sep" => {
+                            if let sql::FunctionArgExpr::Expr(sql::Expr::Value(v)) = arg {
+                                if let sql::Value::SingleQuotedString(s) = v {
+                                    if let Some(c) = s.chars().next() {
+                                        delimiter = c;
+                                    }
+                                }
+                            }
+                        }
+                        _ => {} // Ignore unknown arguments
+                    }
+                }
+            }
+
+            // Read CSV header to get column names
+            let (column_names, column_types) = read_csv_schema(&path, has_header, delimiter)?;
+
+            let table_alias = alias.as_ref().map(|a| a.name.value.clone());
+
+            Ok(BoundTableRef::FileTableFunction {
+                path,
+                file_type: FileTableType::Csv { has_header, delimiter },
+                alias: table_alias,
+                column_names,
+                column_types,
+            })
+        }
+        "READ_PARQUET" => {
+            // read_parquet(path)
+            let path = args.first()
+                .and_then(|arg| match arg {
+                    sql::FunctionArg::Unnamed(sql::FunctionArgExpr::Expr(sql::Expr::Value(v))) => {
+                        match v {
+                            sql::Value::SingleQuotedString(s) |
+                            sql::Value::DoubleQuotedString(s) => Some(s.clone()),
+                            _ => None,
+                        }
+                    }
+                    _ => None,
+                })
+                .ok_or_else(|| Error::InvalidArguments("read_parquet() requires a file path as first argument".to_string()))?;
+
+            // Read Parquet schema to get column names
+            let (column_names, column_types) = read_parquet_schema(&path)?;
+
+            let table_alias = alias.as_ref().map(|a| a.name.value.clone());
+
+            Ok(BoundTableRef::FileTableFunction {
+                path,
+                file_type: FileTableType::Parquet,
+                alias: table_alias,
+                column_names,
+                column_types,
+            })
+        }
         _ => Err(Error::NotImplemented(format!("Table function: {}", func_name))),
+    }
+}
+
+/// Read CSV file schema (column names and types)
+fn read_csv_schema(path: &str, has_header: bool, delimiter: char) -> Result<(Vec<String>, Vec<LogicalType>)> {
+    use std::fs::File;
+    use std::io::{BufRead, BufReader};
+
+    let file = File::open(path)
+        .map_err(|e| Error::Parse(format!("Failed to open CSV file '{}': {}", path, e)))?;
+
+    let mut reader = BufReader::new(file);
+    let mut first_line = String::new();
+    reader.read_line(&mut first_line)
+        .map_err(|e| Error::Parse(format!("Failed to read CSV header: {}", e)))?;
+
+    // Parse the first line as column names (if has_header) or generate default names
+    let first_line = first_line.trim_end_matches(|c| c == '\n' || c == '\r');
+    let parts: Vec<&str> = first_line.split(delimiter).collect();
+
+    if has_header {
+        let column_names: Vec<String> = parts.iter()
+            .map(|s| s.trim_matches('"').trim().to_string())
+            .collect();
+        // Default all columns to VARCHAR since we don't know types yet
+        let column_types: Vec<LogicalType> = column_names.iter()
+            .map(|_| LogicalType::Varchar)
+            .collect();
+        Ok((column_names, column_types))
+    } else {
+        // Generate column names like column0, column1, etc.
+        let column_names: Vec<String> = (0..parts.len())
+            .map(|i| format!("column{}", i))
+            .collect();
+        let column_types: Vec<LogicalType> = column_names.iter()
+            .map(|_| LogicalType::Varchar)
+            .collect();
+        Ok((column_names, column_types))
+    }
+}
+
+/// Read Parquet file schema (column names and types)
+fn read_parquet_schema(path: &str) -> Result<(Vec<String>, Vec<LogicalType>)> {
+    use std::fs::File;
+
+    let file = File::open(path)
+        .map_err(|e| Error::Parse(format!("Failed to open Parquet file '{}': {}", path, e)))?;
+
+    let reader = parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(file)
+        .map_err(|e| Error::Parse(format!("Failed to read Parquet schema: {}", e)))?;
+
+    let schema = reader.schema();
+    let column_names: Vec<String> = schema.fields().iter()
+        .map(|f| f.name().clone())
+        .collect();
+    let column_types: Vec<LogicalType> = schema.fields().iter()
+        .map(|f| arrow_type_to_logical_type(f.data_type()))
+        .collect();
+
+    Ok((column_names, column_types))
+}
+
+/// Convert Arrow DataType to LogicalType
+fn arrow_type_to_logical_type(dt: &arrow::datatypes::DataType) -> LogicalType {
+    use arrow::datatypes::DataType;
+    match dt {
+        DataType::Boolean => LogicalType::Boolean,
+        DataType::Int8 | DataType::Int16 | DataType::Int32 => LogicalType::Integer,
+        DataType::Int64 | DataType::UInt8 | DataType::UInt16 | DataType::UInt32 | DataType::UInt64 => LogicalType::BigInt,
+        DataType::Float32 | DataType::Float64 => LogicalType::Double,
+        DataType::Utf8 | DataType::LargeUtf8 => LogicalType::Varchar,
+        DataType::Date32 | DataType::Date64 => LogicalType::Date,
+        DataType::Timestamp(_, _) => LogicalType::Timestamp,
+        _ => LogicalType::Varchar, // Default to VARCHAR for unknown types
     }
 }
 
@@ -2424,6 +2590,24 @@ fn expand_qualified_wildcard(
         BoundTableRef::Unpivot { source, .. } => {
             expand_qualified_wildcard(source, target_name, table_idx, col_offset, select_list)
         }
+        BoundTableRef::FileTableFunction { path, alias, column_names, column_types, .. } => {
+            let table_name = alias.as_ref().unwrap_or(path);
+            let matches = table_name.eq_ignore_ascii_case(target_name);
+            if matches {
+                for (idx, (col_name, typ)) in column_names.iter().zip(column_types.iter()).enumerate() {
+                    select_list.push(BoundExpression::new(
+                        super::BoundExpressionKind::ColumnRef {
+                            table_idx,
+                            column_idx: *col_offset + idx,
+                            name: col_name.clone(),
+                        },
+                        typ.clone(),
+                    ));
+                }
+            }
+            *col_offset += column_names.len();
+            matches
+        }
         BoundTableRef::Empty => false,
     }
 }
@@ -2573,6 +2757,27 @@ fn expand_qualified_wildcard_with_skip(
         }
         BoundTableRef::Unpivot { source, .. } => {
             expand_qualified_wildcard_with_skip(source, target_name, table_idx, col_offset, select_list, skip_columns)
+        }
+        BoundTableRef::FileTableFunction { path, alias, column_names, column_types, .. } => {
+            let table_name = alias.as_ref().unwrap_or(path);
+            let matches = table_name.eq_ignore_ascii_case(target_name);
+            let mut local_col_idx = 0;
+            for (col_name, typ) in column_names.iter().zip(column_types.iter()) {
+                let should_skip = skip_columns.iter().any(|sc| sc.eq_ignore_ascii_case(col_name));
+                if matches && !should_skip {
+                    select_list.push(BoundExpression::new(
+                        super::BoundExpressionKind::ColumnRef {
+                            table_idx,
+                            column_idx: *col_offset + local_col_idx,
+                            name: col_name.clone(),
+                        },
+                        typ.clone(),
+                    ));
+                }
+                local_col_idx += 1;
+            }
+            *col_offset += column_names.len();
+            matches
         }
         BoundTableRef::Empty => false,
     }
@@ -2738,6 +2943,33 @@ fn expand_qualified_wildcard_with_options(
         BoundTableRef::Unpivot { source, .. } => {
             expand_qualified_wildcard_with_options(source, target_name, table_idx, col_offset, select_list, exclude_columns, replace_map)
         }
+        BoundTableRef::FileTableFunction { path, alias, column_names, column_types, .. } => {
+            let table_name = alias.as_ref().unwrap_or(path);
+            let matches = table_name.eq_ignore_ascii_case(target_name);
+            if matches {
+                for (idx, (col_name, typ)) in column_names.iter().zip(column_types.iter()).enumerate() {
+                    let should_exclude = exclude_columns.iter().any(|ec| ec.eq_ignore_ascii_case(col_name));
+                    if !should_exclude {
+                        if let Some(replacement) = replace_map.get(&col_name.to_uppercase()) {
+                            let mut replaced = replacement.clone();
+                            replaced.alias = Some(col_name.clone());
+                            select_list.push(replaced);
+                        } else {
+                            select_list.push(BoundExpression::new(
+                                super::BoundExpressionKind::ColumnRef {
+                                    table_idx,
+                                    column_idx: *col_offset + idx,
+                                    name: col_name.clone(),
+                                },
+                                typ.clone(),
+                            ));
+                        }
+                    }
+                }
+            }
+            *col_offset += column_names.len();
+            matches
+        }
         BoundTableRef::Empty => false,
     }
 }
@@ -2769,6 +3001,10 @@ fn matches_table_name(table_ref: &BoundTableRef, name: &str) -> bool {
         }
         BoundTableRef::Unpivot { alias, .. } => {
             alias.as_ref().map(|a| a.eq_ignore_ascii_case(name)).unwrap_or(false)
+        }
+        BoundTableRef::FileTableFunction { path, alias, .. } => {
+            let table_name = alias.as_ref().unwrap_or(path);
+            table_name.eq_ignore_ascii_case(name)
         }
         BoundTableRef::Empty => false,
     }
@@ -3065,6 +3301,28 @@ fn expand_wildcard_with_options(
             local_col_idx += 1;
             *col_offset += local_col_idx;
         }
+        BoundTableRef::FileTableFunction { column_names, column_types, .. } => {
+            for (idx, (name, typ)) in column_names.iter().zip(column_types.iter()).enumerate() {
+                let should_exclude = exclude_columns.iter().any(|ec| ec.eq_ignore_ascii_case(name));
+                if !should_exclude {
+                    if let Some(replacement) = replace_map.get(&name.to_uppercase()) {
+                        let mut replaced = replacement.clone();
+                        replaced.alias = Some(name.clone());
+                        select_list.push(replaced);
+                    } else {
+                        select_list.push(BoundExpression::new(
+                            super::BoundExpressionKind::ColumnRef {
+                                table_idx,
+                                column_idx: *col_offset + idx,
+                                name: name.clone(),
+                            },
+                            typ.clone(),
+                        ));
+                    }
+                }
+            }
+            *col_offset += column_names.len();
+        }
         BoundTableRef::Empty => {}
     }
 }
@@ -3181,6 +3439,24 @@ fn expand_wildcard_rec_with_skip(
         }
         BoundTableRef::Unpivot { source, .. } => {
             expand_wildcard_rec_with_skip(source, table_idx, col_offset, select_list, skip_columns);
+        }
+        BoundTableRef::FileTableFunction { column_names, column_types, .. } => {
+            let mut local_col_idx = 0;
+            for (name, typ) in column_names.iter().zip(column_types.iter()) {
+                let should_skip = skip_columns.iter().any(|sc| sc.eq_ignore_ascii_case(name));
+                if !should_skip {
+                    select_list.push(BoundExpression::new(
+                        super::BoundExpressionKind::ColumnRef {
+                            table_idx,
+                            column_idx: *col_offset + local_col_idx,
+                            name: name.clone(),
+                        },
+                        typ.clone(),
+                    ));
+                    local_col_idx += 1;
+                }
+            }
+            *col_offset += local_col_idx;
         }
         BoundTableRef::Empty => {}
     }
@@ -3300,6 +3576,7 @@ fn get_table_ref_columns(table_ref: &BoundTableRef) -> Vec<String> {
             cols.push(value_column.clone());
             cols
         }
+        BoundTableRef::FileTableFunction { column_names, .. } => column_names.clone(),
         BoundTableRef::Empty => vec![],
     }
 }
@@ -3365,6 +3642,7 @@ fn get_table_ref_types(table_ref: &BoundTableRef) -> Vec<ironduck_common::Logica
             }
             types
         }
+        BoundTableRef::FileTableFunction { column_types, .. } => column_types.clone(),
         BoundTableRef::Empty => vec![],
     }
 }

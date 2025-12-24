@@ -215,6 +215,14 @@ pub enum BoundTableRef {
         alias: Option<String>,
         column_alias: Option<String>,
     },
+    /// File-based table function (read_csv, read_parquet) with schema info
+    FileTableFunction {
+        path: String,
+        file_type: FileTableType,
+        alias: Option<String>,
+        column_names: Vec<String>,
+        column_types: Vec<LogicalType>,
+    },
     /// Recursive CTE reference (self-reference within a recursive CTE)
     RecursiveCTERef {
         /// Name of the CTE being referenced
@@ -276,6 +284,28 @@ pub enum TableFunctionType {
         array_expr: BoundExpression,
         dim: i32,
     },
+    /// read_csv(path, ...) - reads a CSV file into a table
+    ReadCsv {
+        path: String,
+        has_header: bool,
+        delimiter: char,
+    },
+    /// read_parquet(path) - reads a Parquet file into a table
+    ReadParquet {
+        path: String,
+    },
+}
+
+/// Types of file-based table functions
+#[derive(Debug, Clone)]
+pub enum FileTableType {
+    /// CSV file with options
+    Csv {
+        has_header: bool,
+        delimiter: char,
+    },
+    /// Parquet file
+    Parquet,
 }
 
 /// Join types

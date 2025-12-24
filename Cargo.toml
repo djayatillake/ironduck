@@ -46,6 +46,8 @@ arrow = { version = "53" }
 arrow-array = "53"
 arrow-buffer = "53"
 arrow-schema = "53"
+arrow-csv = "53"
+parquet = "53"
 
 # Memory Management
 bumpalo = { version = "3", features = ["collections"] }

@@ -273,6 +273,24 @@ pub enum TableFunctionKind {
         array_expr: Expression,
         dim: i32,
     },
+    /// read_csv(path) - reads a CSV file into a table
+    ReadCsv {
+        path: String,
+        has_header: bool,
+        delimiter: char,
+        /// Column names inferred from CSV (populated during execution)
+        column_names: Vec<String>,
+        /// Column types inferred from CSV (populated during execution)
+        column_types: Vec<LogicalType>,
+    },
+    /// read_parquet(path) - reads a Parquet file into a table
+    ReadParquet {
+        path: String,
+        /// Column names from Parquet schema (populated during execution)
+        column_names: Vec<String>,
+        /// Column types from Parquet schema (populated during execution)
+        column_types: Vec<LogicalType>,
+    },
 }
 
 /// Type of set operation

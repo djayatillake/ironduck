@@ -11,3 +11,5 @@ ironduck-catalog.workspace = true
 sqlparser.workspace = true
 thiserror.workspace = true
 chrono.workspace = true
+arrow.workspace = true
+parquet.workspace = true

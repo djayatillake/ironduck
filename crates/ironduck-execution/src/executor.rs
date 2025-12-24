@@ -1853,6 +1853,12 @@ impl Executor {
                             }
                         }
                     }
+                    TableFunctionKind::ReadCsv { path, has_header, delimiter, .. } => {
+                        read_csv_file(path, *has_header, *delimiter)
+                    }
+                    TableFunctionKind::ReadParquet { path, .. } => {
+                        read_parquet_file(path)
+                    }
                 }
             }
 
@@ -2209,6 +2215,8 @@ fn format_plan(op: &LogicalOperator, indent: usize) -> String {
                 TableFunctionKind::Range { .. } => "range",
                 TableFunctionKind::Unnest { .. } => "unnest",
                 TableFunctionKind::GenerateSubscripts { .. } => "generate_subscripts",
+                TableFunctionKind::ReadCsv { path, .. } => return format!("{}TableFunction: read_csv('{}') -> {}", prefix, path, column_name),
+                TableFunctionKind::ReadParquet { path, .. } => return format!("{}TableFunction: read_parquet('{}') -> {}", prefix, path, column_name),
             };
             format!("{}TableFunction: {}() -> {}", prefix, func_name, column_name)
         }
@@ -4469,5 +4477,193 @@ fn parse_tz_offset_str(s: &str) -> i32 {
         hours * 3600
     } else {
         0
+    }
+}
+
+/// Read a CSV file and return rows as Value vectors
+fn read_csv_file(path: &str, has_header: bool, delimiter: char) -> Result<Vec<Vec<Value>>> {
+    use arrow_csv::reader::ReaderBuilder;
+    use arrow_csv::reader::Format;
+    use std::fs::File;
+    use std::io::BufReader;
+
+    // First, infer the schema by reading the file
+    let file_for_schema = File::open(path)
+        .map_err(|e| Error::Execution(format!("Failed to open CSV file '{}': {}", path, e)))?;
+
+    let format = Format::default()
+        .with_header(has_header)
+        .with_delimiter(delimiter as u8);
+
+    // Infer schema from up to 100 rows
+    let (schema, _) = format.infer_schema(BufReader::new(file_for_schema), Some(100))
+        .map_err(|e| Error::Execution(format!("Failed to infer CSV schema: {}", e)))?;
+
+    // Now reopen and read with the inferred schema
+    let file = File::open(path)
+        .map_err(|e| Error::Execution(format!("Failed to open CSV file '{}': {}", path, e)))?;
+
+    let reader = ReaderBuilder::new(std::sync::Arc::new(schema))
+        .with_format(format)
+        .build(file)
+        .map_err(|e| Error::Execution(format!("Failed to create CSV reader: {}", e)))?;
+
+    let mut all_rows = Vec::new();
+
+    for batch_result in reader {
+        let batch = batch_result
+            .map_err(|e| Error::Execution(format!("Failed to read CSV batch: {}", e)))?;
+
+        // Convert Arrow RecordBatch to rows of Values
+        let num_rows = batch.num_rows();
+        let num_cols = batch.num_columns();
+
+        for row_idx in 0..num_rows {
+            let mut row = Vec::with_capacity(num_cols);
+            for col_idx in 0..num_cols {
+                let col = batch.column(col_idx);
+                let value = arrow_array_to_value(col, row_idx)?;
+                row.push(value);
+            }
+            all_rows.push(row);
+        }
+    }
+
+    Ok(all_rows)
+}
+
+/// Read a Parquet file and return rows as Value vectors
+fn read_parquet_file(path: &str) -> Result<Vec<Vec<Value>>> {
+    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+    use std::fs::File;
+
+    let file = File::open(path)
+        .map_err(|e| Error::Execution(format!("Failed to open Parquet file '{}': {}", path, e)))?;
+
+    let reader = ParquetRecordBatchReaderBuilder::try_new(file)
+        .map_err(|e| Error::Execution(format!("Failed to create Parquet reader: {}", e)))?
+        .build()
+        .map_err(|e| Error::Execution(format!("Failed to build Parquet reader: {}", e)))?;
+
+    let mut all_rows = Vec::new();
+
+    for batch_result in reader {
+        let batch = batch_result
+            .map_err(|e| Error::Execution(format!("Failed to read Parquet batch: {}", e)))?;
+
+        // Convert Arrow RecordBatch to rows of Values
+        let num_rows = batch.num_rows();
+        let num_cols = batch.num_columns();
+
+        for row_idx in 0..num_rows {
+            let mut row = Vec::with_capacity(num_cols);
+            for col_idx in 0..num_cols {
+                let col = batch.column(col_idx);
+                let value = arrow_array_to_value(col, row_idx)?;
+                row.push(value);
+            }
+            all_rows.push(row);
+        }
+    }
+
+    Ok(all_rows)
+}
+
+/// Convert an Arrow array value at a given index to a Value
+fn arrow_array_to_value(array: &std::sync::Arc<dyn arrow::array::Array>, row_idx: usize) -> Result<Value> {
+    use arrow::array::*;
+    use arrow::datatypes::DataType;
+
+    if array.is_null(row_idx) {
+        return Ok(Value::Null);
+    }
+
+    match array.data_type() {
+        DataType::Boolean => {
+            let arr = array.as_any().downcast_ref::<BooleanArray>().unwrap();
+            Ok(Value::Boolean(arr.value(row_idx)))
+        }
+        DataType::Int8 => {
+            let arr = array.as_any().downcast_ref::<Int8Array>().unwrap();
+            Ok(Value::Integer(arr.value(row_idx) as i32))
+        }
+        DataType::Int16 => {
+            let arr = array.as_any().downcast_ref::<Int16Array>().unwrap();
+            Ok(Value::Integer(arr.value(row_idx) as i32))
+        }
+        DataType::Int32 => {
+            let arr = array.as_any().downcast_ref::<Int32Array>().unwrap();
+            Ok(Value::Integer(arr.value(row_idx)))
+        }
+        DataType::Int64 => {
+            let arr = array.as_any().downcast_ref::<Int64Array>().unwrap();
+            Ok(Value::BigInt(arr.value(row_idx)))
+        }
+        DataType::UInt8 => {
+            let arr = array.as_any().downcast_ref::<UInt8Array>().unwrap();
+            Ok(Value::Integer(arr.value(row_idx) as i32))
+        }
+        DataType::UInt16 => {
+            let arr = array.as_any().downcast_ref::<UInt16Array>().unwrap();
+            Ok(Value::Integer(arr.value(row_idx) as i32))
+        }
+        DataType::UInt32 => {
+            let arr = array.as_any().downcast_ref::<UInt32Array>().unwrap();
+            Ok(Value::BigInt(arr.value(row_idx) as i64))
+        }
+        DataType::UInt64 => {
+            let arr = array.as_any().downcast_ref::<UInt64Array>().unwrap();
+            Ok(Value::BigInt(arr.value(row_idx) as i64))
+        }
+        DataType::Float32 => {
+            let arr = array.as_any().downcast_ref::<Float32Array>().unwrap();
+            Ok(Value::Double(arr.value(row_idx) as f64))
+        }
+        DataType::Float64 => {
+            let arr = array.as_any().downcast_ref::<Float64Array>().unwrap();
+            Ok(Value::Double(arr.value(row_idx)))
+        }
+        DataType::Utf8 => {
+            let arr = array.as_any().downcast_ref::<StringArray>().unwrap();
+            Ok(Value::Varchar(arr.value(row_idx).to_string()))
+        }
+        DataType::LargeUtf8 => {
+            let arr = array.as_any().downcast_ref::<LargeStringArray>().unwrap();
+            Ok(Value::Varchar(arr.value(row_idx).to_string()))
+        }
+        DataType::Date32 => {
+            let arr = array.as_any().downcast_ref::<Date32Array>().unwrap();
+            let days = arr.value(row_idx);
+            let date = chrono::NaiveDate::from_num_days_from_ce_opt(days + 719163)
+                .unwrap_or_else(|| chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap());
+            Ok(Value::Date(date))
+        }
+        DataType::Date64 => {
+            let arr = array.as_any().downcast_ref::<Date64Array>().unwrap();
+            let millis = arr.value(row_idx);
+            let datetime = chrono::DateTime::from_timestamp_millis(millis)
+                .map(|dt| dt.naive_utc().date())
+                .unwrap_or_else(|| chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap());
+            Ok(Value::Date(datetime))
+        }
+        DataType::Timestamp(_, _) => {
+            let arr = array.as_any().downcast_ref::<TimestampMicrosecondArray>()
+                .or_else(|| Some(array.as_any().downcast_ref::<TimestampMicrosecondArray>()?));
+            if let Some(arr) = arr {
+                let micros = arr.value(row_idx);
+                let dt = chrono::DateTime::from_timestamp_micros(micros)
+                    .map(|dt| dt.naive_utc())
+                    .unwrap_or_else(|| chrono::NaiveDateTime::from_timestamp_opt(0, 0).unwrap());
+                Ok(Value::Timestamp(dt))
+            } else {
+                Ok(Value::Null)
+            }
+        }
+        _ => {
+            // For unsupported types, convert to string representation
+            let formatter = arrow::util::display::ArrayFormatter::try_new(array.as_ref(), &Default::default())
+                .map_err(|e| Error::Execution(format!("Failed to format array: {}", e)))?;
+            Ok(Value::Varchar(formatter.value(row_idx).to_string()))
+        }
     }
 }
