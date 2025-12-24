@@ -149,13 +149,13 @@ fn optimize_limits(op: &LogicalOperator) -> LogicalOperator {
             right,
             join_type,
             condition,
-            is_lateral,
+            is_lateral, asof_condition,
         } => LogicalOperator::Join {
             left: Box::new(optimize_limits(left)),
             right: Box::new(optimize_limits(right)),
             join_type: *join_type,
             condition: condition.clone(),
-            is_lateral: *is_lateral,
+            is_lateral: *is_lateral, asof_condition: asof_condition.clone(),
         },
 
         LogicalOperator::SetOperation {

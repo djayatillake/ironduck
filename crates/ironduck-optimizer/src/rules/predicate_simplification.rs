@@ -113,7 +113,7 @@ fn simplify_operator(op: &LogicalOperator) -> LogicalOperator {
             right,
             join_type,
             condition,
-            is_lateral,
+            is_lateral, asof_condition,
         } => {
             let simplified_cond = condition.as_ref().map(simplify_expression);
 
@@ -125,7 +125,7 @@ fn simplify_operator(op: &LogicalOperator) -> LogicalOperator {
                 right: Box::new(simplify_operator(right)),
                 join_type: *join_type,
                 condition: simplified_cond,
-                is_lateral: *is_lateral,
+                is_lateral: *is_lateral, asof_condition: asof_condition.clone(),
             }
         }
 

@@ -1242,6 +1242,7 @@ fn bind_from_with_ctes(
                 sql::JoinOperator::CrossJoin => BoundJoinType::Cross,
                 sql::JoinOperator::LeftSemi(_) => BoundJoinType::Semi,
                 sql::JoinOperator::LeftAnti(_) => BoundJoinType::Anti,
+                sql::JoinOperator::AsOf { .. } => BoundJoinType::AsOf,
                 _ => return Err(Error::NotImplemented("Join type".to_string())),
             };
 
@@ -1373,12 +1374,80 @@ fn bind_from_with_ctes(
                 _ => (None, Vec::new()),
             };
 
+            // Handle ASOF join's match condition separately
+            let asof_condition = match &join.join_operator {
+                sql::JoinOperator::AsOf { match_condition, .. } => {
+                    let join_tables = collect_tables_from_ref(&current);
+                    let right_tables = collect_tables_from_ref(&right);
+                    let mut all_tables = join_tables;
+                    all_tables.extend(right_tables);
+                    let ctx = ExpressionBinderContext::new(&all_tables);
+                    Some(bind_expression(binder, match_condition, &ctx)?)
+                }
+                _ => None,
+            };
+
+            // For ASOF joins, also extract the constraint condition
+            let (condition, using_columns) = if let sql::JoinOperator::AsOf { constraint, .. } = &join.join_operator {
+                match constraint {
+                    sql::JoinConstraint::On(expr) => {
+                        let join_tables = collect_tables_from_ref(&current);
+                        let right_tables = collect_tables_from_ref(&right);
+                        let mut all_tables = join_tables;
+                        all_tables.extend(right_tables);
+                        let ctx = ExpressionBinderContext::new(&all_tables);
+                        (Some(bind_expression(binder, expr, &ctx)?), Vec::new())
+                    }
+                    sql::JoinConstraint::Using(columns) => {
+                        let join_tables = collect_tables_from_ref(&current);
+                        let right_tables = collect_tables_from_ref(&right);
+                        let mut all_tables = join_tables;
+                        all_tables.extend(right_tables);
+                        let ctx = ExpressionBinderContext::new(&all_tables);
+                        let using_cols: Vec<String> = columns.iter().map(|c| c.value.clone()).collect();
+                        let mut conditions: Vec<BoundExpression> = Vec::new();
+                        for col in columns {
+                            let left_ref = sql::Expr::Identifier(col.clone());
+                            let right_ref = sql::Expr::Identifier(col.clone());
+                            let eq_expr = sql::Expr::BinaryOp {
+                                left: Box::new(left_ref),
+                                op: sql::BinaryOperator::Eq,
+                                right: Box::new(right_ref),
+                            };
+                            conditions.push(bind_expression(binder, &eq_expr, &ctx)?);
+                        }
+                        let cond = if conditions.is_empty() {
+                            None
+                        } else {
+                            let mut result = conditions.remove(0);
+                            for cond in conditions {
+                                result = BoundExpression {
+                                    expr: super::BoundExpressionKind::BinaryOp {
+                                        left: Box::new(result),
+                                        op: super::BoundBinaryOperator::And,
+                                        right: Box::new(cond),
+                                    },
+                                    return_type: ironduck_common::LogicalType::Boolean,
+                                    alias: None,
+                                };
+                            }
+                            Some(result)
+                        };
+                        (cond, using_cols)
+                    }
+                    _ => (None, Vec::new()),
+                }
+            } else {
+                (condition, using_columns)
+            };
+
             current = BoundTableRef::Join {
                 left: Box::new(current),
                 right: Box::new(right),
                 join_type,
                 condition,
                 using_columns,
+                asof_condition,
             };
         }
 

@@ -91,13 +91,13 @@ fn fold_operator(op: &LogicalOperator) -> LogicalOperator {
             right,
             join_type,
             condition,
-            is_lateral,
+            is_lateral, asof_condition,
         } => LogicalOperator::Join {
             left: Box::new(fold_operator(left)),
             right: Box::new(fold_operator(right)),
             join_type: *join_type,
             condition: condition.as_ref().map(fold_expression),
-            is_lateral: *is_lateral,
+            is_lateral: *is_lateral, asof_condition: asof_condition.clone(),
         },
 
         LogicalOperator::SetOperation {

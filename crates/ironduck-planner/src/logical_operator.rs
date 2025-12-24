@@ -48,6 +48,8 @@ pub enum LogicalOperator {
         condition: Option<Expression>,
         /// Whether this is a LATERAL join (right side can reference left side columns)
         is_lateral: bool,
+        /// ASOF match condition (inequality for time-series matching, e.g., left.time >= right.time)
+        asof_condition: Option<Expression>,
     },
 
     /// Sort
@@ -365,6 +367,8 @@ pub enum JoinType {
     Cross,
     Semi,
     Anti,
+    /// ASOF join - matches rows based on closest preceding value
+    AsOf,
 }
 
 /// ALTER TABLE operation types

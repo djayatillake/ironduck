@@ -206,6 +206,8 @@ pub enum BoundTableRef {
         condition: Option<BoundExpression>,
         /// Column names from USING clause that are deduplicated (excluded from right side in wildcards)
         using_columns: Vec<String>,
+        /// ASOF match condition (inequality for time-series matching)
+        asof_condition: Option<BoundExpression>,
     },
     /// Table-valued function (e.g., range(), generate_series())
     TableFunction {
@@ -288,6 +290,9 @@ pub enum BoundJoinType {
     Semi,
     /// Anti join - returns rows from left that have no match in right
     Anti,
+    /// ASOF join - matches rows based on the closest preceding value
+    /// Used for time-series data where exact matches aren't available
+    AsOf,
 }
 
 /// ORDER BY expression

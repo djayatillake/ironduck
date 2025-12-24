@@ -434,7 +434,7 @@ impl Executor {
                 right,
                 join_type,
                 condition,
-                is_lateral,
+                is_lateral, asof_condition,
             } => {
                 let left_rows = self.execute_operator(left)?;
 
@@ -627,6 +627,59 @@ impl Executor {
                             }
                             if !has_match {
                                 result.push(l.clone()); // Only left side columns
+                            }
+                        }
+                    }
+                    ironduck_planner::JoinType::AsOf => {
+                        // ASOF JOIN - for each left row, find the best matching right row
+                        // based on the match condition (typically time >= comparison)
+                        // The asof_condition contains the inequality (e.g., left.time >= right.time)
+                        // The regular condition contains equality requirements (e.g., left.symbol = right.symbol)
+
+                        for l in &left_rows {
+                            let mut best_match: Option<Vec<Value>> = None;
+
+                            for r in &right_rows {
+                                let mut combined = l.clone();
+                                combined.extend(r.clone());
+
+                                // First check the equality condition (if any)
+                                let eq_matches = match condition {
+                                    Some(cond) => {
+                                        matches!(evaluate(cond, &combined)?, Value::Boolean(true))
+                                    }
+                                    None => true,
+                                };
+
+                                if !eq_matches {
+                                    continue;
+                                }
+
+                                // Then check the ASOF inequality condition
+                                let asof_matches = match asof_condition {
+                                    Some(asof_cond) => {
+                                        matches!(evaluate(asof_cond, &combined)?, Value::Boolean(true))
+                                    }
+                                    None => true,
+                                };
+
+                                if asof_matches {
+                                    // For ASOF join, we want the "best" match
+                                    // The semantics is: find the row with the largest right.time that is <= left.time
+                                    // For now, we take the last matching row (assuming right is sorted)
+                                    best_match = Some(combined);
+                                }
+                            }
+
+                            // If we found a match, add it; otherwise add left + NULLs
+                            match best_match {
+                                Some(row) => result.push(row),
+                                None => {
+                                    // No match - treat like LEFT join, add NULLs
+                                    let mut row = l.clone();
+                                    row.extend(vec![Value::Null; right_width]);
+                                    result.push(row);
+                                }
                             }
                         }
                     }
@@ -2374,13 +2427,14 @@ fn substitute_outer_refs(op: &LogicalOperator, outer_row: &[Value]) -> LogicalOp
                 output_types: output_types.clone(),
             }
         }
-        LogicalOperator::Join { left, right, join_type, condition, is_lateral } => {
+        LogicalOperator::Join { left, right, join_type, condition, is_lateral, asof_condition } => {
             LogicalOperator::Join {
                 left: Box::new(substitute_outer_refs(left, outer_row)),
                 right: Box::new(substitute_outer_refs(right, outer_row)),
                 join_type: *join_type,
                 condition: condition.as_ref().map(|e| substitute_expr_outer_refs(e, outer_row)),
                 is_lateral: *is_lateral,
+                asof_condition: asof_condition.as_ref().map(|e| substitute_expr_outer_refs(e, outer_row)),
             }
         }
         LogicalOperator::Sort { input, order_by } => {

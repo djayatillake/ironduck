@@ -820,6 +820,7 @@ fn build_from_plan_with_ctes(from: &[BoundTableRef], ctes: &[BoundCTE]) -> Resul
                     join_type: super::JoinType::Cross,
                     condition: None,
                     is_lateral,
+                    asof_condition: None,
                 }
             },
         });
@@ -891,6 +892,7 @@ fn build_table_ref_plan(table_ref: &BoundTableRef) -> Result<LogicalOperator> {
             right,
             join_type,
             condition,
+            asof_condition,
             ..
         } => {
             let left_plan = build_table_ref_plan(left)?;
@@ -907,6 +909,7 @@ fn build_table_ref_plan(table_ref: &BoundTableRef) -> Result<LogicalOperator> {
                 ironduck_binder::BoundJoinType::Cross => super::JoinType::Cross,
                 ironduck_binder::BoundJoinType::Semi => super::JoinType::Semi,
                 ironduck_binder::BoundJoinType::Anti => super::JoinType::Anti,
+                ironduck_binder::BoundJoinType::AsOf => super::JoinType::AsOf,
             };
 
             Ok(LogicalOperator::Join {
@@ -915,6 +918,7 @@ fn build_table_ref_plan(table_ref: &BoundTableRef) -> Result<LogicalOperator> {
                 join_type: logical_join_type,
                 condition: condition.as_ref().map(convert_expression),
                 is_lateral,
+                asof_condition: asof_condition.as_ref().map(convert_expression),
             })
         }
 
