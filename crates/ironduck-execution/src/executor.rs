@@ -99,6 +99,79 @@ impl Executor {
         evaluate_with_ctx(expr, row, &self.eval_ctx())
     }
 
+    /// Execute a LATERAL join - the right side is re-executed for each left row
+    /// with the left row available as outer context for OuterColumnRef expressions
+    fn execute_lateral_join(
+        &self,
+        _left: &LogicalOperator,
+        right: &LogicalOperator,
+        join_type: &ironduck_planner::JoinType,
+        condition: &Option<Expression>,
+        left_rows: &[Vec<Value>],
+    ) -> Result<Vec<Vec<Value>>> {
+        let mut result = Vec::new();
+        let right_width = right.output_types().len();
+
+        for left_row in left_rows {
+            // Substitute OuterColumnRef in the right plan with values from left_row
+            let substituted_right = substitute_outer_refs(right, left_row);
+
+            // Execute the modified right plan
+            let right_rows = self.execute_operator(&substituted_right)?;
+
+            // Combine results based on join type
+            match join_type {
+                ironduck_planner::JoinType::Cross | ironduck_planner::JoinType::Inner => {
+                    for r in &right_rows {
+                        let mut row = left_row.clone();
+                        row.extend(r.clone());
+
+                        let matches = match condition {
+                            Some(cond) => matches!(evaluate(cond, &row)?, Value::Boolean(true)),
+                            None => true,
+                        };
+
+                        if matches {
+                            result.push(row);
+                        }
+                    }
+                }
+                ironduck_planner::JoinType::Left => {
+                    let mut matched = false;
+                    for r in &right_rows {
+                        let mut row = left_row.clone();
+                        row.extend(r.clone());
+
+                        let matches = match condition {
+                            Some(cond) => matches!(evaluate(cond, &row)?, Value::Boolean(true)),
+                            None => true,
+                        };
+
+                        if matches {
+                            result.push(row);
+                            matched = true;
+                        }
+                    }
+                    if !matched {
+                        let mut row = left_row.clone();
+                        row.extend(vec![Value::Null; right_width]);
+                        result.push(row);
+                    }
+                }
+                _ => {
+                    // For other join types, fall back to cross product behavior
+                    for r in &right_rows {
+                        let mut row = left_row.clone();
+                        row.extend(r.clone());
+                        result.push(row);
+                    }
+                }
+            }
+        }
+
+        Ok(result)
+    }
+
     /// Execute a logical plan and return results
     pub fn execute(&self, plan: &LogicalPlan) -> Result<QueryResult> {
         // Set the catalog for the current thread so aggregate functions can access it
@@ -361,8 +434,16 @@ impl Executor {
                 right,
                 join_type,
                 condition,
+                is_lateral,
             } => {
                 let left_rows = self.execute_operator(left)?;
+
+                // For LATERAL joins, we need to re-execute the right side for each left row
+                // with the left row as outer context
+                if *is_lateral {
+                    return self.execute_lateral_join(left, right, join_type, condition, &left_rows);
+                }
+
                 let right_rows = self.execute_operator(right)?;
                 let mut result = Vec::new();
 
@@ -1967,6 +2048,149 @@ fn contains_rowid(expr: &Expression) -> bool {
         Expression::InList { expr, list, .. } => contains_rowid(expr) || list.iter().any(contains_rowid),
         Expression::InSubquery { expr, .. } => contains_rowid(expr),
         _ => false,
+    }
+}
+
+/// Substitute OuterColumnRef expressions in a logical operator with constant values
+/// This is used for LATERAL joins where we need to execute the right side with
+/// values from the current left row
+fn substitute_outer_refs(op: &LogicalOperator, outer_row: &[Value]) -> LogicalOperator {
+    match op {
+        LogicalOperator::Project { input, expressions, output_names, output_types } => {
+            LogicalOperator::Project {
+                input: Box::new(substitute_outer_refs(input, outer_row)),
+                expressions: expressions.iter().map(|e| substitute_expr_outer_refs(e, outer_row)).collect(),
+                output_names: output_names.clone(),
+                output_types: output_types.clone(),
+            }
+        }
+        LogicalOperator::Filter { input, predicate } => {
+            LogicalOperator::Filter {
+                input: Box::new(substitute_outer_refs(input, outer_row)),
+                predicate: substitute_expr_outer_refs(predicate, outer_row),
+            }
+        }
+        LogicalOperator::Aggregate { input, group_by, aggregates } => {
+            LogicalOperator::Aggregate {
+                input: Box::new(substitute_outer_refs(input, outer_row)),
+                group_by: group_by.iter().map(|e| substitute_expr_outer_refs(e, outer_row)).collect(),
+                aggregates: aggregates.iter().map(|agg| {
+                    ironduck_planner::AggregateExpression {
+                        function: agg.function.clone(),
+                        args: agg.args.iter().map(|e| substitute_expr_outer_refs(e, outer_row)).collect(),
+                        distinct: agg.distinct,
+                        filter: agg.filter.as_ref().map(|e| substitute_expr_outer_refs(e, outer_row)),
+                        order_by: agg.order_by.iter().map(|(e, asc, nf)| (substitute_expr_outer_refs(e, outer_row), *asc, *nf)).collect(),
+                    }
+                }).collect(),
+            }
+        }
+        LogicalOperator::Scan { schema, table, column_names, output_types } => {
+            LogicalOperator::Scan {
+                schema: schema.clone(),
+                table: table.clone(),
+                column_names: column_names.clone(),
+                output_types: output_types.clone(),
+            }
+        }
+        LogicalOperator::Join { left, right, join_type, condition, is_lateral } => {
+            LogicalOperator::Join {
+                left: Box::new(substitute_outer_refs(left, outer_row)),
+                right: Box::new(substitute_outer_refs(right, outer_row)),
+                join_type: *join_type,
+                condition: condition.as_ref().map(|e| substitute_expr_outer_refs(e, outer_row)),
+                is_lateral: *is_lateral,
+            }
+        }
+        LogicalOperator::Sort { input, order_by } => {
+            LogicalOperator::Sort {
+                input: Box::new(substitute_outer_refs(input, outer_row)),
+                order_by: order_by.iter().map(|o| ironduck_planner::OrderByExpression {
+                    expr: substitute_expr_outer_refs(&o.expr, outer_row),
+                    ascending: o.ascending,
+                    nulls_first: o.nulls_first,
+                }).collect(),
+            }
+        }
+        LogicalOperator::Limit { input, limit, offset } => {
+            LogicalOperator::Limit {
+                input: Box::new(substitute_outer_refs(input, outer_row)),
+                limit: *limit,
+                offset: *offset,
+            }
+        }
+        LogicalOperator::Distinct { input, on_exprs } => {
+            LogicalOperator::Distinct {
+                input: Box::new(substitute_outer_refs(input, outer_row)),
+                on_exprs: on_exprs.as_ref().map(|es| es.iter().map(|e| substitute_expr_outer_refs(e, outer_row)).collect()),
+            }
+        }
+        // For operators that don't contain expressions, just return as-is
+        _ => op.clone(),
+    }
+}
+
+/// Substitute OuterColumnRef in an expression with constant values
+fn substitute_expr_outer_refs(expr: &Expression, outer_row: &[Value]) -> Expression {
+    match expr {
+        Expression::OuterColumnRef { column_index, .. } => {
+            // Replace with constant value from outer row
+            if let Some(value) = outer_row.get(*column_index) {
+                Expression::Constant(value.clone())
+            } else {
+                Expression::Constant(Value::Null)
+            }
+        }
+        Expression::BinaryOp { left, op, right } => {
+            Expression::BinaryOp {
+                left: Box::new(substitute_expr_outer_refs(left, outer_row)),
+                op: *op,
+                right: Box::new(substitute_expr_outer_refs(right, outer_row)),
+            }
+        }
+        Expression::UnaryOp { op, expr } => {
+            Expression::UnaryOp {
+                op: *op,
+                expr: Box::new(substitute_expr_outer_refs(expr, outer_row)),
+            }
+        }
+        Expression::Function { name, args } => {
+            Expression::Function {
+                name: name.clone(),
+                args: args.iter().map(|e| substitute_expr_outer_refs(e, outer_row)).collect(),
+            }
+        }
+        Expression::Cast { expr, target_type } => {
+            Expression::Cast {
+                expr: Box::new(substitute_expr_outer_refs(expr, outer_row)),
+                target_type: target_type.clone(),
+            }
+        }
+        Expression::TryCast { expr, target_type } => {
+            Expression::TryCast {
+                expr: Box::new(substitute_expr_outer_refs(expr, outer_row)),
+                target_type: target_type.clone(),
+            }
+        }
+        Expression::IsNull(e) => Expression::IsNull(Box::new(substitute_expr_outer_refs(e, outer_row))),
+        Expression::IsNotNull(e) => Expression::IsNotNull(Box::new(substitute_expr_outer_refs(e, outer_row))),
+        Expression::Case { operand, conditions, results, else_result } => {
+            Expression::Case {
+                operand: operand.as_ref().map(|e| Box::new(substitute_expr_outer_refs(e, outer_row))),
+                conditions: conditions.iter().map(|e| substitute_expr_outer_refs(e, outer_row)).collect(),
+                results: results.iter().map(|e| substitute_expr_outer_refs(e, outer_row)).collect(),
+                else_result: else_result.as_ref().map(|e| Box::new(substitute_expr_outer_refs(e, outer_row))),
+            }
+        }
+        Expression::InList { expr, list, negated } => {
+            Expression::InList {
+                expr: Box::new(substitute_expr_outer_refs(expr, outer_row)),
+                list: list.iter().map(|e| substitute_expr_outer_refs(e, outer_row)).collect(),
+                negated: *negated,
+            }
+        }
+        // For other expressions (Constant, ColumnRef, etc.), return as-is
+        _ => expr.clone(),
     }
 }
 

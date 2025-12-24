@@ -93,11 +93,13 @@ fn pushdown_filters(op: &LogicalOperator) -> LogicalOperator {
             right,
             join_type,
             condition,
+            is_lateral,
         } => LogicalOperator::Join {
             left: Box::new(pushdown_filters(left)),
             right: Box::new(pushdown_filters(right)),
             join_type: *join_type,
             condition: condition.clone(),
+            is_lateral: *is_lateral,
         },
 
         LogicalOperator::SetOperation {
@@ -243,6 +245,7 @@ fn push_filter_through(input: &LogicalOperator, predicate: &Expression) -> Logic
             right,
             join_type,
             condition,
+            is_lateral,
         } => {
             let left_columns = count_columns(left);
 
@@ -302,6 +305,7 @@ fn push_filter_through(input: &LogicalOperator, predicate: &Expression) -> Logic
                 right: Box::new(new_right),
                 join_type: *join_type,
                 condition: condition.clone(),
+                is_lateral: *is_lateral,
             };
 
             // Apply remaining filters above the join

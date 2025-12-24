@@ -193,6 +193,7 @@ fn pushdown_projections(op: &LogicalOperator, needed: &HashSet<usize>) -> Logica
             right,
             join_type,
             condition,
+            is_lateral,
         } => {
             // Keep all columns from both sides to preserve column indices
             let left_count = left.output_types().len();
@@ -205,6 +206,7 @@ fn pushdown_projections(op: &LogicalOperator, needed: &HashSet<usize>) -> Logica
                 right: Box::new(pushdown_projections(right, &right_needed)),
                 join_type: *join_type,
                 condition: condition.clone(),
+                is_lateral: *is_lateral,
             }
         }
 

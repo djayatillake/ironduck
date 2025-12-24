@@ -799,11 +799,16 @@ fn build_from_plan_with_ctes(from: &[BoundTableRef], ctes: &[BoundCTE]) -> Resul
 
         result = Some(match result {
             None => table_plan,
-            Some(left) => LogicalOperator::Join {
-                left: Box::new(left),
-                right: Box::new(table_plan),
-                join_type: super::JoinType::Cross,
-                condition: None,
+            Some(left) => {
+                // Check if this is a LATERAL cross join (FROM a, LATERAL (...))
+                let is_lateral = matches!(table_ref, BoundTableRef::Subquery { is_lateral: true, .. });
+                LogicalOperator::Join {
+                    left: Box::new(left),
+                    right: Box::new(table_plan),
+                    join_type: super::JoinType::Cross,
+                    condition: None,
+                    is_lateral,
+                }
             },
         });
     }
@@ -879,6 +884,9 @@ fn build_table_ref_plan(table_ref: &BoundTableRef) -> Result<LogicalOperator> {
             let left_plan = build_table_ref_plan(left)?;
             let right_plan = build_table_ref_plan(right)?;
 
+            // Check if the right side is a LATERAL subquery
+            let is_lateral = matches!(right.as_ref(), BoundTableRef::Subquery { is_lateral: true, .. });
+
             let logical_join_type = match join_type {
                 ironduck_binder::BoundJoinType::Inner => super::JoinType::Inner,
                 ironduck_binder::BoundJoinType::Left => super::JoinType::Left,
@@ -894,6 +902,7 @@ fn build_table_ref_plan(table_ref: &BoundTableRef) -> Result<LogicalOperator> {
                 right: Box::new(right_plan),
                 join_type: logical_join_type,
                 condition: condition.as_ref().map(convert_expression),
+                is_lateral,
             })
         }
 

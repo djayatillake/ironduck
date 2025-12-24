@@ -46,6 +46,8 @@ pub enum LogicalOperator {
         right: Box<LogicalOperator>,
         join_type: JoinType,
         condition: Option<Expression>,
+        /// Whether this is a LATERAL join (right side can reference left side columns)
+        is_lateral: bool,
     },
 
     /// Sort
