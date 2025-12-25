@@ -25,6 +25,11 @@ impl Table {
         self.columns.iter().find(|c| c.name == name)
     }
 
+    /// Get a column's index by name
+    pub fn get_column_index(&self, name: &str) -> Option<usize> {
+        self.columns.iter().position(|c| c.name.eq_ignore_ascii_case(name))
+    }
+
     /// Get a column by index
     pub fn get_column_by_id(&self, id: ColumnId) -> Option<&Column> {
         self.columns.get(id as usize)

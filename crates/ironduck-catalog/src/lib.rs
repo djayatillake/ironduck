@@ -9,6 +9,7 @@ use std::sync::Arc;
 
 mod column;
 mod function;
+mod index;
 mod schema;
 mod sequence;
 mod table;
@@ -16,6 +17,7 @@ mod view;
 
 pub use column::{Column, ColumnId};
 pub use function::{Function, FunctionId};
+pub use index::{Index, IndexId, IndexType};
 pub use schema::{Schema, SchemaId};
 pub use sequence::{Sequence, SequenceId};
 pub use table::{Table, TableId};
@@ -215,6 +217,64 @@ impl Catalog {
         let schema = self.get_schema(schema_name)
             .ok_or_else(|| Error::SchemaNotFound(schema_name.to_string()))?;
         schema.rename_table(old_name, new_name)
+    }
+
+    /// Create an index in the given schema
+    pub fn create_index(
+        &self,
+        schema_name: &str,
+        index_name: &str,
+        table_name: &str,
+        columns: Vec<String>,
+        column_types: Vec<LogicalType>,
+        index_type: IndexType,
+        unique: bool,
+    ) -> Result<IndexId> {
+        let schema = self
+            .get_schema(schema_name)
+            .ok_or_else(|| Error::SchemaNotFound(schema_name.to_string()))?;
+
+        // Verify table exists
+        if schema.get_table(table_name).is_none() {
+            return Err(Error::TableNotFound(table_name.to_string()));
+        }
+
+        let index_id = self.next_id();
+        let index = Index::new(
+            index_id,
+            index_name.to_string(),
+            table_name.to_string(),
+            columns,
+            column_types,
+            index_type,
+            unique,
+        );
+        schema.add_index(index)?;
+
+        Ok(index_id)
+    }
+
+    /// Get an index by schema and index name
+    pub fn get_index(&self, schema_name: &str, index_name: &str) -> Option<Arc<Index>> {
+        let schema = self.get_schema(schema_name)?;
+        schema.get_index(index_name)
+    }
+
+    /// Get all indexes for a table
+    pub fn get_indexes_for_table(&self, schema_name: &str, table_name: &str) -> Vec<Arc<Index>> {
+        if let Some(schema) = self.get_schema(schema_name) {
+            schema.get_indexes_for_table(table_name)
+        } else {
+            vec![]
+        }
+    }
+
+    /// Drop an index
+    pub fn drop_index(&self, schema_name: &str, index_name: &str) -> Result<()> {
+        let schema = self
+            .get_schema(schema_name)
+            .ok_or_else(|| Error::SchemaNotFound(schema_name.to_string()))?;
+        schema.drop_index(index_name)
     }
 }
 

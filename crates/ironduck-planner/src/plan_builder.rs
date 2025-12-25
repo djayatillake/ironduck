@@ -1,10 +1,10 @@
 //! Plan builder - converts bound statements to logical plans
 
-use super::{AlterTableOp, CopyFormatKind, CopySourceKind, LogicalOperator, LogicalPlan, SetOperationType};
+use super::{AlterTableOp, CopyFormatKind, CopySourceKind, LogicalOperator, LogicalPlan, SetOperationType, TransactionOp};
 use ironduck_binder::{
-    AlterTableOperation, BoundCTE, BoundCopy, BoundDelete, BoundExpression, BoundExpressionKind,
+    AlterTableOperation, BoundCTE, BoundCopy, BoundCreateIndex, BoundDelete, BoundExpression, BoundExpressionKind,
     BoundSelect, BoundSetOperation, BoundStatement, BoundTableRef, BoundUpdate, CopyFormatType,
-    CopySource, DistinctKind, SetOperand,
+    CopySource, DistinctKind, SetOperand, TransactionStatement,
 };
 use ironduck_common::{Error, LogicalType, Result, Value};
 
@@ -156,6 +156,32 @@ pub fn build_plan(statement: &BoundStatement) -> Result<LogicalPlan> {
             ))
         }
         BoundStatement::Copy(copy) => build_copy_plan(copy),
+        BoundStatement::CreateIndex(create) => Ok(LogicalPlan::new(
+            LogicalOperator::CreateIndex {
+                schema: create.schema.clone(),
+                index_name: create.index_name.clone(),
+                table_name: create.table_name.clone(),
+                columns: create.columns.clone(),
+                column_types: create.column_types.clone(),
+                unique: create.unique,
+                if_not_exists: create.if_not_exists,
+            },
+            vec!["Success".to_string()],
+        )),
+        BoundStatement::Transaction(tx) => {
+            let operation = match tx {
+                TransactionStatement::Begin => TransactionOp::Begin,
+                TransactionStatement::Commit => TransactionOp::Commit,
+                TransactionStatement::Rollback => TransactionOp::Rollback,
+                TransactionStatement::Savepoint(name) => TransactionOp::Savepoint(name.clone()),
+                TransactionStatement::ReleaseSavepoint(name) => TransactionOp::ReleaseSavepoint(name.clone()),
+                TransactionStatement::RollbackToSavepoint(name) => TransactionOp::RollbackToSavepoint(name.clone()),
+            };
+            Ok(LogicalPlan::new(
+                LogicalOperator::Transaction { operation },
+                vec!["Success".to_string()],
+            ))
+        }
         BoundStatement::NoOp => {
             // No-op statements (PRAGMA, SET, etc.) produce an empty result
             Ok(LogicalPlan::new(
@@ -1164,6 +1190,17 @@ fn build_table_ref_plan(table_ref: &BoundTableRef) -> Result<LogicalOperator> {
                             column_types: column_types.clone(),
                         },
                         column_name: "parquet".to_string(),
+                        output_type: ironduck_common::LogicalType::Unknown,
+                    })
+                }
+                ironduck_binder::FileTableType::Json => {
+                    Ok(LogicalOperator::TableFunction {
+                        function: super::TableFunctionKind::ReadJson {
+                            path: path.clone(),
+                            column_names: column_names.clone(),
+                            column_types: column_types.clone(),
+                        },
+                        column_name: "json".to_string(),
                         output_type: ironduck_common::LogicalType::Unknown,
                     })
                 }

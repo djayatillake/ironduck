@@ -393,6 +393,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "72b3254f16251a8381aa12e40e3c4d2f0199f8c6508fbecb9d91f575e0fbb8c6"
 
 [[package]]
+name = "bincode"
+version = "1.3.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b1f45e9417d87227c7a56d22e471c6206462cba514c7590c09aff4cf6d1ddcad"
+dependencies = [
+ "serde",
+]
+
+[[package]]
 name = "bitflags"
 version = "1.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1167,6 +1176,7 @@ dependencies = [
  "ironduck-common",
  "ironduck-parser",
  "parquet",
+ "serde_json",
  "sqlparser",
  "thiserror",
 ]
@@ -1201,6 +1211,7 @@ dependencies = [
  "chrono",
  "num-traits",
  "rust_decimal",
+ "serde",
  "smallvec",
  "thiserror",
  "uuid",
@@ -1288,11 +1299,14 @@ dependencies = [
 name = "ironduck-storage"
 version = "0.1.0"
 dependencies = [
+ "bincode",
  "bytes",
  "ironduck-common",
  "lz4_flex",
  "memmap2",
  "parking_lot",
+ "serde",
+ "serde_json",
  "thiserror",
  "zstd",
 ]
@@ -2479,6 +2493,7 @@ checksum = "e2e054861b4bd027cd373e18e8d8d8e6548085000e41290d95ce0c373a654b4a"
 dependencies = [
  "getrandom 0.3.4",
  "js-sys",
+ "serde_core",
  "wasm-bindgen",
 ]
 

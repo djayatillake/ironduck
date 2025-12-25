@@ -2,12 +2,12 @@
 
 use super::expression_binder::{bind_data_type, bind_expression, ExpressionBinderContext};
 use super::{
-    AlterTableOperation, BoundAlterTable, BoundCTE, BoundColumnDef, BoundCopy, BoundCreateSchema,
-    BoundCreateSequence, BoundCreateTable, BoundCreateView, BoundDelete, BoundDrop,
-    BoundExpression, BoundInsert, BoundJoinType, BoundOrderBy, BoundRecursiveCTE,
+    AlterTableOperation, BoundAlterTable, BoundCTE, BoundColumnDef, BoundCopy, BoundCreateIndex,
+    BoundCreateSchema, BoundCreateSequence, BoundCreateTable, BoundCreateView, BoundDelete,
+    BoundDrop, BoundExpression, BoundInsert, BoundJoinType, BoundOrderBy, BoundRecursiveCTE,
     BoundSelect, BoundSetOperation, BoundStatement, BoundTableRef, BoundUpdate, Binder,
     CopyFormat, CopyFormatType, CopySource, DistinctKind, DropObjectType, FileTableType,
-    SetOperand, SetOperationType, TableFunctionType,
+    SetOperand, SetOperationType, TableFunctionType, TransactionStatement,
 };
 use ironduck_common::{Error, LogicalType, Result};
 use sqlparser::ast as sql;
@@ -39,6 +39,7 @@ pub fn bind_statement(binder: &Binder, stmt: &sql::Statement) -> Result<BoundSta
                 sql::ObjectType::Table => DropObjectType::Table,
                 sql::ObjectType::Schema => DropObjectType::Schema,
                 sql::ObjectType::View => DropObjectType::View,
+                sql::ObjectType::Index => DropObjectType::Index,
                 _ => return Err(Error::NotImplemented(format!("DROP {:?}", object_type))),
             };
 
@@ -96,12 +97,28 @@ pub fn bind_statement(binder: &Binder, stmt: &sql::Statement) -> Result<BoundSta
             bind_create_sequence(binder, name, *if_not_exists, sequence_options)
         }
 
-        // Transaction statements - treat as no-ops for in-memory database
-        sql::Statement::StartTransaction { .. } => Ok(BoundStatement::NoOp),
-        sql::Statement::Commit { .. } => Ok(BoundStatement::NoOp),
-        sql::Statement::Rollback { .. } => Ok(BoundStatement::NoOp),
-        sql::Statement::Savepoint { .. } => Ok(BoundStatement::NoOp),
-        sql::Statement::ReleaseSavepoint { .. } => Ok(BoundStatement::NoOp),
+        // Transaction statements
+        sql::Statement::StartTransaction { .. } => {
+            Ok(BoundStatement::Transaction(TransactionStatement::Begin))
+        }
+        sql::Statement::Commit { .. } => {
+            Ok(BoundStatement::Transaction(TransactionStatement::Commit))
+        }
+        sql::Statement::Rollback { savepoint, .. } => {
+            if let Some(sp) = savepoint {
+                Ok(BoundStatement::Transaction(TransactionStatement::RollbackToSavepoint(
+                    sp.value.clone()
+                )))
+            } else {
+                Ok(BoundStatement::Transaction(TransactionStatement::Rollback))
+            }
+        }
+        sql::Statement::Savepoint { name } => {
+            Ok(BoundStatement::Transaction(TransactionStatement::Savepoint(name.value.clone())))
+        }
+        sql::Statement::ReleaseSavepoint { name } => {
+            Ok(BoundStatement::Transaction(TransactionStatement::ReleaseSavepoint(name.value.clone())))
+        }
 
         // ALTER TABLE
         sql::Statement::AlterTable { name, if_exists: _, operations, .. } => {
@@ -111,6 +128,11 @@ pub fn bind_statement(binder: &Binder, stmt: &sql::Statement) -> Result<BoundSta
         // COPY statement
         sql::Statement::Copy { source, to, target, options, .. } => {
             bind_copy(binder, source, *to, target, options)
+        }
+
+        // CREATE INDEX
+        sql::Statement::CreateIndex(create_index) => {
+            bind_create_index(binder, create_index)
         }
 
         _ => Err(Error::NotImplemented(format!("Statement: {:?}", stmt))),
@@ -255,6 +277,61 @@ fn bind_alter_table(
         schema,
         table_name,
         operation: bound_op,
+    }))
+}
+
+/// Bind CREATE INDEX statement
+fn bind_create_index(binder: &Binder, create: &sql::CreateIndex) -> Result<BoundStatement> {
+    // Get index name
+    let index_name = create.name.as_ref()
+        .map(|n| n.0.last().map(|i| i.value.clone()).unwrap_or_default())
+        .unwrap_or_else(|| "unnamed_index".to_string());
+
+    // Get table name
+    let table_parts: Vec<_> = create.table_name.0.iter().map(|i| i.value.clone()).collect();
+    let (schema, table_name) = if table_parts.len() == 2 {
+        (table_parts[0].clone(), table_parts[1].clone())
+    } else {
+        (binder.current_schema().to_string(), table_parts[0].clone())
+    };
+
+    // Get the table to verify columns and get types
+    let table = binder.catalog().get_table(&schema, &table_name)
+        .ok_or_else(|| Error::TableNotFound(format!("{}.{}", schema, table_name)))?;
+
+    // Get column names from the index
+    let mut columns = Vec::new();
+    let mut column_types = Vec::new();
+
+    for col in &create.columns {
+        let col_name = match &col.expr {
+            sql::Expr::Identifier(ident) => ident.value.clone(),
+            _ => return Err(Error::InvalidArguments("Index column must be a column name".to_string())),
+        };
+
+        // Find the column in the table
+        let col_info = table.columns.iter()
+            .find(|c| c.name.eq_ignore_ascii_case(&col_name))
+            .ok_or_else(|| Error::ColumnNotFound(col_name.clone()))?;
+
+        columns.push(col_name);
+        column_types.push(col_info.logical_type.clone());
+    }
+
+    // Check if unique
+    let unique = create.unique;
+
+    // Check if_not_exists
+    let if_not_exists = create.if_not_exists;
+
+    Ok(BoundStatement::CreateIndex(BoundCreateIndex {
+        schema,
+        index_name,
+        table_name,
+        columns,
+        column_types,
+        unique,
+        if_not_exists,
     }))
 }
 
@@ -2178,7 +2255,90 @@ fn bind_table_function(
                 column_types,
             })
         }
+        "READ_JSON" | "READ_JSON_AUTO" | "READ_NDJSON" | "READ_NDJSON_AUTO" => {
+            // read_json(path)
+            let path = args.first()
+                .and_then(|arg| match arg {
+                    sql::FunctionArg::Unnamed(sql::FunctionArgExpr::Expr(sql::Expr::Value(v))) => {
+                        match v {
+                            sql::Value::SingleQuotedString(s) |
+                            sql::Value::DoubleQuotedString(s) => Some(s.clone()),
+                            _ => None,
+                        }
+                    }
+                    _ => None,
+                })
+                .ok_or_else(|| Error::InvalidArguments("read_json() requires a file path as first argument".to_string()))?;
+
+            // Read JSON schema to get column names
+            let (column_names, column_types) = read_json_schema(&path)?;
+
+            let table_alias = alias.as_ref().map(|a| a.name.value.clone());
+
+            Ok(BoundTableRef::FileTableFunction {
+                path,
+                file_type: FileTableType::Json,
+                alias: table_alias,
+                column_names,
+                column_types,
+            })
+        }
         _ => Err(Error::NotImplemented(format!("Table function: {}", func_name))),
+    }
+}
+
+/// Read JSON file schema (column names and types)
+fn read_json_schema(path: &str) -> Result<(Vec<String>, Vec<LogicalType>)> {
+    use std::fs::File;
+    use std::io::{BufRead, BufReader};
+
+    let file = File::open(path)
+        .map_err(|e| Error::Parse(format!("Failed to open JSON file '{}': {}", path, e)))?;
+
+    let reader = BufReader::new(file);
+
+    // Read the first line to infer schema
+    for line in reader.lines() {
+        let line = line.map_err(|e| Error::Parse(format!("Failed to read JSON file: {}", e)))?;
+        let line = line.trim();
+
+        if line.is_empty() {
+            continue;
+        }
+
+        // Parse as JSON object
+        let json: serde_json::Value = serde_json::from_str(line)
+            .map_err(|e| Error::Parse(format!("Failed to parse JSON: {}", e)))?;
+
+        if let serde_json::Value::Object(obj) = json {
+            let column_names: Vec<String> = obj.keys().cloned().collect();
+            let column_types: Vec<LogicalType> = obj.values()
+                .map(|v| json_value_to_logical_type(v))
+                .collect();
+            return Ok((column_names, column_types));
+        } else {
+            return Err(Error::Parse("JSON file must contain objects".to_string()));
+        }
+    }
+
+    Err(Error::Parse("Empty JSON file".to_string()))
+}
+
+/// Infer LogicalType from a JSON value
+fn json_value_to_logical_type(v: &serde_json::Value) -> LogicalType {
+    match v {
+        serde_json::Value::Null => LogicalType::Varchar,
+        serde_json::Value::Bool(_) => LogicalType::Boolean,
+        serde_json::Value::Number(n) => {
+            if n.is_i64() {
+                LogicalType::BigInt
+            } else {
+                LogicalType::Double
+            }
+        }
+        serde_json::Value::String(_) => LogicalType::Varchar,
+        serde_json::Value::Array(_) => LogicalType::List(Box::new(LogicalType::Varchar)),
+        serde_json::Value::Object(_) => LogicalType::Varchar, // Serialize nested objects as JSON strings
     }
 }
 

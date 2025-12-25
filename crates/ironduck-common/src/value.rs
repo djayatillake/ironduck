@@ -10,12 +10,13 @@
 use crate::types::LogicalType;
 use chrono::{DateTime, NaiveDate, NaiveDateTime, NaiveTime, Timelike, Utc};
 use rust_decimal::Decimal;
+use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 use std::fmt;
 use uuid::Uuid;
 
 /// An interval value representing a duration
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Interval {
     /// Number of months
     pub months: i32,
@@ -44,7 +45,7 @@ impl Interval {
 }
 
 /// Runtime value representation
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Value {
     /// NULL value
     Null,

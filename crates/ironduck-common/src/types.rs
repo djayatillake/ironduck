@@ -4,11 +4,12 @@
 //! Every value in IronDuck has a LogicalType that determines how it's stored,
 //! compared, and operated upon.
 
+use serde::{Deserialize, Serialize};
 use std::fmt;
 
 /// The logical type of a value in IronDuck.
 /// This matches DuckDB's type system for compatibility.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum LogicalType {
     // ============================================
     // Null type

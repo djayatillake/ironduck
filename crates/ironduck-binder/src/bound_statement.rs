@@ -15,9 +15,12 @@ pub enum BoundStatement {
     CreateSchema(BoundCreateSchema),
     CreateView(BoundCreateView),
     CreateSequence(BoundCreateSequence),
+    CreateIndex(BoundCreateIndex),
     Drop(BoundDrop),
     AlterTable(BoundAlterTable),
     Copy(BoundCopy),
+    /// Transaction control
+    Transaction(TransactionStatement),
     Explain(Box<BoundStatement>),
     /// No-op statement (PRAGMA, SET, etc.)
     NoOp,
@@ -307,6 +310,8 @@ pub enum FileTableType {
     },
     /// Parquet file
     Parquet,
+    /// JSON file (newline-delimited JSON or JSON array)
+    Json,
 }
 
 /// Join types
@@ -439,6 +444,30 @@ pub enum DropObjectType {
     Table,
     Schema,
     View,
+    Index,
+}
+
+/// Bound CREATE INDEX statement
+#[derive(Debug, Clone)]
+pub struct BoundCreateIndex {
+    pub schema: String,
+    pub index_name: String,
+    pub table_name: String,
+    pub columns: Vec<String>,
+    pub column_types: Vec<LogicalType>,
+    pub unique: bool,
+    pub if_not_exists: bool,
+}
+
+/// Transaction control statements
+#[derive(Debug, Clone)]
+pub enum TransactionStatement {
+    Begin,
+    Commit,
+    Rollback,
+    Savepoint(String),
+    ReleaseSavepoint(String),
+    RollbackToSavepoint(String),
 }
 
 /// Bound ALTER TABLE statement

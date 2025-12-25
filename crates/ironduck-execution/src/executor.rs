@@ -3,8 +3,8 @@
 use crate::expression::{evaluate, evaluate_with_ctx, EvalContext};
 use ironduck_catalog::Catalog;
 use ironduck_common::{Error, LogicalType, Result, Value};
-use ironduck_planner::{Expression, LogicalOperator, LogicalPlan, TableFunctionKind, WindowFrame, WindowFrameBound, WindowFunction};
-use ironduck_storage::TableStorage;
+use ironduck_planner::{Expression, LogicalOperator, LogicalPlan, TableFunctionKind, TransactionOp, WindowFrame, WindowFrameBound, WindowFunction};
+use ironduck_storage::{IndexKey, IndexStorage, TableStorage};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -61,6 +61,7 @@ fn eval_with_catalog(expr: &Expression, row: &[Value]) -> Result<Value> {
 pub struct Executor {
     catalog: Arc<Catalog>,
     storage: Arc<TableStorage>,
+    index_storage: Arc<IndexStorage>,
     /// Working tables for recursive CTE execution
     /// Maps CTE name to the current iteration's rows
     recursive_working_tables: RefCell<HashMap<String, Vec<Vec<Value>>>>,
@@ -71,6 +72,7 @@ impl Executor {
         Executor {
             catalog,
             storage: Arc::new(TableStorage::new()),
+            index_storage: Arc::new(IndexStorage::new()),
             recursive_working_tables: RefCell::new(HashMap::new()),
         }
     }
@@ -80,6 +82,21 @@ impl Executor {
         Executor {
             catalog,
             storage,
+            index_storage: Arc::new(IndexStorage::new()),
+            recursive_working_tables: RefCell::new(HashMap::new()),
+        }
+    }
+
+    /// Create executor with shared storage and index storage
+    pub fn with_storage_and_indexes(
+        catalog: Arc<Catalog>,
+        storage: Arc<TableStorage>,
+        index_storage: Arc<IndexStorage>,
+    ) -> Self {
+        Executor {
+            catalog,
+            storage,
+            index_storage,
             recursive_working_tables: RefCell::new(HashMap::new()),
         }
     }
@@ -919,6 +936,16 @@ impl Executor {
                     "Table" => {
                         self.storage.drop_table(schema_name, name);
                         // TODO: Drop from catalog
+                    }
+                    "Index" => {
+                        // Drop from index storage
+                        self.index_storage.drop_index(schema_name, name);
+                        // Drop from catalog
+                        if let Err(e) = self.catalog.drop_index(schema_name, name) {
+                            if !*if_exists {
+                                return Err(e);
+                            }
+                        }
                     }
                     _ => {}
                 }
@@ -1791,6 +1818,71 @@ impl Executor {
                 Ok(result)
             }
 
+            LogicalOperator::CreateIndex {
+                schema,
+                index_name,
+                table_name,
+                columns,
+                column_types,
+                unique,
+                if_not_exists,
+            } => {
+                use ironduck_catalog::IndexType;
+
+                // Check if index already exists
+                if self.catalog.get_index(schema, index_name).is_some() {
+                    if *if_not_exists {
+                        return Ok(vec![vec![Value::Varchar(format!("Index {} already exists", index_name))]]);
+                    }
+                    return Err(Error::IndexAlreadyExists(index_name.clone()));
+                }
+
+                // Create index in catalog
+                self.catalog.create_index(
+                    schema,
+                    index_name,
+                    table_name,
+                    columns.clone(),
+                    column_types.clone(),
+                    IndexType::BTree,
+                    *unique,
+                )?;
+
+                // Create B-tree index in storage
+                let btree_index = self.index_storage.create_index(schema, index_name, *unique);
+
+                // Populate the index with existing data
+                if let Some(table_data) = self.storage.get(schema, table_name) {
+                    // Get column indices for the indexed columns
+                    let table = self.catalog.get_table(schema, table_name)
+                        .ok_or_else(|| Error::TableNotFound(table_name.clone()))?;
+                    let column_indices: Vec<usize> = columns.iter()
+                        .filter_map(|col| table.get_column_index(col))
+                        .collect();
+
+                    // Get all rows and build index
+                    let all_rows = table_data.scan();
+                    btree_index.rebuild(&column_indices, &all_rows)
+                        .map_err(|e| Error::Execution(e))?;
+                }
+
+                Ok(vec![vec![Value::Varchar(format!("Created index {}", index_name))]])
+            }
+
+            LogicalOperator::Transaction { operation } => {
+                // For now, transactions are no-ops in the in-memory database
+                // Full transaction support will require snapshot isolation and WAL
+                let msg = match operation {
+                    TransactionOp::Begin => "BEGIN",
+                    TransactionOp::Commit => "COMMIT",
+                    TransactionOp::Rollback => "ROLLBACK",
+                    TransactionOp::Savepoint(name) => return Ok(vec![vec![Value::Varchar(format!("SAVEPOINT {}", name))]]),
+                    TransactionOp::ReleaseSavepoint(name) => return Ok(vec![vec![Value::Varchar(format!("RELEASE SAVEPOINT {}", name))]]),
+                    TransactionOp::RollbackToSavepoint(name) => return Ok(vec![vec![Value::Varchar(format!("ROLLBACK TO SAVEPOINT {}", name))]]),
+                };
+                Ok(vec![vec![Value::Varchar(msg.to_string())]])
+            }
+
             LogicalOperator::NoOp => {
                 // No-op statements return empty result
                 Ok(vec![vec![Value::Varchar("OK".to_string())]])
@@ -1949,6 +2041,9 @@ impl Executor {
                     }
                     TableFunctionKind::ReadParquet { path, .. } => {
                         read_parquet_file(path)
+                    }
+                    TableFunctionKind::ReadJson { path, column_names, .. } => {
+                        read_json_file(path, column_names)
                     }
                 }
             }
@@ -2298,6 +2393,20 @@ fn format_plan(op: &LogicalOperator, indent: usize) -> String {
                 format_plan(recursive_case, indent + 1)
             )
         }
+        LogicalOperator::CreateIndex { index_name, table_name, columns, .. } => {
+            format!("{}CreateIndex: {} ON {} ({})", prefix, index_name, table_name, columns.join(", "))
+        }
+        LogicalOperator::Transaction { operation } => {
+            let op_name = match operation {
+                TransactionOp::Begin => "BEGIN",
+                TransactionOp::Commit => "COMMIT",
+                TransactionOp::Rollback => "ROLLBACK",
+                TransactionOp::Savepoint(name) => return format!("{}SAVEPOINT {}", prefix, name),
+                TransactionOp::ReleaseSavepoint(name) => return format!("{}RELEASE SAVEPOINT {}", prefix, name),
+                TransactionOp::RollbackToSavepoint(name) => return format!("{}ROLLBACK TO SAVEPOINT {}", prefix, name),
+            };
+            format!("{}{}", prefix, op_name)
+        }
         LogicalOperator::NoOp => {
             format!("{}NoOp", prefix)
         }
@@ -2308,6 +2417,7 @@ fn format_plan(op: &LogicalOperator, indent: usize) -> String {
                 TableFunctionKind::GenerateSubscripts { .. } => "generate_subscripts",
                 TableFunctionKind::ReadCsv { path, .. } => return format!("{}TableFunction: read_csv('{}') -> {}", prefix, path, column_name),
                 TableFunctionKind::ReadParquet { path, .. } => return format!("{}TableFunction: read_parquet('{}') -> {}", prefix, path, column_name),
+                TableFunctionKind::ReadJson { path, .. } => return format!("{}TableFunction: read_json('{}') -> {}", prefix, path, column_name),
             };
             format!("{}TableFunction: {}() -> {}", prefix, func_name, column_name)
         }
@@ -4662,6 +4772,70 @@ fn read_parquet_file(path: &str) -> Result<Vec<Vec<Value>>> {
     }
 
     Ok(all_rows)
+}
+
+/// Read JSON file and return rows
+fn read_json_file(path: &str, column_names: &[String]) -> Result<Vec<Vec<Value>>> {
+    use std::fs::File;
+    use std::io::{BufRead, BufReader};
+
+    let file = File::open(path)
+        .map_err(|e| Error::Execution(format!("Failed to open JSON file '{}': {}", path, e)))?;
+
+    let reader = BufReader::new(file);
+    let mut all_rows = Vec::new();
+
+    for line in reader.lines() {
+        let line = line.map_err(|e| Error::Execution(format!("Failed to read JSON line: {}", e)))?;
+        let line = line.trim();
+
+        if line.is_empty() {
+            continue;
+        }
+
+        // Parse as JSON object
+        let json: serde_json::Value = serde_json::from_str(line)
+            .map_err(|e| Error::Execution(format!("Failed to parse JSON: {}", e)))?;
+
+        if let serde_json::Value::Object(obj) = json {
+            let mut row = Vec::with_capacity(column_names.len());
+            for col_name in column_names {
+                let value = obj.get(col_name)
+                    .map(|v| json_value_to_ironduck_value(v))
+                    .unwrap_or(Value::Null);
+                row.push(value);
+            }
+            all_rows.push(row);
+        }
+    }
+
+    Ok(all_rows)
+}
+
+/// Convert a serde_json Value to an IronDuck Value
+fn json_value_to_ironduck_value(v: &serde_json::Value) -> Value {
+    match v {
+        serde_json::Value::Null => Value::Null,
+        serde_json::Value::Bool(b) => Value::Boolean(*b),
+        serde_json::Value::Number(n) => {
+            if let Some(i) = n.as_i64() {
+                Value::BigInt(i)
+            } else if let Some(f) = n.as_f64() {
+                Value::Double(f)
+            } else {
+                Value::Varchar(n.to_string())
+            }
+        }
+        serde_json::Value::String(s) => Value::Varchar(s.clone()),
+        serde_json::Value::Array(arr) => {
+            let values: Vec<Value> = arr.iter().map(json_value_to_ironduck_value).collect();
+            Value::List(values)
+        }
+        serde_json::Value::Object(_) => {
+            // Serialize nested objects as JSON strings
+            Value::Varchar(v.to_string())
+        }
+    }
 }
 
 /// Convert an Arrow array value at a given index to a Value

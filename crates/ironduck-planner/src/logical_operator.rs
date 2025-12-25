@@ -161,6 +161,22 @@ pub enum LogicalOperator {
         operation: AlterTableOp,
     },
 
+    /// CREATE INDEX
+    CreateIndex {
+        schema: String,
+        index_name: String,
+        table_name: String,
+        columns: Vec<String>,
+        column_types: Vec<LogicalType>,
+        unique: bool,
+        if_not_exists: bool,
+    },
+
+    /// Transaction control
+    Transaction {
+        operation: TransactionOp,
+    },
+
     /// Set operation (UNION, INTERSECT, EXCEPT)
     SetOperation {
         left: Box<LogicalOperator>,
@@ -328,6 +344,14 @@ pub enum TableFunctionKind {
         /// Column types from Parquet schema (populated during execution)
         column_types: Vec<LogicalType>,
     },
+    /// read_json(path) - reads a JSON file into a table
+    ReadJson {
+        path: String,
+        /// Column names inferred from JSON (populated during execution)
+        column_names: Vec<String>,
+        /// Column types inferred from JSON (populated during execution)
+        column_types: Vec<LogicalType>,
+    },
 }
 
 /// Type of set operation
@@ -380,6 +404,8 @@ impl LogicalOperator {
             LogicalOperator::Update { .. } => vec![LogicalType::BigInt],
             LogicalOperator::Drop { .. } => vec![LogicalType::Varchar],
             LogicalOperator::AlterTable { .. } => vec![LogicalType::Varchar],
+            LogicalOperator::CreateIndex { .. } => vec![LogicalType::Varchar],
+            LogicalOperator::Transaction { .. } => vec![LogicalType::Varchar],
             LogicalOperator::SetOperation { left, .. } => left.output_types(),
             LogicalOperator::Window { output_types, .. } => output_types.clone(),
             LogicalOperator::Explain { .. } => vec![LogicalType::Varchar],
@@ -469,6 +495,17 @@ pub enum AlterTableOp {
         column_name: String,
         not_null: bool,
     },
+}
+
+/// Transaction operation types
+#[derive(Debug, Clone)]
+pub enum TransactionOp {
+    Begin,
+    Commit,
+    Rollback,
+    Savepoint(String),
+    ReleaseSavepoint(String),
+    RollbackToSavepoint(String),
 }
 
 /// An expression in the logical plan
