@@ -1076,8 +1076,16 @@ fn evaluate_function(name: &str, args: &[Value]) -> Result<Value> {
             }
         }
         "REGEXP_SPLIT_TO_ARRAY" => {
-            let s = args.first().and_then(|v| v.as_str()).unwrap_or("");
-            let pattern = args.get(1).and_then(|v| v.as_str()).unwrap_or("");
+            let s = match args.first() {
+                Some(Value::Null) => return Ok(Value::Null),
+                Some(v) => v.as_str().unwrap_or(""),
+                None => "",
+            };
+            let pattern = match args.get(1) {
+                Some(Value::Null) => return Ok(Value::Null),
+                Some(v) => v.as_str().unwrap_or(""),
+                None => "",
+            };
             match regex::Regex::new(pattern) {
                 Ok(re) => {
                     let parts: Vec<Value> = re.split(s)
@@ -1089,8 +1097,16 @@ fn evaluate_function(name: &str, args: &[Value]) -> Result<Value> {
             }
         }
         "REGEXP_COUNT" => {
-            let s = args.first().and_then(|v| v.as_str()).unwrap_or("");
-            let pattern = args.get(1).and_then(|v| v.as_str()).unwrap_or("");
+            let s = match args.first() {
+                Some(Value::Null) => return Ok(Value::Null),
+                Some(v) => v.as_str().unwrap_or(""),
+                None => "",
+            };
+            let pattern = match args.get(1) {
+                Some(Value::Null) => return Ok(Value::Null),
+                Some(v) => v.as_str().unwrap_or(""),
+                None => "",
+            };
             match regex::Regex::new(pattern) {
                 Ok(re) => Ok(Value::BigInt(re.find_iter(s).count() as i64)),
                 Err(_) => Ok(Value::BigInt(0)),
