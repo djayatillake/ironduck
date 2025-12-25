@@ -689,51 +689,140 @@ fn evaluate_function(name: &str, args: &[Value]) -> Result<Value> {
             Ok(Value::Varchar(result))
         }
         "REPEAT" => {
-            let s = args.first().and_then(|v| v.as_str()).unwrap_or("");
-            let n = args.get(1).and_then(|v| v.as_i64()).unwrap_or(0) as usize;
-            Ok(Value::Varchar(s.repeat(n)))
+            // Return NULL if string is NULL
+            let s = match args.first() {
+                Some(Value::Null) => return Ok(Value::Null),
+                Some(v) => v.as_str().unwrap_or(""),
+                None => "",
+            };
+            // Return NULL if count is NULL, empty string if negative or zero
+            let n = match args.get(1) {
+                Some(Value::Null) => return Ok(Value::Null),
+                Some(v) => v.as_i64().unwrap_or(0),
+                None => 0,
+            };
+            if n <= 0 {
+                Ok(Value::Varchar(String::new()))
+            } else {
+                Ok(Value::Varchar(s.repeat(n as usize)))
+            }
         }
         "LPAD" => {
-            let s = args.first().and_then(|v| v.as_str()).unwrap_or("");
-            let len = args.get(1).and_then(|v| v.as_i64()).unwrap_or(0) as usize;
-            let pad = args.get(2).and_then(|v| v.as_str()).unwrap_or(" ");
-            if s.len() >= len {
-                Ok(Value::Varchar(s.to_string()))
+            // Return NULL if any argument is NULL
+            let s = match args.first() {
+                Some(Value::Null) => return Ok(Value::Null),
+                Some(v) => v.as_str().unwrap_or(""),
+                None => "",
+            };
+            let len = match args.get(1) {
+                Some(Value::Null) => return Ok(Value::Null),
+                Some(v) => v.as_i64().unwrap_or(0),
+                None => 0,
+            };
+            let pad = match args.get(2) {
+                Some(Value::Null) => return Ok(Value::Null),
+                Some(v) => v.as_str().unwrap_or(" "),
+                None => " ",
+            };
+            // Negative or zero length returns empty string
+            if len <= 0 {
+                return Ok(Value::Varchar(String::new()));
+            }
+            // Cap length to prevent memory exhaustion
+            let len = std::cmp::min(len as usize, 10_000_000);
+            let s_chars: Vec<char> = s.chars().collect();
+            if s_chars.len() >= len {
+                // Truncate to len characters
+                Ok(Value::Varchar(s_chars[..len].iter().collect()))
             } else {
-                let pad_len = len - s.len();
+                // Empty pad string is an error only when we need to pad
+                if pad.is_empty() {
+                    return Err(ironduck_common::Error::Execution("LPAD padding string cannot be empty".to_string()));
+                }
+                let pad_len = len - s_chars.len();
                 let padding: String = pad.chars().cycle().take(pad_len).collect();
                 Ok(Value::Varchar(format!("{}{}", padding, s)))
             }
         }
         "RPAD" => {
-            let s = args.first().and_then(|v| v.as_str()).unwrap_or("");
-            let len = args.get(1).and_then(|v| v.as_i64()).unwrap_or(0) as usize;
-            let pad = args.get(2).and_then(|v| v.as_str()).unwrap_or(" ");
-            if s.len() >= len {
-                Ok(Value::Varchar(s.to_string()))
+            // Return NULL if any argument is NULL
+            let s = match args.first() {
+                Some(Value::Null) => return Ok(Value::Null),
+                Some(v) => v.as_str().unwrap_or(""),
+                None => "",
+            };
+            let len = match args.get(1) {
+                Some(Value::Null) => return Ok(Value::Null),
+                Some(v) => v.as_i64().unwrap_or(0),
+                None => 0,
+            };
+            let pad = match args.get(2) {
+                Some(Value::Null) => return Ok(Value::Null),
+                Some(v) => v.as_str().unwrap_or(" "),
+                None => " ",
+            };
+            // Negative or zero length returns empty string
+            if len <= 0 {
+                return Ok(Value::Varchar(String::new()));
+            }
+            // Cap length to prevent memory exhaustion
+            let len = std::cmp::min(len as usize, 10_000_000);
+            let s_chars: Vec<char> = s.chars().collect();
+            if s_chars.len() >= len {
+                // Truncate to len characters
+                Ok(Value::Varchar(s_chars[..len].iter().collect()))
             } else {
-                let pad_len = len - s.len();
+                // Empty pad string is an error only when we need to pad
+                if pad.is_empty() {
+                    return Err(ironduck_common::Error::Execution("RPAD padding string cannot be empty".to_string()));
+                }
+                let pad_len = len - s_chars.len();
                 let padding: String = pad.chars().cycle().take(pad_len).collect();
                 Ok(Value::Varchar(format!("{}{}", s, padding)))
             }
         }
         "INSTR" | "POSITION" | "STRPOS" => {
-            let haystack = args.first().and_then(|v| v.as_str()).unwrap_or("");
-            let needle = args.get(1).and_then(|v| v.as_str()).unwrap_or("");
+            // Return NULL if either argument is NULL
+            let haystack = match args.first() {
+                Some(Value::Null) | None => return Ok(Value::Null),
+                Some(v) => v.as_str().unwrap_or(""),
+            };
+            let needle = match args.get(1) {
+                Some(Value::Null) | None => return Ok(Value::Null),
+                Some(v) => v.as_str().unwrap_or(""),
+            };
             match haystack.find(needle) {
                 Some(pos) => Ok(Value::BigInt((pos + 1) as i64)), // 1-indexed
                 None => Ok(Value::BigInt(0)),
             }
         }
         "SPLIT_PART" => {
-            let s = args.first().and_then(|v| v.as_str()).unwrap_or("");
-            let delimiter = args.get(1).and_then(|v| v.as_str()).unwrap_or("");
-            let part = args.get(2).and_then(|v| v.as_i64()).unwrap_or(1) as usize;
+            // Return NULL if any argument is NULL
+            let s = match args.first() {
+                Some(Value::Null) => return Ok(Value::Null),
+                Some(v) => v.as_str().unwrap_or(""),
+                None => "",
+            };
+            let delimiter = match args.get(1) {
+                Some(Value::Null) => return Ok(Value::Null),
+                Some(v) => v.as_str().unwrap_or(""),
+                None => "",
+            };
+            let part = match args.get(2) {
+                Some(Value::Null) => return Ok(Value::Null),
+                Some(v) => v.as_i64().unwrap_or(1),
+                None => 1,
+            };
             let parts: Vec<&str> = s.split(delimiter).collect();
-            Ok(Value::Varchar(parts.get(part.saturating_sub(1)).unwrap_or(&"").to_string()))
+            Ok(Value::Varchar(parts.get((part.max(1) - 1) as usize).unwrap_or(&"").to_string()))
         }
         "STRING_SPLIT" | "STR_SPLIT" | "STRING_TO_ARRAY" => {
-            let s = args.first().and_then(|v| v.as_str()).unwrap_or("");
+            // Return NULL if string is NULL
+            let s = match args.first() {
+                Some(Value::Null) => return Ok(Value::Null),
+                Some(v) => v.as_str().unwrap_or(""),
+                None => "",
+            };
             let delimiter = args.get(1).and_then(|v| v.as_str()).unwrap_or("");
             let parts: Vec<Value> = s.split(delimiter).map(|p| Value::Varchar(p.to_string())).collect();
             Ok(Value::List(parts))
