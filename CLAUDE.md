@@ -92,7 +92,6 @@ DuckDB has 400+ built-in functions. Categories include:
 - [x] COPY statement (import/export)
 - [x] ALTER TABLE (ADD/DROP/RENAME COLUMN, RENAME TABLE)
 - [x] PIVOT/UNPIVOT
-- [ ] Materialized views
 
 ### Implemented DuckDB Functions
 
@@ -169,10 +168,7 @@ ironduck/
 
 ## Current Limitations
 
-Features not yet implemented:
-
 - **Some INTERVAL syntax**: `INTERVAL 7 MINUTES` (use `INTERVAL '7' MINUTE`)
-- **Materialized views**: Not yet supported
 
 ## Contributing
 
