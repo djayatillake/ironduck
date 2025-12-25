@@ -1,0 +1,130 @@
+# name: test/sql/aggregate/aggregates/test_new_aggregates.test
+# description: Test new aggregate functions (ARG_MAX, ARG_MIN, ENTROPY, etc.)
+# group: [aggregates]
+
+# Setup
+statement ok
+CREATE TABLE sales(product VARCHAR, amount INTEGER, price DOUBLE);
+
+statement ok
+INSERT INTO sales VALUES
+    ('Apple', 10, 1.50),
+    ('Banana', 20, 0.75),
+    ('Orange', 15, 1.25),
+    ('Apple', 5, 1.50),
+    ('Banana', 30, 0.75);
+
+# ARG_MAX - get product with maximum amount
+query T
+SELECT ARG_MAX(product, amount) FROM sales;
+----
+Banana
+
+# ARG_MIN - get product with minimum amount
+query T
+SELECT ARG_MIN(product, amount) FROM sales;
+----
+Apple
+
+# APPROX_COUNT_DISTINCT
+query I
+SELECT APPROX_COUNT_DISTINCT(product) FROM sales;
+----
+3
+
+# Test with GROUP BY
+query TI
+SELECT product, SUM(amount) FROM sales GROUP BY product ORDER BY product;
+----
+Apple
+15
+Banana
+50
+Orange
+15
+
+# ARG_MAX with GROUP BY (get product with max amount per product - should be same product)
+query TT
+SELECT product, ARG_MAX(product, amount) FROM sales GROUP BY product ORDER BY product;
+----
+Apple
+Apple
+Banana
+Banana
+Orange
+Orange
+
+# ENTROPY test
+statement ok
+CREATE TABLE entropy_test(val INTEGER);
+
+statement ok
+INSERT INTO entropy_test VALUES (1), (1), (1), (1), (2), (2), (3), (3);
+
+# Entropy should be > 0 for mixed values
+query I
+SELECT CASE WHEN ENTROPY(val) > 0 THEN 1 ELSE 0 END FROM entropy_test;
+----
+1
+
+# REGR functions
+statement ok
+CREATE TABLE regression(x DOUBLE, y DOUBLE);
+
+statement ok
+INSERT INTO regression VALUES (1, 2), (2, 4), (3, 6), (4, 8), (5, 10);
+
+# Perfect linear relationship y = 2x, so slope should be 2
+query I
+SELECT REGR_SLOPE(y, x)::BIGINT FROM regression;
+----
+2
+
+# Intercept should be 0 for y = 2x
+query I
+SELECT REGR_INTERCEPT(y, x)::BIGINT FROM regression;
+----
+0
+
+# R² should be 1 for perfect linear relationship
+query I
+SELECT REGR_R2(y, x)::BIGINT FROM regression;
+----
+1
+
+# REGR_COUNT should count pairs
+query I
+SELECT REGR_COUNT(y, x) FROM regression;
+----
+5
+
+# REGR_AVGX
+query I
+SELECT REGR_AVGX(y, x)::BIGINT FROM regression;
+----
+3
+
+# REGR_AVGY
+query I
+SELECT REGR_AVGY(y, x)::BIGINT FROM regression;
+----
+6
+
+# SKEWNESS and KURTOSIS
+statement ok
+CREATE TABLE stats_test(val DOUBLE);
+
+statement ok
+INSERT INTO stats_test VALUES (1), (2), (3), (4), (5), (6), (7), (8), (9), (10);
+
+# For uniform distribution, skewness should be close to 0
+query I
+SELECT (SKEWNESS(val) * 1000000)::BIGINT FROM stats_test;
+----
+0
+
+# Kurtosis for uniform distribution should be around -1.22
+query I
+SELECT (KURTOSIS(val) * 100)::BIGINT FROM stats_test;
+----
+-122

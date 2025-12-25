@@ -1,0 +1,79 @@
+# Bitwise operator tests
+
+# Bitwise AND
+query I
+SELECT 5 & 3;
+----
+1
+
+query I
+SELECT 255 & 15;
+----
+15
+
+# Bitwise OR
+query I
+SELECT 5 | 3;
+----
+7
+
+query I
+SELECT 8 | 4;
+----
+12
+
+# Bitwise XOR
+query I
+SELECT 5 ^ 3;
+----
+6
+
+query I
+SELECT 10 ^ 10;
+----
+0
+
+# Left shift
+query I
+SELECT 1 << 3;
+----
+8
+
+query I
+SELECT 2 << 4;
+----
+32
+
+# Right shift
+query I
+SELECT 8 >> 2;
+----
+2
+
+query I
+SELECT 16 >> 1;
+----
+8
+
+# Combined operations
+query I
+SELECT (5 & 3) | 8;
+----
+9
+
+query I
+SELECT (1 << 4) & 255;
+----
+16
+
+# Bitwise NOT (using function)
+query I
+SELECT bitnot(0);
+----
+-1
+
+query I
+SELECT bitnot(5);
+----
+-6
+

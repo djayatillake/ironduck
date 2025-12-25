@@ -1,14 +1,30 @@
 //! Expression evaluation
 
+use ironduck_catalog::Catalog;
 use ironduck_common::{Error, LogicalType, Result, Value};
 use ironduck_planner::{BinaryOperator, Expression, UnaryOperator};
 use std::cmp::Ordering;
+use std::sync::Arc;
 
 /// Context for expression evaluation
-#[derive(Debug, Clone, Default)]
+#[derive(Clone, Default)]
 pub struct EvalContext {
     /// Row indices for each table (for rowid pseudo-column)
     pub row_indices: Vec<i64>,
+    /// Optional catalog reference for functions like NEXTVAL
+    catalog: Option<Arc<Catalog>>,
+    /// Outer row for correlated subqueries
+    pub outer_row: Option<Vec<Value>>,
+}
+
+impl std::fmt::Debug for EvalContext {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EvalContext")
+            .field("row_indices", &self.row_indices)
+            .field("has_catalog", &self.catalog.is_some())
+            .field("has_outer_row", &self.outer_row.is_some())
+            .finish()
+    }
 }
 
 impl EvalContext {
@@ -19,7 +35,26 @@ impl EvalContext {
     pub fn with_row_index(row_idx: i64) -> Self {
         Self {
             row_indices: vec![row_idx],
+            catalog: None,
+            outer_row: None,
         }
+    }
+
+    pub fn with_catalog(catalog: Arc<Catalog>) -> Self {
+        Self {
+            row_indices: Vec::new(),
+            catalog: Some(catalog),
+            outer_row: None,
+        }
+    }
+
+    pub fn with_outer_row(mut self, outer_row: Vec<Value>) -> Self {
+        self.outer_row = Some(outer_row);
+        self
+    }
+
+    pub fn catalog(&self) -> Option<&Catalog> {
+        self.catalog.as_deref()
     }
 }
 
@@ -39,6 +74,15 @@ pub fn evaluate_with_ctx(expr: &Expression, row: &[Value], ctx: &EvalContext) ->
                 .ok_or_else(|| Error::Internal(format!("Column index {} out of bounds", column_index)))
         }
 
+        Expression::OuterColumnRef { column_index, name, .. } => {
+            // Look up value from outer row (for correlated subqueries)
+            ctx.outer_row
+                .as_ref()
+                .and_then(|outer| outer.get(*column_index))
+                .cloned()
+                .ok_or_else(|| Error::Internal(format!("Outer column {} (index {}) not found in context", name, column_index)))
+        }
+
         Expression::BinaryOp { left, op, right } => {
             let left_val = evaluate_with_ctx(left, row, ctx)?;
             let right_val = evaluate_with_ctx(right, row, ctx)?;
@@ -51,6 +95,35 @@ pub fn evaluate_with_ctx(expr: &Expression, row: &[Value], ctx: &EvalContext) ->
         }
 
         Expression::Function { name, args } => {
+            let name_upper = name.to_uppercase();
+
+            // Handle NEXTVAL/CURRVAL specially - they need catalog access
+            if name_upper == "NEXTVAL" || name_upper == "CURRVAL" {
+                if args.is_empty() {
+                    return Err(Error::InvalidArguments(format!("{} requires a sequence name", name_upper)));
+                }
+                let seq_name = evaluate_with_ctx(&args[0], row, ctx)?;
+                let seq_name_str = match seq_name {
+                    Value::Varchar(s) => s,
+                    _ => return Err(Error::InvalidArguments("Sequence name must be a string".to_string())),
+                };
+
+                // Get catalog from context
+                let catalog = ctx.catalog().ok_or_else(|| {
+                    Error::NotImplemented(format!("Function: {}", name_upper))
+                })?;
+
+                // Look up the sequence (try main schema)
+                let sequence = catalog.get_sequence("main", &seq_name_str)
+                    .ok_or_else(|| Error::SequenceNotFound(seq_name_str.clone()))?;
+
+                if name_upper == "NEXTVAL" {
+                    return Ok(Value::BigInt(sequence.nextval()));
+                } else {
+                    return Ok(Value::BigInt(sequence.currval()));
+                }
+            }
+
             let arg_values: Result<Vec<_>> = args.iter().map(|a| evaluate_with_ctx(a, row, ctx)).collect();
             evaluate_function(name, &arg_values?)
         }
@@ -58,6 +131,15 @@ pub fn evaluate_with_ctx(expr: &Expression, row: &[Value], ctx: &EvalContext) ->
         Expression::Cast { expr, target_type } => {
             let val = evaluate_with_ctx(expr, row, ctx)?;
             cast_value(&val, target_type)
+        }
+
+        Expression::TryCast { expr, target_type } => {
+            let val = evaluate_with_ctx(expr, row, ctx)?;
+            // TRY_CAST returns NULL on error instead of failing
+            match cast_value(&val, target_type) {
+                Ok(v) => Ok(v),
+                Err(_) => Ok(Value::Null),
+            }
         }
 
         Expression::IsNull(expr) => {
@@ -167,8 +249,104 @@ fn evaluate_binary_op(left: &Value, op: BinaryOperator, right: &Value) -> Result
 
     match op {
         // Arithmetic operations
-        BinaryOperator::Add => arithmetic_op(left, right, |a, b| a + b, |a, b| a + b),
-        BinaryOperator::Subtract => arithmetic_op(left, right, |a, b| a - b, |a, b| a - b),
+        BinaryOperator::Add => {
+            // Handle date/timestamp + interval
+            match (left, right) {
+                (Value::Date(d), Value::Interval(i)) | (Value::Interval(i), Value::Date(d)) => {
+                    use chrono::Months;
+                    let mut result = *d;
+                    if i.months != 0 {
+                        result = result.checked_add_months(Months::new(i.months.unsigned_abs()))
+                            .unwrap_or(result);
+                        if i.months < 0 {
+                            result = result.checked_sub_months(Months::new((i.months.abs() * 2) as u32))
+                                .unwrap_or(result);
+                        }
+                    }
+                    if i.days != 0 {
+                        result = result + chrono::Duration::days(i.days as i64);
+                    }
+                    Ok(Value::Date(result))
+                }
+                (Value::Timestamp(ts), Value::Interval(i)) | (Value::Interval(i), Value::Timestamp(ts)) => {
+                    use chrono::Months;
+                    let mut result = *ts;
+                    if i.months != 0 {
+                        let new_date = result.date().checked_add_months(Months::new(i.months.unsigned_abs()))
+                            .unwrap_or(result.date());
+                        result = new_date.and_time(result.time());
+                        if i.months < 0 {
+                            let new_date = result.date().checked_sub_months(Months::new((i.months.abs() * 2) as u32))
+                                .unwrap_or(result.date());
+                            result = new_date.and_time(result.time());
+                        }
+                    }
+                    if i.days != 0 {
+                        result = result + chrono::Duration::days(i.days as i64);
+                    }
+                    if i.micros != 0 {
+                        result = result + chrono::Duration::microseconds(i.micros);
+                    }
+                    Ok(Value::Timestamp(result))
+                }
+                _ => arithmetic_op(left, right, |a, b| a + b, |a, b| a + b),
+            }
+        }
+        BinaryOperator::Subtract => {
+            // Handle date/timestamp - interval
+            match (left, right) {
+                (Value::Date(d), Value::Interval(i)) => {
+                    use chrono::Months;
+                    let mut result = *d;
+                    if i.months != 0 {
+                        if i.months > 0 {
+                            result = result.checked_sub_months(Months::new(i.months as u32))
+                                .unwrap_or(result);
+                        } else {
+                            result = result.checked_add_months(Months::new(i.months.unsigned_abs()))
+                                .unwrap_or(result);
+                        }
+                    }
+                    if i.days != 0 {
+                        result = result - chrono::Duration::days(i.days as i64);
+                    }
+                    Ok(Value::Date(result))
+                }
+                (Value::Timestamp(ts), Value::Interval(i)) => {
+                    use chrono::Months;
+                    let mut result = *ts;
+                    if i.months != 0 {
+                        if i.months > 0 {
+                            let new_date = result.date().checked_sub_months(Months::new(i.months as u32))
+                                .unwrap_or(result.date());
+                            result = new_date.and_time(result.time());
+                        } else {
+                            let new_date = result.date().checked_add_months(Months::new(i.months.unsigned_abs()))
+                                .unwrap_or(result.date());
+                            result = new_date.and_time(result.time());
+                        }
+                    }
+                    if i.days != 0 {
+                        result = result - chrono::Duration::days(i.days as i64);
+                    }
+                    if i.micros != 0 {
+                        result = result - chrono::Duration::microseconds(i.micros);
+                    }
+                    Ok(Value::Timestamp(result))
+                }
+                (Value::Date(d1), Value::Date(d2)) => {
+                    // Date - Date = number of days
+                    let days = (*d1 - *d2).num_days();
+                    Ok(Value::BigInt(days))
+                }
+                (Value::Timestamp(t1), Value::Timestamp(t2)) => {
+                    // Timestamp - Timestamp = interval in microseconds
+                    let micros = (*t1 - *t2).num_microseconds().unwrap_or(0);
+                    Ok(Value::Interval(ironduck_common::value::Interval::new(0, 0, micros)))
+                }
+                _ => arithmetic_op(left, right, |a, b| a - b, |a, b| a - b),
+            }
+        }
         BinaryOperator::Multiply => arithmetic_op(left, right, |a, b| a * b, |a, b| a * b),
         BinaryOperator::Divide => {
             // Division by zero returns NULL in SQL (DuckDB behavior)
@@ -344,11 +522,11 @@ fn evaluate_unary_op(op: UnaryOperator, val: &Value) -> Result<Value> {
 fn evaluate_function(name: &str, args: &[Value]) -> Result<Value> {
     match name.to_uppercase().as_str() {
         // String functions
-        "LOWER" => {
+        "LOWER" | "LCASE" => {
             let s = args.first().and_then(|v| v.as_str()).unwrap_or("");
             Ok(Value::Varchar(s.to_lowercase()))
         }
-        "UPPER" => {
+        "UPPER" | "UCASE" => {
             let s = args.first().and_then(|v| v.as_str()).unwrap_or("");
             Ok(Value::Varchar(s.to_uppercase()))
         }
@@ -418,7 +596,7 @@ fn evaluate_function(name: &str, args: &[Value]) -> Result<Value> {
             let start = chars.len().saturating_sub(n);
             Ok(Value::Varchar(chars.into_iter().skip(start).collect()))
         }
-        "ASCII" => {
+        "ASCII" | "ORD" => {
             // Return the ASCII code of the first character
             let s = args.first().and_then(|v| v.as_str()).unwrap_or("");
             if s.is_empty() {
@@ -440,6 +618,56 @@ fn evaluate_function(name: &str, args: &[Value]) -> Result<Value> {
                 }
                 None => Ok(Value::Null),
             }
+        }
+        "UNICODE" => {
+            // Return Unicode code point of first character
+            let s = args.first().and_then(|v| v.as_str()).unwrap_or("");
+            if s.is_empty() {
+                Ok(Value::Null)
+            } else {
+                Ok(Value::Integer(s.chars().next().unwrap() as i32))
+            }
+        }
+        "STRIP_ACCENTS" => {
+            // Remove accents from characters (simplified version)
+            let s = args.first().and_then(|v| v.as_str()).unwrap_or("");
+            let result: String = s.chars().map(|c| {
+                match c {
+                    'á' | 'à' | 'â' | 'ä' | 'ã' | 'å' => 'a',
+                    'é' | 'è' | 'ê' | 'ë' => 'e',
+                    'í' | 'ì' | 'î' | 'ï' => 'i',
+                    'ó' | 'ò' | 'ô' | 'ö' | 'õ' => 'o',
+                    'ú' | 'ù' | 'û' | 'ü' => 'u',
+                    'ñ' => 'n',
+                    'ç' => 'c',
+                    'Á' | 'À' | 'Â' | 'Ä' | 'Ã' | 'Å' => 'A',
+                    'É' | 'È' | 'Ê' | 'Ë' => 'E',
+                    'Í' | 'Ì' | 'Î' | 'Ï' => 'I',
+                    'Ó' | 'Ò' | 'Ô' | 'Ö' | 'Õ' => 'O',
+                    'Ú' | 'Ù' | 'Û' | 'Ü' => 'U',
+                    'Ñ' => 'N',
+                    'Ç' => 'C',
+                    _ => c,
+                }
+            }).collect();
+            Ok(Value::Varchar(result))
+        }
+        "BAR" => {
+            // Create a bar chart string (like DuckDB's bar function)
+            // bar(value, min, max, width) -> string of █ characters
+            let value = args.first().and_then(|v| v.as_f64()).unwrap_or(0.0);
+            let min = args.get(1).and_then(|v| v.as_f64()).unwrap_or(0.0);
+            let max = args.get(2).and_then(|v| v.as_f64()).unwrap_or(100.0);
+            let width = args.get(3).and_then(|v| v.as_i64()).unwrap_or(80) as usize;
+
+            if max <= min {
+                return Ok(Value::Varchar(String::new()));
+            }
+
+            let ratio = ((value - min) / (max - min)).clamp(0.0, 1.0);
+            let filled = (ratio * width as f64).round() as usize;
+            let bar: String = "█".repeat(filled);
+            Ok(Value::Varchar(bar))
         }
         "REVERSE" => {
             let s = args.first().and_then(|v| v.as_str()).unwrap_or("");
@@ -504,6 +732,12 @@ fn evaluate_function(name: &str, args: &[Value]) -> Result<Value> {
             let parts: Vec<&str> = s.split(delimiter).collect();
             Ok(Value::Varchar(parts.get(part.saturating_sub(1)).unwrap_or(&"").to_string()))
         }
+        "STRING_SPLIT" | "STR_SPLIT" | "STRING_TO_ARRAY" => {
+            let s = args.first().and_then(|v| v.as_str()).unwrap_or("");
+            let delimiter = args.get(1).and_then(|v| v.as_str()).unwrap_or("");
+            let parts: Vec<Value> = s.split(delimiter).map(|p| Value::Varchar(p.to_string())).collect();
+            Ok(Value::List(parts))
+        }
         "INITCAP" => {
             let s = args.first().and_then(|v| v.as_str()).unwrap_or("");
             let result: String = s.split_whitespace()
@@ -521,12 +755,12 @@ fn evaluate_function(name: &str, args: &[Value]) -> Result<Value> {
                 .join(" ");
             Ok(Value::Varchar(result))
         }
-        "STARTS_WITH" => {
+        "STARTS_WITH" | "PREFIX" => {
             let s = args.first().and_then(|v| v.as_str()).unwrap_or("");
             let prefix = args.get(1).and_then(|v| v.as_str()).unwrap_or("");
             Ok(Value::Boolean(s.starts_with(prefix)))
         }
-        "ENDS_WITH" => {
+        "ENDS_WITH" | "SUFFIX" => {
             let s = args.first().and_then(|v| v.as_str()).unwrap_or("");
             let suffix = args.get(1).and_then(|v| v.as_str()).unwrap_or("");
             Ok(Value::Boolean(s.ends_with(suffix)))
@@ -535,6 +769,26 @@ fn evaluate_function(name: &str, args: &[Value]) -> Result<Value> {
             let s = args.first().and_then(|v| v.as_str()).unwrap_or("");
             let needle = args.get(1).and_then(|v| v.as_str()).unwrap_or("");
             Ok(Value::Boolean(s.contains(needle)))
+        }
+        "FORMAT" | "PRINTF" => {
+            // Simple {} placeholder replacement (DuckDB-style)
+            let format_str = args.first().and_then(|v| v.as_str()).unwrap_or("");
+            let mut result = format_str.to_string();
+            let mut arg_idx = 1;
+            while let Some(pos) = result.find("{}") {
+                if let Some(arg) = args.get(arg_idx) {
+                    let replacement = match arg {
+                        Value::Null => "NULL".to_string(),
+                        Value::Varchar(s) => s.clone(),
+                        _ => arg.to_string(),
+                    };
+                    result = result[..pos].to_string() + &replacement + &result[pos + 2..];
+                    arg_idx += 1;
+                } else {
+                    break;
+                }
+            }
+            Ok(Value::Varchar(result))
         }
 
         // Regular expression functions
@@ -646,6 +900,45 @@ fn evaluate_function(name: &str, args: &[Value]) -> Result<Value> {
                 }
                 Some(Value::Null) => Ok(Value::Null),
                 _ => Ok(Value::Boolean(false)),
+            }
+        }
+        "ARRAY_EXTRACT" | "LIST_EXTRACT" | "LIST_ELEMENT" => {
+            // Get element at index (1-based)
+            match (args.first(), args.get(1)) {
+                (Some(Value::List(list)), Some(idx)) => {
+                    let index = idx.as_i64().unwrap_or(0);
+                    if index <= 0 || index as usize > list.len() {
+                        Ok(Value::Null)
+                    } else {
+                        Ok(list[(index - 1) as usize].clone())
+                    }
+                }
+                (Some(Value::Null), _) | (_, Some(Value::Null)) => Ok(Value::Null),
+                _ => Ok(Value::Null),
+            }
+        }
+        "ARRAY_SLICE" | "LIST_SLICE" => {
+            // Get slice of array: array_slice(arr, start, end) - 1-based, inclusive
+            match args.first() {
+                Some(Value::List(list)) => {
+                    let start = args.get(1).and_then(|v| v.as_i64()).unwrap_or(1) as usize;
+                    let end = args.get(2).and_then(|v| v.as_i64()).map(|e| e as usize).unwrap_or(list.len());
+
+                    if start == 0 || start > list.len() {
+                        return Ok(Value::List(vec![]));
+                    }
+
+                    let start_idx = start.saturating_sub(1);
+                    let end_idx = end.min(list.len());
+
+                    if start_idx >= end_idx {
+                        Ok(Value::List(vec![]))
+                    } else {
+                        Ok(Value::List(list[start_idx..end_idx].to_vec()))
+                    }
+                }
+                Some(Value::Null) => Ok(Value::Null),
+                _ => Ok(Value::List(vec![])),
             }
         }
         "LIST_POSITION" | "ARRAY_POSITION" | "ARRAY_INDEXOF" => {
@@ -815,6 +1108,81 @@ fn evaluate_function(name: &str, args: &[Value]) -> Result<Value> {
                 _ => Ok(Value::Null),
             }
         }
+        "LIST_PRODUCT" | "ARRAY_PRODUCT" => {
+            match args.first() {
+                Some(Value::List(list)) => {
+                    let product = list.iter()
+                        .filter(|v| !v.is_null())
+                        .try_fold(1.0f64, |acc, v| {
+                            v.as_f64().map(|f| acc * f)
+                        });
+                    match product {
+                        Some(p) => Ok(Value::Double(p)),
+                        None => Ok(Value::Null),
+                    }
+                }
+                Some(Value::Null) => Ok(Value::Null),
+                _ => Ok(Value::Null),
+            }
+        }
+        "LIST_ANY" | "ARRAY_ANY" | "LIST_BOOL_OR" => {
+            // Returns TRUE if any element is TRUE
+            match args.first() {
+                Some(Value::List(list)) => {
+                    let any_true = list.iter().any(|v| {
+                        matches!(v, Value::Boolean(true))
+                    });
+                    Ok(Value::Boolean(any_true))
+                }
+                Some(Value::Null) => Ok(Value::Null),
+                _ => Ok(Value::Null),
+            }
+        }
+        "LIST_ALL" | "ARRAY_ALL" | "LIST_BOOL_AND" => {
+            // Returns TRUE if all elements are TRUE
+            match args.first() {
+                Some(Value::List(list)) => {
+                    if list.is_empty() {
+                        return Ok(Value::Boolean(true));
+                    }
+                    let all_true = list.iter().all(|v| {
+                        matches!(v, Value::Boolean(true))
+                    });
+                    Ok(Value::Boolean(all_true))
+                }
+                Some(Value::Null) => Ok(Value::Null),
+                _ => Ok(Value::Null),
+            }
+        }
+        "LIST_COUNT" | "ARRAY_COUNT" => {
+            // Count non-null elements in a list
+            match args.first() {
+                Some(Value::List(list)) => {
+                    let count = list.iter().filter(|v| !v.is_null()).count();
+                    Ok(Value::BigInt(count as i64))
+                }
+                Some(Value::Null) => Ok(Value::Null),
+                _ => Ok(Value::Null),
+            }
+        }
+        "LIST_STRING_AGG" | "ARRAY_STRING_AGG" => {
+            // Concatenate list elements with separator
+            let list = match args.first() {
+                Some(Value::List(list)) => list,
+                Some(Value::Null) => return Ok(Value::Null),
+                _ => return Ok(Value::Null),
+            };
+            let separator = args.get(1)
+                .and_then(|v| v.as_str())
+                .unwrap_or(",");
+
+            let result: String = list.iter()
+                .filter(|v| !v.is_null())
+                .map(|v| value_to_string(v))
+                .collect::<Vec<_>>()
+                .join(separator);
+            Ok(Value::Varchar(result))
+        }
         "FLATTEN" => {
             // Flatten nested lists one level
             match args.first() {
@@ -894,6 +1262,166 @@ fn evaluate_function(name: &str, args: &[Value]) -> Result<Value> {
                 }
                 Some(Value::Null) => Ok(Value::Null),
                 _ => Ok(Value::Null),
+            }
+        }
+
+        // Map functions
+        "MAP" | "MAP_FROM_ENTRIES" => {
+            // Create a map from key-value pairs
+            // MAP([key1, key2, ...], [value1, value2, ...]) or
+            // MAP_FROM_ENTRIES([[key1, value1], [key2, value2], ...])
+            match args {
+                [Value::List(keys), Value::List(values)] => {
+                    // MAP(keys, values) form
+                    let pairs: Vec<(Value, Value)> = keys.iter()
+                        .zip(values.iter())
+                        .map(|(k, v)| (k.clone(), v.clone()))
+                        .collect();
+                    Ok(Value::Map(pairs))
+                }
+                [Value::List(entries)] => {
+                    // MAP_FROM_ENTRIES form: list of [key, value] pairs
+                    let pairs: Vec<(Value, Value)> = entries.iter()
+                        .filter_map(|e| {
+                            if let Value::List(pair) = e {
+                                if pair.len() >= 2 {
+                                    return Some((pair[0].clone(), pair[1].clone()));
+                                }
+                            }
+                            None
+                        })
+                        .collect();
+                    Ok(Value::Map(pairs))
+                }
+                _ => Ok(Value::Map(vec![])),
+            }
+        }
+        "MAP_KEYS" => {
+            // Extract keys from a map as a list
+            match args.first() {
+                Some(Value::Map(pairs)) => {
+                    let keys: Vec<Value> = pairs.iter().map(|(k, _)| k.clone()).collect();
+                    Ok(Value::List(keys))
+                }
+                Some(Value::Null) => Ok(Value::Null),
+                _ => Ok(Value::List(vec![])),
+            }
+        }
+        "MAP_VALUES" => {
+            // Extract values from a map as a list
+            match args.first() {
+                Some(Value::Map(pairs)) => {
+                    let values: Vec<Value> = pairs.iter().map(|(_, v)| v.clone()).collect();
+                    Ok(Value::List(values))
+                }
+                Some(Value::Null) => Ok(Value::Null),
+                _ => Ok(Value::List(vec![])),
+            }
+        }
+        "MAP_ENTRIES" => {
+            // Convert map to list of [key, value] pairs
+            match args.first() {
+                Some(Value::Map(pairs)) => {
+                    let entries: Vec<Value> = pairs.iter()
+                        .map(|(k, v)| Value::List(vec![k.clone(), v.clone()]))
+                        .collect();
+                    Ok(Value::List(entries))
+                }
+                Some(Value::Null) => Ok(Value::Null),
+                _ => Ok(Value::List(vec![])),
+            }
+        }
+        "MAP_CONTAINS" | "MAP_HAS" => {
+            // Check if map contains a key
+            match (args.first(), args.get(1)) {
+                (Some(Value::Map(pairs)), Some(key)) => {
+                    let found = pairs.iter().any(|(k, _)| k == key);
+                    Ok(Value::Boolean(found))
+                }
+                (Some(Value::Null), _) | (_, Some(Value::Null)) => Ok(Value::Null),
+                _ => Ok(Value::Boolean(false)),
+            }
+        }
+        "MAP_EXTRACT" | "ELEMENT_AT" => {
+            // Extract value from map by key
+            match (args.first(), args.get(1)) {
+                (Some(Value::Map(pairs)), Some(key)) => {
+                    let value = pairs.iter()
+                        .find(|(k, _)| k == key)
+                        .map(|(_, v)| v.clone())
+                        .unwrap_or(Value::Null);
+                    Ok(value)
+                }
+                _ => Ok(Value::Null),
+            }
+        }
+        "CARDINALITY" => {
+            // Return number of elements in map or list
+            match args.first() {
+                Some(Value::Map(pairs)) => Ok(Value::BigInt(pairs.len() as i64)),
+                Some(Value::List(list)) => Ok(Value::BigInt(list.len() as i64)),
+                Some(Value::Null) => Ok(Value::Null),
+                _ => Ok(Value::BigInt(0)),
+            }
+        }
+
+        // Struct functions
+        "STRUCT" | "ROW" => {
+            // Create a struct from values
+            // STRUCT(val1, val2, ...) - creates an unnamed struct
+            let fields: Vec<(String, Value)> = args.iter().enumerate()
+                .map(|(i, v)| (format!("v{}", i + 1), v.clone()))
+                .collect();
+            Ok(Value::Struct(fields))
+        }
+        "STRUCT_PACK" => {
+            // Create a struct with named fields
+            // Called like STRUCT_PACK(a := 1, b := 2) which we receive as alternating name, value
+            let mut fields = Vec::new();
+            let mut i = 0;
+            while i + 1 < args.len() {
+                if let Value::Varchar(name) = &args[i] {
+                    fields.push((name.clone(), args[i + 1].clone()));
+                }
+                i += 2;
+            }
+            Ok(Value::Struct(fields))
+        }
+        "STRUCT_EXTRACT" => {
+            // Extract a field from a struct by name
+            match (args.first(), args.get(1)) {
+                (Some(Value::Struct(fields)), Some(Value::Varchar(name))) => {
+                    let value = fields.iter()
+                        .find(|(n, _)| n == name)
+                        .map(|(_, v)| v.clone())
+                        .unwrap_or(Value::Null);
+                    Ok(value)
+                }
+                _ => Ok(Value::Null),
+            }
+        }
+        "STRUCT_KEYS" => {
+            // Get field names from a struct
+            match args.first() {
+                Some(Value::Struct(fields)) => {
+                    let keys: Vec<Value> = fields.iter()
+                        .map(|(k, _)| Value::Varchar(k.clone()))
+                        .collect();
+                    Ok(Value::List(keys))
+                }
+                _ => Ok(Value::List(vec![])),
+            }
+        }
+        "STRUCT_VALUES" => {
+            // Get field values from a struct
+            match args.first() {
+                Some(Value::Struct(fields)) => {
+                    let values: Vec<Value> = fields.iter()
+                        .map(|(_, v)| v.clone())
+                        .collect();
+                    Ok(Value::List(values))
+                }
+                _ => Ok(Value::List(vec![])),
             }
         }
 
@@ -1136,6 +1664,151 @@ fn evaluate_function(name: &str, args: &[Value]) -> Result<Value> {
                 Ok(Value::BigInt(result))
             }
         }
+        "EVEN" => {
+            // Round to nearest even number
+            let val = args.first().and_then(|v| v.as_f64()).unwrap_or(0.0);
+            let ceil = val.ceil();
+            let result = if ceil as i64 % 2 == 0 {
+                ceil
+            } else if val >= 0.0 {
+                ceil + 1.0
+            } else {
+                ceil - 1.0
+            };
+            Ok(Value::Double(result))
+        }
+        "ODD" => {
+            // Round to nearest odd number
+            let val = args.first().and_then(|v| v.as_f64()).unwrap_or(0.0);
+            let ceil = val.ceil();
+            let result = if ceil as i64 % 2 != 0 {
+                ceil
+            } else if val >= 0.0 {
+                ceil + 1.0
+            } else {
+                ceil - 1.0
+            };
+            Ok(Value::Double(result))
+        }
+        "DIV" => {
+            // Integer division
+            let a = args.first().and_then(|v| v.as_i64()).unwrap_or(0);
+            let b = args.get(1).and_then(|v| v.as_i64()).unwrap_or(1);
+            if b == 0 {
+                Ok(Value::Null)
+            } else {
+                Ok(Value::BigInt(a / b))
+            }
+        }
+        "ISNAN" => {
+            let val = args.first().and_then(|v| v.as_f64());
+            match val {
+                Some(f) => Ok(Value::Boolean(f.is_nan())),
+                None => Ok(Value::Null),
+            }
+        }
+        "ISINF" => {
+            let val = args.first().and_then(|v| v.as_f64());
+            match val {
+                Some(f) => Ok(Value::Boolean(f.is_infinite())),
+                None => Ok(Value::Null),
+            }
+        }
+        "ISFINITE" => {
+            let val = args.first().and_then(|v| v.as_f64());
+            match val {
+                Some(f) => Ok(Value::Boolean(f.is_finite())),
+                None => Ok(Value::Null),
+            }
+        }
+        "GAMMA" | "LGAMMA" => {
+            // Log gamma function (approximation using Stirling's formula)
+            let val = args.first().and_then(|v| v.as_f64()).unwrap_or(0.0);
+            if val <= 0.0 {
+                Ok(Value::Null)
+            } else {
+                // Using Stirling's approximation for log(Gamma(x))
+                let result = (val - 0.5) * val.ln() - val + 0.5 * (2.0 * std::f64::consts::PI).ln()
+                    + 1.0 / (12.0 * val);
+                Ok(Value::Double(result))
+            }
+        }
+        "NEXTAFTER" => {
+            // Return the next representable floating-point value after x towards y
+            let x = args.first().and_then(|v| v.as_f64()).unwrap_or(0.0);
+            let y = args.get(1).and_then(|v| v.as_f64()).unwrap_or(1.0);
+            if x == y {
+                Ok(Value::Double(y))
+            } else if y > x {
+                // Get next higher value
+                let bits = x.to_bits();
+                let next_bits = if x >= 0.0 { bits + 1 } else { bits - 1 };
+                Ok(Value::Double(f64::from_bits(next_bits)))
+            } else {
+                // Get next lower value
+                let bits = x.to_bits();
+                let next_bits = if x > 0.0 { bits - 1 } else { bits + 1 };
+                Ok(Value::Double(f64::from_bits(next_bits)))
+            }
+        }
+        "FMOD" => {
+            // Floating-point modulo
+            let x = args.first().and_then(|v| v.as_f64()).unwrap_or(0.0);
+            let y = args.get(1).and_then(|v| v.as_f64()).unwrap_or(1.0);
+            if y == 0.0 {
+                Ok(Value::Null)
+            } else {
+                Ok(Value::Double(x % y))
+            }
+        }
+        "COPYSIGN" => {
+            // Return x with the sign of y
+            let x = args.first().and_then(|v| v.as_f64()).unwrap_or(0.0);
+            let y = args.get(1).and_then(|v| v.as_f64()).unwrap_or(1.0);
+            Ok(Value::Double(x.copysign(y)))
+        }
+        "HYPOT" => {
+            // Return sqrt(x*x + y*y) without overflow
+            let x = args.first().and_then(|v| v.as_f64()).unwrap_or(0.0);
+            let y = args.get(1).and_then(|v| v.as_f64()).unwrap_or(0.0);
+            Ok(Value::Double(x.hypot(y)))
+        }
+        "LDEXP" => {
+            // Return x * 2^exp
+            let x = args.first().and_then(|v| v.as_f64()).unwrap_or(0.0);
+            let exp = args.get(1).and_then(|v| v.as_i64()).unwrap_or(0) as i32;
+            Ok(Value::Double(x * (2.0_f64).powi(exp)))
+        }
+        "SIGNBIT" => {
+            // Return true if sign bit is set (including -0.0)
+            let val = args.first().and_then(|v| v.as_f64()).unwrap_or(0.0);
+            Ok(Value::Boolean(val.is_sign_negative()))
+        }
+        "FDIM" => {
+            // Return positive difference: max(x - y, 0)
+            let x = args.first().and_then(|v| v.as_f64()).unwrap_or(0.0);
+            let y = args.get(1).and_then(|v| v.as_f64()).unwrap_or(0.0);
+            Ok(Value::Double((x - y).max(0.0)))
+        }
+        "FMA" => {
+            // Fused multiply-add: x * y + z
+            let x = args.first().and_then(|v| v.as_f64()).unwrap_or(0.0);
+            let y = args.get(1).and_then(|v| v.as_f64()).unwrap_or(0.0);
+            let z = args.get(2).and_then(|v| v.as_f64()).unwrap_or(0.0);
+            Ok(Value::Double(x.mul_add(y, z)))
+        }
+        "REMAINDER" | "IEEE_REMAINDER" => {
+            // IEEE 754 remainder
+            let x = args.first().and_then(|v| v.as_f64()).unwrap_or(0.0);
+            let y = args.get(1).and_then(|v| v.as_f64()).unwrap_or(1.0);
+            if y == 0.0 {
+                Ok(Value::Null)
+            } else {
+                // IEEE remainder: x - n*y where n is the integer nearest x/y
+                let n = (x / y).round();
+                Ok(Value::Double(x - n * y))
+            }
+        }
 
         // UUID functions
         "GEN_RANDOM_UUID" | "UUID" => {
@@ -1165,9 +1838,68 @@ fn evaluate_function(name: &str, args: &[Value]) -> Result<Value> {
             let s = args.first().and_then(|v| v.as_str()).unwrap_or("");
             Ok(Value::Integer(s.len() as i32))
         }
+        "BIT_AND" | "BITAND" => {
+            let a = args.first().and_then(|v| v.as_i64()).unwrap_or(0);
+            let b = args.get(1).and_then(|v| v.as_i64()).unwrap_or(0);
+            Ok(Value::BigInt(a & b))
+        }
+        "BIT_OR" | "BITOR" => {
+            let a = args.first().and_then(|v| v.as_i64()).unwrap_or(0);
+            let b = args.get(1).and_then(|v| v.as_i64()).unwrap_or(0);
+            Ok(Value::BigInt(a | b))
+        }
+        "BIT_XOR" | "BITXOR" | "XOR" => {
+            let a = args.first().and_then(|v| v.as_i64()).unwrap_or(0);
+            let b = args.get(1).and_then(|v| v.as_i64()).unwrap_or(0);
+            Ok(Value::BigInt(a ^ b))
+        }
+        "BIT_NOT" | "BITNOT" => {
+            let a = args.first().and_then(|v| v.as_i64()).unwrap_or(0);
+            Ok(Value::BigInt(!a))
+        }
+        "LEFT_SHIFT" | "LSHIFT" | "SHIFTLEFT" => {
+            let a = args.first().and_then(|v| v.as_i64()).unwrap_or(0);
+            let b = args.get(1).and_then(|v| v.as_i64()).unwrap_or(0) as u32;
+            Ok(Value::BigInt(a << b.min(63)))
+        }
+        "RIGHT_SHIFT" | "RSHIFT" | "SHIFTRIGHT" => {
+            let a = args.first().and_then(|v| v.as_i64()).unwrap_or(0);
+            let b = args.get(1).and_then(|v| v.as_i64()).unwrap_or(0) as u32;
+            Ok(Value::BigInt(a >> b.min(63)))
+        }
+        "GET_BIT" => {
+            // Get the bit at position n (0-indexed from right)
+            let val = args.first().and_then(|v| v.as_i64()).unwrap_or(0);
+            let pos = args.get(1).and_then(|v| v.as_i64()).unwrap_or(0) as u32;
+            if pos >= 64 {
+                Ok(Value::Integer(0))
+            } else {
+                Ok(Value::Integer(((val >> pos) & 1) as i32))
+            }
+        }
+        "SET_BIT" => {
+            // Set the bit at position n to 1 or 0
+            let val = args.first().and_then(|v| v.as_i64()).unwrap_or(0);
+            let pos = args.get(1).and_then(|v| v.as_i64()).unwrap_or(0) as u32;
+            let new_val = args.get(2).and_then(|v| v.as_i64()).unwrap_or(1);
+            if pos >= 64 {
+                Ok(Value::BigInt(val))
+            } else if new_val != 0 {
+                Ok(Value::BigInt(val | (1 << pos)))
+            } else {
+                Ok(Value::BigInt(val & !(1 << pos)))
+            }
+        }
+        "BITSTRING" => {
+            // Convert integer to binary string
+            let val = args.first().and_then(|v| v.as_i64()).unwrap_or(0);
+            let width = args.get(1).and_then(|v| v.as_i64()).unwrap_or(64) as usize;
+            let binary = format!("{:0>width$b}", val.abs(), width = width.min(64));
+            Ok(Value::Varchar(binary))
+        }
 
         // Format function
-        "FORMAT" | "PRINTF" => {
+        "FORMAT" | "PRINTF" | "SPRINTF" => {
             // Simple format - just return the first string with replacements
             let template = args.first().and_then(|v| v.as_str()).unwrap_or("");
             let mut arg_idx = 1;
@@ -1615,11 +2347,138 @@ fn evaluate_function(name: &str, args: &[Value]) -> Result<Value> {
                 Ok(first.clone())
             }
         }
+        "NVL2" => {
+            // NVL2(expr, val_if_not_null, val_if_null)
+            let first = args.first().unwrap_or(&Value::Null);
+            if first.is_null() {
+                Ok(args.get(2).cloned().unwrap_or(Value::Null))
+            } else {
+                Ok(args.get(1).cloned().unwrap_or(Value::Null))
+            }
+        }
+        "DECODE" => {
+            // DECODE(expr, search1, result1, search2, result2, ..., default)
+            // Returns result for first matching search value
+            let expr = args.first().unwrap_or(&Value::Null);
+            let mut i = 1;
+            while i + 1 < args.len() {
+                if &args[i] == expr {
+                    return Ok(args[i + 1].clone());
+                }
+                i += 2;
+            }
+            // Return default if no match (last arg if odd number of remaining args)
+            if i < args.len() {
+                Ok(args[i].clone())
+            } else {
+                Ok(Value::Null)
+            }
+        }
+        "CHOOSE" => {
+            // CHOOSE(index, val1, val2, val3, ...)
+            // Returns val at 1-based index
+            let index = args.first().and_then(|v| v.as_i64()).unwrap_or(0) as usize;
+            if index >= 1 && index < args.len() {
+                Ok(args[index].clone())
+            } else {
+                Ok(Value::Null)
+            }
+        }
+        "ZEROIFNULL" => {
+            let first = args.first().unwrap_or(&Value::Null);
+            if first.is_null() {
+                Ok(Value::Integer(0))
+            } else {
+                Ok(first.clone())
+            }
+        }
+        "NULLIFZERO" => {
+            match args.first() {
+                Some(Value::Integer(0)) | Some(Value::BigInt(0)) => Ok(Value::Null),
+                Some(Value::Float(f)) if *f == 0.0 => Ok(Value::Null),
+                Some(Value::Double(f)) if *f == 0.0 => Ok(Value::Null),
+                Some(v) => Ok(v.clone()),
+                None => Ok(Value::Null),
+            }
+        }
+        "IFNOT" => {
+            // IFNOT(cond, val) returns val if cond is false
+            let cond = args.first().map(|v| matches!(v, Value::Boolean(true))).unwrap_or(false);
+            if !cond {
+                Ok(args.get(1).cloned().unwrap_or(Value::Null))
+            } else {
+                Ok(Value::Null)
+            }
+        }
 
         // Type functions
         "TYPEOF" => {
             let val = args.first().unwrap_or(&Value::Null);
             Ok(Value::Varchar(val.logical_type().to_string()))
+        }
+
+        // System/utility functions
+        "VERSION" => {
+            Ok(Value::Varchar("IronDuck 0.1.0 (DuckDB compatible)".to_string()))
+        }
+        "CURRENT_DATABASE" | "DATABASE" => {
+            Ok(Value::Varchar("memory".to_string()))
+        }
+        "CURRENT_SCHEMA" | "SCHEMA" => {
+            Ok(Value::Varchar("main".to_string()))
+        }
+        "CURRENT_USER" | "USER" | "SESSION_USER" => {
+            Ok(Value::Varchar("ironduck".to_string()))
+        }
+        "CURRENT_CATALOG" => {
+            Ok(Value::Varchar("memory".to_string()))
+        }
+        "CURRENT_SETTING" => {
+            // Return default settings
+            let setting = args.first().and_then(|v| v.as_str()).unwrap_or("");
+            match setting.to_lowercase().as_str() {
+                "timezone" => Ok(Value::Varchar("UTC".to_string())),
+                "memory_limit" => Ok(Value::Varchar("unlimited".to_string())),
+                "threads" => Ok(Value::Varchar("1".to_string())),
+                _ => Ok(Value::Null),
+            }
+        }
+        "ALIAS" => {
+            // Returns the alias of a column (for display purposes)
+            args.first().cloned().ok_or_else(|| Error::InvalidArguments("ALIAS requires an argument".to_string()))
+        }
+        "ERROR" => {
+            // Raise an error with the given message
+            let msg = args.first().and_then(|v| v.as_str()).unwrap_or("User error");
+            Err(Error::NotImplemented(msg.to_string()))
+        }
+        "CONSTANT_OR_NULL" => {
+            // Returns constant if all rows have same value, NULL otherwise
+            // For scalar context, just return the first arg
+            args.first().cloned().ok_or_else(|| Error::InvalidArguments("CONSTANT_OR_NULL requires an argument".to_string()))
+        }
+        "STATS" => {
+            // Return stats about a column (simplified)
+            Ok(Value::Varchar("Statistics not available".to_string()))
+        }
+        "PG_TYPEOF" => {
+            // PostgreSQL compatibility - return type name
+            let val = args.first().unwrap_or(&Value::Null);
+            let type_name = match val.logical_type() {
+                LogicalType::Integer => "integer",
+                LogicalType::BigInt => "bigint",
+                LogicalType::SmallInt => "smallint",
+                LogicalType::TinyInt => "tinyint",
+                LogicalType::Float => "real",
+                LogicalType::Double => "double precision",
+                LogicalType::Varchar => "text",
+                LogicalType::Boolean => "boolean",
+                LogicalType::Date => "date",
+                LogicalType::Timestamp => "timestamp without time zone",
+                LogicalType::Time => "time without time zone",
+                _ => "unknown",
+            };
+            Ok(Value::Varchar(type_name.to_string()))
         }
 
         // Date/Time functions
@@ -1702,35 +2561,74 @@ fn evaluate_function(name: &str, args: &[Value]) -> Result<Value> {
             let part = args.first().and_then(|v| v.as_str()).unwrap_or("").to_uppercase();
             let ts = args.get(1).unwrap_or(&Value::Null);
 
-            let dt = match ts {
-                Value::Timestamp(dt) => *dt,
-                Value::Null => return Ok(Value::Null),
-                _ => return Err(Error::TypeMismatch {
-                    expected: "timestamp".to_string(),
+            match ts {
+                Value::Timestamp(dt) => {
+                    let truncated = match part.as_str() {
+                        "SECOND" => NaiveDateTime::new(
+                            dt.date(),
+                            NaiveTime::from_hms_opt(dt.hour(), dt.minute(), dt.second()).unwrap(),
+                        ),
+                        "MINUTE" => NaiveDateTime::new(
+                            dt.date(),
+                            NaiveTime::from_hms_opt(dt.hour(), dt.minute(), 0).unwrap(),
+                        ),
+                        "HOUR" => NaiveDateTime::new(
+                            dt.date(),
+                            NaiveTime::from_hms_opt(dt.hour(), 0, 0).unwrap(),
+                        ),
+                        "DAY" => NaiveDateTime::new(
+                            dt.date(),
+                            NaiveTime::from_hms_opt(0, 0, 0).unwrap(),
+                        ),
+                        "WEEK" => {
+                            // Truncate to start of week (Monday)
+                            let weekday = dt.weekday().num_days_from_monday();
+                            let start_of_week = dt.date() - chrono::Duration::days(weekday as i64);
+                            NaiveDateTime::new(start_of_week, NaiveTime::from_hms_opt(0, 0, 0).unwrap())
+                        }
+                        "MONTH" => NaiveDateTime::new(
+                            NaiveDate::from_ymd_opt(dt.year(), dt.month(), 1).unwrap(),
+                            NaiveTime::from_hms_opt(0, 0, 0).unwrap(),
+                        ),
+                        "QUARTER" => {
+                            let quarter_month = ((dt.month() - 1) / 3) * 3 + 1;
+                            NaiveDateTime::new(
+                                NaiveDate::from_ymd_opt(dt.year(), quarter_month, 1).unwrap(),
+                                NaiveTime::from_hms_opt(0, 0, 0).unwrap(),
+                            )
+                        }
+                        "YEAR" => NaiveDateTime::new(
+                            NaiveDate::from_ymd_opt(dt.year(), 1, 1).unwrap(),
+                            NaiveTime::from_hms_opt(0, 0, 0).unwrap(),
+                        ),
+                        _ => return Err(Error::NotImplemented(format!("DATE_TRUNC field: {}", part))),
+                    };
+                    Ok(Value::Timestamp(truncated))
+                }
+                Value::Date(d) => {
+                    let truncated = match part.as_str() {
+                        "DAY" => *d,
+                        "WEEK" => {
+                            // Truncate to start of week (Monday)
+                            let weekday = d.weekday().num_days_from_monday();
+                            *d - chrono::Duration::days(weekday as i64)
+                        }
+                        "MONTH" => NaiveDate::from_ymd_opt(d.year(), d.month(), 1).unwrap(),
+                        "QUARTER" => {
+                            let quarter_month = ((d.month() - 1) / 3) * 3 + 1;
+                            NaiveDate::from_ymd_opt(d.year(), quarter_month, 1).unwrap()
+                        }
+                        "YEAR" => NaiveDate::from_ymd_opt(d.year(), 1, 1).unwrap(),
+                        _ => return Err(Error::NotImplemented(format!("DATE_TRUNC field: {}", part))),
+                    };
+                    Ok(Value::Date(truncated))
+                }
+                Value::Null => Ok(Value::Null),
+                _ => Err(Error::TypeMismatch {
+                    expected: "timestamp or date".to_string(),
                     got: format!("{:?}", ts),
                 }),
-            };
-
-            let truncated = match part.as_str() {
-                "SECOND" => NaiveDateTime::new(
-                    dt.date(),
-                    NaiveTime::from_hms_opt(dt.hour(), dt.minute(), dt.second()).unwrap(),
-                ),
-                "MINUTE" => NaiveDateTime::new(
-                    dt.date(),
-                    NaiveTime::from_hms_opt(dt.hour(), dt.minute(), 0).unwrap(),
-                ),
-                "HOUR" => NaiveDateTime::new(
-                    dt.date(),
-                    NaiveTime::from_hms_opt(dt.hour(), 0, 0).unwrap(),
-                ),
-                "DAY" => NaiveDateTime::new(
-                    dt.date(),
-                    NaiveTime::from_hms_opt(0, 0, 0).unwrap(),
-                ),
-                _ => return Err(Error::NotImplemented(format!("DATE_TRUNC field: {}", part))),
-            };
-            Ok(Value::Timestamp(truncated))
+            }
         }
         "YEAR" => {
             use chrono::Datelike;
@@ -1949,6 +2847,48 @@ fn evaluate_function(name: &str, args: &[Value]) -> Result<Value> {
                 _ => Ok(Value::Null),
             }
         }
+        "DAYNAME" => {
+            use chrono::Datelike;
+            let weekday = match args.first() {
+                Some(Value::Date(d)) => Some(d.weekday()),
+                Some(Value::Timestamp(dt)) => Some(dt.weekday()),
+                _ => None,
+            };
+            match weekday {
+                Some(chrono::Weekday::Mon) => Ok(Value::Varchar("Monday".to_string())),
+                Some(chrono::Weekday::Tue) => Ok(Value::Varchar("Tuesday".to_string())),
+                Some(chrono::Weekday::Wed) => Ok(Value::Varchar("Wednesday".to_string())),
+                Some(chrono::Weekday::Thu) => Ok(Value::Varchar("Thursday".to_string())),
+                Some(chrono::Weekday::Fri) => Ok(Value::Varchar("Friday".to_string())),
+                Some(chrono::Weekday::Sat) => Ok(Value::Varchar("Saturday".to_string())),
+                Some(chrono::Weekday::Sun) => Ok(Value::Varchar("Sunday".to_string())),
+                None => Ok(Value::Null),
+            }
+        }
+        "MONTHNAME" => {
+            use chrono::Datelike;
+            let month = match args.first() {
+                Some(Value::Date(d)) => Some(d.month()),
+                Some(Value::Timestamp(dt)) => Some(dt.month()),
+                _ => None,
+            };
+            let name = match month {
+                Some(1) => "January",
+                Some(2) => "February",
+                Some(3) => "March",
+                Some(4) => "April",
+                Some(5) => "May",
+                Some(6) => "June",
+                Some(7) => "July",
+                Some(8) => "August",
+                Some(9) => "September",
+                Some(10) => "October",
+                Some(11) => "November",
+                Some(12) => "December",
+                _ => return Ok(Value::Null),
+            };
+            Ok(Value::Varchar(name.to_string()))
+        }
         "EPOCH" | "EPOCH_MS" => {
             match args.first() {
                 Some(Value::Timestamp(dt)) => {
@@ -1960,6 +2900,99 @@ fn evaluate_function(name: &str, args: &[Value]) -> Result<Value> {
                     Ok(Value::BigInt(epoch))
                 }
                 Some(Value::Null) => Ok(Value::Null),
+                _ => Ok(Value::Null),
+            }
+        }
+        "EPOCH_US" => {
+            // Return epoch in microseconds
+            match args.first() {
+                Some(Value::Timestamp(dt)) => {
+                    let epoch_us = dt.and_utc().timestamp_micros();
+                    Ok(Value::BigInt(epoch_us))
+                }
+                Some(Value::Date(d)) => {
+                    let epoch_us = d.and_hms_opt(0, 0, 0).unwrap().and_utc().timestamp_micros();
+                    Ok(Value::BigInt(epoch_us))
+                }
+                Some(Value::Null) => Ok(Value::Null),
+                _ => Ok(Value::Null),
+            }
+        }
+        "EPOCH_NS" => {
+            // Return epoch in nanoseconds
+            match args.first() {
+                Some(Value::Timestamp(dt)) => {
+                    if let Some(epoch_ns) = dt.and_utc().timestamp_nanos_opt() {
+                        Ok(Value::BigInt(epoch_ns))
+                    } else {
+                        Ok(Value::Null) // Overflow
+                    }
+                }
+                Some(Value::Date(d)) => {
+                    if let Some(epoch_ns) = d.and_hms_opt(0, 0, 0).unwrap().and_utc().timestamp_nanos_opt() {
+                        Ok(Value::BigInt(epoch_ns))
+                    } else {
+                        Ok(Value::Null)
+                    }
+                }
+                Some(Value::Null) => Ok(Value::Null),
+                _ => Ok(Value::Null),
+            }
+        }
+        "TIME_BUCKET" => {
+            // TIME_BUCKET(bucket_width, timestamp) - truncate timestamp to bucket
+            use chrono::{Duration, Datelike, Timelike, NaiveDateTime};
+
+            let bucket_width = args.first();
+            let timestamp = args.get(1);
+
+            match (bucket_width, timestamp) {
+                (Some(Value::Interval(interval)), Some(Value::Timestamp(ts))) => {
+                    // Calculate bucket width in microseconds
+                    let bucket_micros = interval.micros
+                        + (interval.days as i64 * 24 * 60 * 60 * 1_000_000)
+                        + (interval.months as i64 * 30 * 24 * 60 * 60 * 1_000_000);
+
+                    if bucket_micros <= 0 {
+                        return Err(Error::Execution("TIME_BUCKET: bucket width must be positive".to_string()));
+                    }
+
+                    // Get timestamp as microseconds since epoch
+                    let ts_micros = ts.and_utc().timestamp_micros();
+
+                    // Truncate to bucket
+                    let bucket_start = (ts_micros / bucket_micros) * bucket_micros;
+
+                    // Convert back to timestamp
+                    let secs = bucket_start / 1_000_000;
+                    let nsecs = ((bucket_start % 1_000_000) * 1000) as u32;
+                    match chrono::DateTime::from_timestamp(secs, nsecs) {
+                        Some(dt) => Ok(Value::Timestamp(dt.naive_utc())),
+                        None => Ok(Value::Null),
+                    }
+                }
+                (Some(Value::Interval(interval)), Some(Value::Date(d))) => {
+                    // For dates, convert to timestamp at midnight
+                    let ts = d.and_hms_opt(0, 0, 0).unwrap();
+                    let bucket_micros = interval.micros
+                        + (interval.days as i64 * 24 * 60 * 60 * 1_000_000)
+                        + (interval.months as i64 * 30 * 24 * 60 * 60 * 1_000_000);
+
+                    if bucket_micros <= 0 {
+                        return Err(Error::Execution("TIME_BUCKET: bucket width must be positive".to_string()));
+                    }
+
+                    let ts_micros = ts.and_utc().timestamp_micros();
+                    let bucket_start = (ts_micros / bucket_micros) * bucket_micros;
+
+                    let secs = bucket_start / 1_000_000;
+                    let nsecs = ((bucket_start % 1_000_000) * 1000) as u32;
+                    match chrono::DateTime::from_timestamp(secs, nsecs) {
+                        Some(dt) => Ok(Value::Timestamp(dt.naive_utc())),
+                        None => Ok(Value::Null),
+                    }
+                }
+                (Some(Value::Null), _) | (_, Some(Value::Null)) => Ok(Value::Null),
                 _ => Ok(Value::Null),
             }
         }
@@ -2153,6 +3186,121 @@ fn evaluate_function(name: &str, args: &[Value]) -> Result<Value> {
             obj.push('}');
             Ok(Value::Varchar(obj))
         }
+        "JSON_MERGE_PATCH" => {
+            // Merge two JSON objects (RFC 7396)
+            let json1_str = args.first().and_then(|v| v.as_str()).unwrap_or("{}");
+            let json2_str = args.get(1).and_then(|v| v.as_str()).unwrap_or("{}");
+
+            let json1: serde_json::Value = serde_json::from_str(json1_str).unwrap_or(serde_json::Value::Null);
+            let json2: serde_json::Value = serde_json::from_str(json2_str).unwrap_or(serde_json::Value::Null);
+
+            fn merge(a: &mut serde_json::Value, b: serde_json::Value) {
+                if let (Some(a_obj), Some(b_obj)) = (a.as_object_mut(), b.as_object()) {
+                    for (k, v) in b_obj {
+                        if v.is_null() {
+                            a_obj.remove(k);
+                        } else if let Some(existing) = a_obj.get_mut(k) {
+                            merge(existing, v.clone());
+                        } else {
+                            a_obj.insert(k.clone(), v.clone());
+                        }
+                    }
+                } else {
+                    *a = b;
+                }
+            }
+
+            let mut result = json1;
+            merge(&mut result, json2);
+            Ok(Value::Varchar(result.to_string()))
+        }
+        "JSON_CONTAINS" => {
+            // Check if JSON contains a value at path
+            let json_str = args.first().and_then(|v| v.as_str()).unwrap_or("{}");
+            let needle = args.get(1).and_then(|v| v.as_str()).unwrap_or("");
+
+            let json_str_lower = json_str.to_lowercase();
+            let needle_lower = needle.to_lowercase();
+            Ok(Value::Boolean(json_str_lower.contains(&needle_lower)))
+        }
+        "JSON_QUOTE" => {
+            // Quote a string as a JSON string
+            let s = args.first().and_then(|v| v.as_str()).unwrap_or("");
+            let quoted = serde_json::to_string(s).unwrap_or_else(|_| format!("\"{}\"", s));
+            Ok(Value::Varchar(quoted))
+        }
+        "TRY_JSON_EXTRACT" | "JSON_EXTRACT_PATH_TEXT" => {
+            // Like JSON_EXTRACT but returns NULL on error instead of failing
+            let json_str = args.first().and_then(|v| v.as_str()).unwrap_or("");
+            let path = args.get(1).and_then(|v| v.as_str()).unwrap_or("");
+
+            match serde_json::from_str::<serde_json::Value>(json_str) {
+                Ok(mut val) => {
+                    for key in path.trim_start_matches('$').trim_start_matches('.').split('.') {
+                        if key.is_empty() { continue; }
+                        val = match val {
+                            serde_json::Value::Object(ref obj) => {
+                                obj.get(key).cloned().unwrap_or(serde_json::Value::Null)
+                            }
+                            serde_json::Value::Array(ref arr) => {
+                                if let Ok(idx) = key.parse::<usize>() {
+                                    arr.get(idx).cloned().unwrap_or(serde_json::Value::Null)
+                                } else {
+                                    serde_json::Value::Null
+                                }
+                            }
+                            _ => serde_json::Value::Null,
+                        };
+                    }
+                    if val.is_null() {
+                        Ok(Value::Null)
+                    } else if let Some(s) = val.as_str() {
+                        Ok(Value::Varchar(s.to_string()))
+                    } else {
+                        Ok(Value::Varchar(val.to_string()))
+                    }
+                }
+                Err(_) => Ok(Value::Null),
+            }
+        }
+        "JSON_SERIALIZE" => {
+            // Serialize value to JSON (alias for TO_JSON)
+            match args.first() {
+                Some(v) => Ok(Value::Varchar(value_to_json_string(v))),
+                None => Ok(Value::Varchar("null".to_string())),
+            }
+        }
+        "JSON_DESERIALIZE" | "JSON_PARSE" | "FROM_JSON" => {
+            // Parse JSON string into a value
+            let json_str = args.first().and_then(|v| v.as_str()).unwrap_or("null");
+            match serde_json::from_str::<serde_json::Value>(json_str) {
+                Ok(json) => Ok(json_value_to_value(&json)),
+                Err(_) => Ok(Value::Null),
+            }
+        }
+        "JSON_GROUP_ARRAY" | "JSON_AGG" => {
+            // This is an aggregate function, but we handle scalar case
+            let json_vals: Vec<String> = args.iter()
+                .map(|v| value_to_json_string(v))
+                .collect();
+            Ok(Value::Varchar(format!("[{}]", json_vals.join(","))))
+        }
+        "JSON_GROUP_OBJECT" => {
+            // This is an aggregate function, but we handle scalar case
+            let mut obj = String::from("{");
+            let mut first = true;
+            for chunk in args.chunks(2) {
+                if chunk.len() == 2 {
+                    if !first { obj.push(','); }
+                    first = false;
+                    let key = value_to_string(&chunk[0]);
+                    let val = value_to_json_string(&chunk[1]);
+                    obj.push_str(&format!("\"{}\":{}", key, val));
+                }
+            }
+            obj.push('}');
+            Ok(Value::Varchar(obj))
+        }
 
         _ => Err(Error::NotImplemented(format!("Function: {}", name))),
     }
@@ -2207,6 +3355,21 @@ fn value_to_json_string(val: &Value) -> String {
             format!("{{{}}}", json_fields.join(","))
         }
         _ => format!("\"{}\"", val),
+    }
+}
+
+/// Parse a timezone offset string like "0530" or "05:30" to seconds
+fn parse_tz_offset(s: &str) -> i32 {
+    let s = s.replace(':', "");
+    if s.len() >= 4 {
+        let hours: i32 = s[..2].parse().unwrap_or(0);
+        let mins: i32 = s[2..4].parse().unwrap_or(0);
+        hours * 3600 + mins * 60
+    } else if s.len() >= 2 {
+        let hours: i32 = s[..2].parse().unwrap_or(0);
+        hours * 3600
+    } else {
+        0
     }
 }
 
@@ -2420,6 +3583,52 @@ fn cast_value(val: &Value, target: &LogicalType) -> Result<Value> {
                 }),
             };
             Ok(Value::Time(t))
+        }
+        LogicalType::TimeTz => {
+            use chrono::NaiveTime;
+            let (time, offset) = match val {
+                Value::TimeTz(t, off) => (*t, *off),
+                Value::Time(t) => (*t, 0), // Assume UTC for plain time
+                Value::Timestamp(ts) => (ts.time(), 0),
+                Value::TimestampTz(ts) => (ts.time(), 0), // Already UTC
+                Value::Varchar(s) => {
+                    // Parse TIMETZ format like "00:00:00+1559" or "12:30:45-0500"
+                    let s = s.trim();
+                    // Find the timezone offset (+ or -)
+                    let (time_part, offset_secs) = if let Some(pos) = s.rfind('+') {
+                        let time_str = &s[..pos];
+                        let offset_str = &s[pos + 1..];
+                        let offset = parse_tz_offset(offset_str);
+                        (time_str, offset)
+                    } else if let Some(pos) = s.rfind('-') {
+                        // Make sure we don't split on a date separator
+                        if pos > 5 { // Likely timezone, not date
+                            let time_str = &s[..pos];
+                            let offset_str = &s[pos + 1..];
+                            let offset = -parse_tz_offset(offset_str);
+                            (time_str, offset)
+                        } else {
+                            (s, 0)
+                        }
+                    } else {
+                        (s, 0)
+                    };
+
+                    let time = NaiveTime::parse_from_str(time_part, "%H:%M:%S")
+                        .or_else(|_| NaiveTime::parse_from_str(time_part, "%H:%M:%S%.f"))
+                        .or_else(|_| NaiveTime::parse_from_str(time_part, "%H:%M"))
+                        .map_err(|_| Error::InvalidCast {
+                            from: "VARCHAR".to_string(),
+                            to: "TIMETZ".to_string(),
+                        })?;
+                    (time, offset_secs)
+                }
+                _ => return Err(Error::InvalidCast {
+                    from: val.logical_type().to_string(),
+                    to: target.to_string(),
+                }),
+            };
+            Ok(Value::TimeTz(time, offset))
         }
         LogicalType::TimestampTz => {
             use chrono::{DateTime, Utc, NaiveDateTime, NaiveDate};

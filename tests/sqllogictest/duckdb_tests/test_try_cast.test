@@ -1,0 +1,38 @@
+# TRY_CAST tests
+
+# TRY_CAST returns NULL on error
+query T
+SELECT TRY_CAST('abc' AS INTEGER);
+----
+NULL
+
+# TRY_CAST with valid value
+query I
+SELECT TRY_CAST('123' AS INTEGER);
+----
+123
+
+# TRY_CAST with NULL
+query T
+SELECT TRY_CAST(NULL AS INTEGER);
+----
+NULL
+
+# TRY_CAST string to bigint
+query I
+SELECT TRY_CAST('9999999999' AS BIGINT);
+----
+9999999999
+
+# TRY_CAST invalid double
+query T
+SELECT TRY_CAST('not a number' AS DOUBLE);
+----
+NULL
+
+# TRY_CAST valid double
+query R
+SELECT TRY_CAST('3.14159' AS DOUBLE);
+----
+3.14159
+

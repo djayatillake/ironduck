@@ -1,6 +1,6 @@
 //! Schema management
 
-use super::{CatalogId, Table, TableId, View};
+use super::{CatalogId, Index, Sequence, Table, TableId, View};
 use hashbrown::HashMap;
 use ironduck_common::{Error, Result};
 use parking_lot::RwLock;
@@ -18,6 +18,10 @@ pub struct Schema {
     tables: RwLock<HashMap<String, Arc<Table>>>,
     /// Views in this schema
     views: RwLock<HashMap<String, Arc<View>>>,
+    /// Sequences in this schema
+    sequences: RwLock<HashMap<String, Arc<Sequence>>>,
+    /// Indexes in this schema
+    indexes: RwLock<HashMap<String, Arc<Index>>>,
 }
 
 impl Schema {
@@ -27,6 +31,8 @@ impl Schema {
             name,
             tables: RwLock::new(HashMap::new()),
             views: RwLock::new(HashMap::new()),
+            sequences: RwLock::new(HashMap::new()),
+            indexes: RwLock::new(HashMap::new()),
         }
     }
 
@@ -95,5 +101,123 @@ impl Schema {
             return Err(Error::ViewNotFound(name.to_string()));
         }
         Ok(())
+    }
+
+    /// List all view names in this schema
+    pub fn list_views(&self) -> Vec<String> {
+        self.views.read().keys().cloned().collect()
+    }
+
+    /// Add a sequence to this schema (name is normalized to lowercase)
+    pub fn add_sequence(&self, sequence: Sequence) -> Result<()> {
+        let mut sequences = self.sequences.write();
+        let name_lower = sequence.name.to_lowercase();
+        if sequences.contains_key(&name_lower) {
+            return Err(Error::SequenceAlreadyExists(sequence.name.clone()));
+        }
+        sequences.insert(name_lower, Arc::new(sequence));
+        Ok(())
+    }
+
+    /// Get a sequence by name (case-insensitive)
+    pub fn get_sequence(&self, name: &str) -> Option<Arc<Sequence>> {
+        let name_lower = name.to_lowercase();
+        self.sequences.read().get(&name_lower).cloned()
+    }
+
+    /// Remove a sequence by name (case-insensitive)
+    pub fn drop_sequence(&self, name: &str) -> Result<()> {
+        let mut sequences = self.sequences.write();
+        let name_lower = name.to_lowercase();
+        if sequences.remove(&name_lower).is_none() {
+            return Err(Error::SequenceNotFound(name.to_string()));
+        }
+        Ok(())
+    }
+
+    /// List all sequence names in this schema
+    pub fn list_sequences(&self) -> Vec<String> {
+        self.sequences.read().keys().cloned().collect()
+    }
+
+    /// Modify a table by applying a mutation function
+    /// This replaces the Arc<Table> with an updated clone
+    pub fn alter_table<F>(&self, name: &str, f: F) -> Result<()>
+    where
+        F: FnOnce(&mut Table),
+    {
+        let mut tables = self.tables.write();
+        let name_lower = name.to_lowercase();
+        if let Some(table_arc) = tables.get(&name_lower) {
+            let mut table: Table = table_arc.as_ref().clone();
+            f(&mut table);
+            tables.insert(name_lower, Arc::new(table));
+            Ok(())
+        } else {
+            Err(Error::TableNotFound(name.to_string()))
+        }
+    }
+
+    /// Rename a table
+    pub fn rename_table(&self, old_name: &str, new_name: &str) -> Result<()> {
+        let mut tables = self.tables.write();
+        let old_name_lower = old_name.to_lowercase();
+        let new_name_lower = new_name.to_lowercase();
+
+        if tables.contains_key(&new_name_lower) {
+            return Err(Error::TableAlreadyExists(new_name.to_string()));
+        }
+
+        if let Some(table_arc) = tables.remove(&old_name_lower) {
+            let mut table: Table = table_arc.as_ref().clone();
+            table.name = new_name_lower.clone();
+            tables.insert(new_name_lower, Arc::new(table));
+            Ok(())
+        } else {
+            Err(Error::TableNotFound(old_name.to_string()))
+        }
+    }
+
+    /// Add an index to this schema (name is normalized to lowercase)
+    pub fn add_index(&self, index: Index) -> Result<()> {
+        let mut indexes = self.indexes.write();
+        let name_lower = index.name.to_lowercase();
+        if indexes.contains_key(&name_lower) {
+            return Err(Error::IndexAlreadyExists(index.name.clone()));
+        }
+        indexes.insert(name_lower, Arc::new(index));
+        Ok(())
+    }
+
+    /// Get an index by name (case-insensitive)
+    pub fn get_index(&self, name: &str) -> Option<Arc<Index>> {
+        let name_lower = name.to_lowercase();
+        self.indexes.read().get(&name_lower).cloned()
+    }
+
+    /// Get all indexes for a table
+    pub fn get_indexes_for_table(&self, table_name: &str) -> Vec<Arc<Index>> {
+        let table_lower = table_name.to_lowercase();
+        self.indexes
+            .read()
+            .values()
+            .filter(|idx| idx.table_name.to_lowercase() == table_lower)
+            .cloned()
+            .collect()
+    }
+
+    /// Remove an index by name (case-insensitive)
+    pub fn drop_index(&self, name: &str) -> Result<()> {
+        let mut indexes = self.indexes.write();
+        let name_lower = name.to_lowercase();
+        if indexes.remove(&name_lower).is_none() {
+            return Err(Error::IndexNotFound(name.to_string()));
+        }
+        Ok(())
+    }
+
+    /// List all index names in this schema
+    pub fn list_indexes(&self) -> Vec<String> {
+        self.indexes.read().keys().cloned().collect()
     }
 }

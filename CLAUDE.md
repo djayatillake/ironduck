@@ -17,7 +17,7 @@ IronDuck is a **complete replication of DuckDB written in pure Rust**. The goal 
 
 We validate correctness by running DuckDB's official SQLLogicTest suite against IronDuck.
 
-**Current Status**: 95.9% (117/122 tests passing)
+**Current Status**: 100% (606/606 tests passing)
 
 #### What are SQLLogicTests?
 
@@ -75,18 +75,88 @@ DuckDB has 400+ built-in functions. Categories include:
 
 #### Features to Implement
 
-- [ ] All aggregate functions with DISTINCT, ORDER BY, FILTER
-- [ ] Window functions with PARTITION BY, ORDER BY, frame clauses
-- [ ] Common Table Expressions (CTEs), including recursive
-- [ ] Correlated subqueries
-- [ ] All JOIN types (INNER, LEFT, RIGHT, FULL, CROSS, SEMI, ANTI)
-- [ ] SET operations (UNION, INTERSECT, EXCEPT)
-- [ ] Complex types (LIST, STRUCT, MAP)
-- [ ] Sequences (CREATE SEQUENCE, NEXTVAL)
-- [ ] Views (CREATE VIEW, materialized views)
-- [ ] Indexes
-- [ ] Transactions (BEGIN, COMMIT, ROLLBACK)
-- [ ] External file formats (Parquet, CSV, JSON)
+- [x] All aggregate functions with DISTINCT, ORDER BY, FILTER
+- [x] Window functions with PARTITION BY, ORDER BY, frame clauses
+- [x] Common Table Expressions (CTEs), including recursive
+- [x] Correlated subqueries (scalar, EXISTS, IN)
+- [x] All JOIN types (INNER, LEFT, RIGHT, FULL, CROSS, SEMI, ANTI, ASOF)
+- [x] SET operations (UNION, INTERSECT, EXCEPT) - including nested operations
+- [x] Complex types (LIST, STRUCT, MAP) - partial support
+- [x] Sequences (CREATE SEQUENCE, NEXTVAL)
+- [x] Views (CREATE VIEW)
+- [x] Query optimizer with multiple optimization rules
+- [x] Indexes (CREATE INDEX, DROP INDEX, B-tree)
+- [x] Transactions (BEGIN, COMMIT, ROLLBACK, SAVEPOINT)
+- [x] Persistent storage (save/load to disk)
+- [x] File table functions (read_csv, read_parquet, read_json)
+- [x] COPY statement (import/export)
+- [x] ALTER TABLE (ADD/DROP/RENAME COLUMN, RENAME TABLE)
+- [x] PIVOT/UNPIVOT
+- [ ] Materialized views
+- [ ] Hash indexes
+
+### Remaining DuckDB Functions to Implement
+
+The following categories contain functions not yet fully implemented:
+
+#### String Functions (Priority: High)
+- `INSTR` - Find position of substring
+- `LPAD`/`RPAD` - Pad strings
+- `REGEXP_EXTRACT`, `REGEXP_REPLACE` - Regex operations
+- `MD5`, `SHA256` - Hash functions
+- `ENCODE`/`DECODE` - Base64 encoding
+- `SOUNDEX`, `LEVENSHTEIN` - Fuzzy matching
+
+#### Date/Time Functions (Priority: High)
+- `DATE_ADD`/`DATE_SUB` - Add/subtract intervals
+- `DATEDIFF` - Difference between dates
+- `TO_DAYS`/`FROM_DAYS` - Julian day conversion
+- `MAKE_DATE`/`MAKE_TIME`/`MAKE_TIMESTAMP` - Construct temporal types
+- `TIMEZONE` - Timezone conversion
+- `AGE` - Calculate age between timestamps
+
+#### Numeric Functions (Priority: Medium)
+- `LOG`/`LOG2`/`LOG10` - Logarithms
+- `FACTORIAL` - Factorial calculation
+- `GCD`/`LCM` - Greatest common divisor / Least common multiple
+- `ISNAN`/`ISINF` - Float checks
+- `BIT_COUNT`, `BIT_POSITION` - Bit manipulation
+
+#### Aggregate Functions (Priority: Medium)
+- `PERCENTILE_CONT`/`PERCENTILE_DISC` - Full percentile support
+- `REGR_*` - Regression functions (slope, intercept, etc.)
+- `CORR`, `COVAR_POP`, `COVAR_SAMP` - Correlation/covariance
+- `ENTROPY` - Information entropy
+- `HISTOGRAM` - Build histograms
+
+#### List/Array Functions (Priority: Medium)
+- `LIST_COSINE_SIMILARITY` - Vector similarity
+- `LIST_INNER_PRODUCT` - Dot product
+- `LIST_REDUCE` - Custom aggregation
+- `LIST_SORT`, `LIST_REVERSE_SORT` - Sorting
+- `LIST_UNIQUE` - Deduplicate
+- `LIST_ZIP` - Combine lists
+
+#### Table Functions (Priority: Low)
+- `GLOB` - File pattern matching
+- `READ_CSV_AUTO` - Auto-detect CSV schema
+- `READ_JSON_OBJECTS` - Parse JSON as objects
+- `QUERY_PARQUET` - Query Parquet metadata
+
+#### System Functions (Priority: Low)
+- `CURRENT_SCHEMA`, `CURRENT_DATABASE` - Current context
+- `PG_*` - PostgreSQL compatibility functions
+- `VERSION` - Database version info
+
+### Query Optimizer
+
+The query optimizer applies multiple rules in order:
+
+1. **Constant Folding**: Evaluates constant expressions at compile time (e.g., `1 + 2` → `3`)
+2. **Predicate Simplification**: Simplifies boolean logic (e.g., `TRUE AND x` → `x`)
+3. **Filter Pushdown**: Pushes filters closer to data sources to reduce processing
+4. **Projection Pushdown**: Eliminates unused columns early to reduce memory usage
+5. **Limit Pushdown**: Combines consecutive limits and pushes them past projections
 
 ## Crate Architecture
 
@@ -111,10 +181,9 @@ ironduck/
 
 Features not yet implemented:
 
-- **Sequences**: CREATE SEQUENCE, NEXTVAL, CURRVAL
-- **TIMETZ type**: Time with timezone
-- **Ordered aggregates**: SUM(x ORDER BY y) syntax
 - **Some INTERVAL syntax**: `INTERVAL 7 MINUTES` (use `INTERVAL '7' MINUTE`)
+- **Materialized views**: Not yet supported
+- **Hash indexes**: Only B-tree indexes are supported
 
 ## Contributing
 

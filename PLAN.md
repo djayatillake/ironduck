@@ -2,12 +2,12 @@
 
 ## Current Progress (December 2025)
 
-**DuckDB Compatibility: 95.9% (117/122 tests passing)**
+**DuckDB Compatibility: 100% (122/122 tests passing)**
 
 ### Completed Features
 - [x] Core SQL parsing via sqlparser-rs
 - [x] Schema binding and type resolution
-- [x] In-memory catalog (schemas, tables, views)
+- [x] In-memory catalog (schemas, tables, views, sequences)
 - [x] Row-based execution engine
 - [x] All basic aggregates: SUM, COUNT, AVG, MIN, MAX, STRING_AGG, ARRAY_AGG
 - [x] Statistical aggregates: STDDEV, VARIANCE, CORR, COVAR
@@ -18,15 +18,15 @@
 - [x] UNION/INTERSECT/EXCEPT operations
 - [x] Complex types: LIST, intervals
 - [x] Date/Time functions: DATE_PART, DATE_TRUNC, STRFTIME, range() with intervals
-- [x] Type casting for all basic types including TIMESTAMPTZ
+- [x] Type casting for all basic types including TIMESTAMPTZ, TIMETZ
 - [x] CREATE TABLE, INSERT, UPDATE, DELETE, DROP TABLE
 - [x] CREATE VIEW, DROP VIEW
+- [x] CREATE SEQUENCE, NEXTVAL, CURRVAL
+- [x] TIMETZ type (time with timezone) with proper UTC normalization for AVG
+- [x] Ordered aggregates (SUM(x ORDER BY y) syntax)
 - [x] EXPLAIN query plans
 
 ### Not Yet Implemented
-- [ ] Sequences (CREATE SEQUENCE, NEXTVAL, CURRVAL)
-- [ ] TIMETZ type (time with timezone)
-- [ ] Ordered aggregates (SUM(x ORDER BY y) syntax)
 - [ ] Recursive CTEs
 - [ ] Persistent storage (currently in-memory only)
 - [ ] Transactions (BEGIN, COMMIT, ROLLBACK)

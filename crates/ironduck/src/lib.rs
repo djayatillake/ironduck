@@ -22,6 +22,7 @@
 pub use ironduck_catalog as catalog;
 pub use ironduck_common as common;
 pub use ironduck_execution as execution;
+pub use ironduck_optimizer as optimizer;
 pub use ironduck_parser as parser;
 pub use ironduck_planner as planner;
 pub use ironduck_storage as storage;
@@ -31,11 +32,20 @@ use ironduck_binder::Binder;
 use ironduck_catalog::Catalog;
 use ironduck_common::{Error, Result, Value};
 use ironduck_execution::Executor;
+use ironduck_storage::{
+    database_exists, load_metadata, load_table_data, save_metadata, save_table_data,
+    ColumnMetadata, DatabaseMetadata, IndexMetadata, IndexStorage, SchemaMetadata,
+    SequenceMetadata, TableMetadata, TableStorage, ViewMetadata, STORAGE_VERSION,
+    PersistedTableData,
+};
+use std::path::Path;
 use std::sync::Arc;
 
 /// The main database instance
 pub struct Database {
     catalog: Arc<Catalog>,
+    storage: Arc<TableStorage>,
+    index_storage: Arc<IndexStorage>,
     executor: Executor,
 }
 
@@ -43,9 +53,249 @@ impl Database {
     /// Create a new in-memory database
     pub fn new() -> Self {
         let catalog = Arc::new(Catalog::new());
-        let executor = Executor::new(catalog.clone());
+        let storage = Arc::new(TableStorage::new());
+        let index_storage = Arc::new(IndexStorage::new());
+        let executor = Executor::with_storage_and_indexes(
+            catalog.clone(),
+            storage.clone(),
+            index_storage.clone(),
+        );
 
-        Database { catalog, executor }
+        Database {
+            catalog,
+            storage,
+            index_storage,
+            executor,
+        }
+    }
+
+    /// Open a database from a directory, or create a new one if it doesn't exist
+    pub fn open(path: &Path) -> Result<Self> {
+        if database_exists(path) {
+            Self::load(path)
+        } else {
+            Ok(Self::new())
+        }
+    }
+
+    /// Load a database from a directory
+    pub fn load(path: &Path) -> Result<Self> {
+        let metadata = load_metadata(path)
+            .map_err(|e| Error::Internal(format!("Failed to load database: {}", e)))?;
+
+        let catalog = Arc::new(Catalog::new());
+        let storage = Arc::new(TableStorage::new());
+        let index_storage = Arc::new(IndexStorage::new());
+
+        // Restore schemas, tables, views, sequences, and indexes
+        for schema_meta in &metadata.schemas {
+            if schema_meta.name != "main" {
+                catalog.create_schema(&schema_meta.name)?;
+            }
+
+            // Restore tables
+            for table_meta in &schema_meta.tables {
+                let columns: Vec<(String, ironduck_common::LogicalType)> = table_meta
+                    .columns
+                    .iter()
+                    .map(|c| (c.name.clone(), c.logical_type.clone()))
+                    .collect();
+                let defaults: Vec<Option<Value>> = table_meta
+                    .columns
+                    .iter()
+                    .map(|c| c.default_value.clone())
+                    .collect();
+                catalog.create_table_with_defaults(
+                    &schema_meta.name,
+                    &table_meta.name,
+                    columns,
+                    defaults,
+                )?;
+
+                // Load table data
+                if let Ok(data) = load_table_data(path, &schema_meta.name, &table_meta.name) {
+                    let column_types: Vec<_> = table_meta.columns.iter().map(|c| c.logical_type.clone()).collect();
+                    let table_storage = storage.get_or_create(&schema_meta.name, &table_meta.name, &column_types);
+                    for row in data.rows {
+                        table_storage.insert(row);
+                    }
+                }
+            }
+
+            // Restore views
+            for view_meta in &schema_meta.views {
+                catalog.create_view(
+                    &schema_meta.name,
+                    &view_meta.name,
+                    view_meta.sql.clone(),
+                    view_meta.column_names.clone(),
+                    false,
+                )?;
+            }
+
+            // Restore sequences
+            for seq_meta in &schema_meta.sequences {
+                catalog.create_sequence(
+                    &schema_meta.name,
+                    &seq_meta.name,
+                    seq_meta.current_value,
+                    seq_meta.increment,
+                    seq_meta.min_value,
+                    seq_meta.max_value,
+                    seq_meta.cycle,
+                )?;
+            }
+
+            // Restore indexes
+            for idx_meta in &schema_meta.indexes {
+                // Get column types from table
+                if let Some(table) = catalog.get_table(&schema_meta.name, &idx_meta.table_name) {
+                    let column_types: Vec<_> = idx_meta
+                        .columns
+                        .iter()
+                        .filter_map(|col| {
+                            table.columns.iter().find(|c| c.name == *col).map(|c| c.logical_type.clone())
+                        })
+                        .collect();
+
+                    catalog.create_index(
+                        &schema_meta.name,
+                        &idx_meta.name,
+                        &idx_meta.table_name,
+                        idx_meta.columns.clone(),
+                        column_types,
+                        ironduck_catalog::IndexType::BTree,
+                        idx_meta.unique,
+                    )?;
+
+                    // Create and populate B-tree index
+                    let btree = index_storage.create_index(&schema_meta.name, &idx_meta.name, idx_meta.unique);
+                    if let Some(table_data) = storage.get(&schema_meta.name, &idx_meta.table_name) {
+                        let column_indices: Vec<usize> = idx_meta
+                            .columns
+                            .iter()
+                            .filter_map(|col| table.get_column_index(col))
+                            .collect();
+                        let rows = table_data.scan();
+                        let _ = btree.rebuild(&column_indices, &rows);
+                    }
+                }
+            }
+        }
+
+        let executor = Executor::with_storage_and_indexes(
+            catalog.clone(),
+            storage.clone(),
+            index_storage.clone(),
+        );
+
+        Ok(Database {
+            catalog,
+            storage,
+            index_storage,
+            executor,
+        })
+    }
+
+    /// Save the database to a directory
+    pub fn save(&self, path: &Path) -> Result<()> {
+        let mut schemas = Vec::new();
+
+        for schema_name in self.catalog.list_schemas() {
+            let schema = self.catalog.get_schema(&schema_name).unwrap();
+
+            // Collect table metadata
+            let mut tables = Vec::new();
+            for table_name in schema.list_tables() {
+                if let Some(table) = schema.get_table(&table_name) {
+                    let columns: Vec<ColumnMetadata> = table
+                        .columns
+                        .iter()
+                        .map(|c| ColumnMetadata {
+                            name: c.name.clone(),
+                            logical_type: c.logical_type.clone(),
+                            nullable: c.nullable,
+                            default_value: c.default_value.clone(),
+                        })
+                        .collect();
+
+                    tables.push(TableMetadata {
+                        name: table_name.clone(),
+                        columns,
+                    });
+
+                    // Save table data
+                    if let Some(table_data) = self.storage.get(&schema_name, &table_name) {
+                        let rows = table_data.scan();
+                        let col_names: Vec<String> = table.columns.iter().map(|c| c.name.clone()).collect();
+                        let persisted = PersistedTableData {
+                            columns: col_names,
+                            rows,
+                        };
+                        save_table_data(path, &schema_name, &table_name, &persisted)
+                            .map_err(|e| Error::Internal(format!("Failed to save table data: {}", e)))?;
+                    }
+                }
+            }
+
+            // Collect view metadata
+            let mut views = Vec::new();
+            for view_name in schema.list_views() {
+                if let Some(view) = schema.get_view(&view_name) {
+                    views.push(ViewMetadata {
+                        name: view_name,
+                        sql: view.sql.clone(),
+                        column_names: view.column_names.clone(),
+                    });
+                }
+            }
+
+            // Collect sequence metadata
+            let mut sequences = Vec::new();
+            for seq_name in schema.list_sequences() {
+                if let Some(seq) = schema.get_sequence(&seq_name) {
+                    sequences.push(SequenceMetadata {
+                        name: seq_name,
+                        current_value: seq.currval(),
+                        increment: seq.increment,
+                        min_value: seq.min_value,
+                        max_value: seq.max_value,
+                        cycle: seq.cycle,
+                    });
+                }
+            }
+
+            // Collect index metadata
+            let mut indexes = Vec::new();
+            for idx_name in schema.list_indexes() {
+                if let Some(idx) = schema.get_index(&idx_name) {
+                    indexes.push(IndexMetadata {
+                        name: idx_name,
+                        table_name: idx.table_name.clone(),
+                        columns: idx.columns.clone(),
+                        unique: idx.unique,
+                    });
+                }
+            }
+
+            schemas.push(SchemaMetadata {
+                name: schema_name,
+                tables,
+                views,
+                sequences,
+                indexes,
+            });
+        }
+
+        let metadata = DatabaseMetadata {
+            version: STORAGE_VERSION,
+            schemas,
+        };
+
+        save_metadata(path, &metadata)
+            .map_err(|e| Error::Internal(format!("Failed to save metadata: {}", e)))?;
+
+        Ok(())
     }
 
     /// Execute a SQL query
@@ -67,6 +317,9 @@ impl Database {
         // Plan
         let plan = planner::create_logical_plan(&bound)?;
 
+        // Optimize
+        let plan = optimizer::optimize(plan)?;
+
         // Execute
         let exec_result = self.executor.execute(&plan)?;
 
@@ -85,6 +338,7 @@ impl Database {
             let binder = Binder::new(self.catalog.clone());
             let bound = binder.bind(statement)?;
             let plan = planner::create_logical_plan(&bound)?;
+            let plan = optimizer::optimize(plan)?;
             let exec_result = self.executor.execute(&plan)?;
 
             results.push(QueryResult {

@@ -34,6 +34,18 @@ pub enum Error {
     #[error("Schema already exists: {0}")]
     SchemaAlreadyExists(String),
 
+    #[error("Sequence not found: {0}")]
+    SequenceNotFound(String),
+
+    #[error("Sequence already exists: {0}")]
+    SequenceAlreadyExists(String),
+
+    #[error("Index not found: {0}")]
+    IndexNotFound(String),
+
+    #[error("Index already exists: {0}")]
+    IndexAlreadyExists(String),
+
     // Binder errors
     #[error("Ambiguous column reference: {0}")]
     AmbiguousColumn(String),

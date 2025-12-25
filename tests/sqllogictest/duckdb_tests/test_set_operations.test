@@ -1,0 +1,260 @@
+# SET operation tests (UNION, INTERSECT, EXCEPT)
+
+# Setup
+statement ok
+CREATE TABLE set_a (id INTEGER, name TEXT);
+
+statement ok
+INSERT INTO set_a VALUES (1, 'Alice'), (2, 'Bob'), (3, 'Charlie');
+
+statement ok
+CREATE TABLE set_b (id INTEGER, name TEXT);
+
+statement ok
+INSERT INTO set_b VALUES (2, 'Bob'), (3, 'Charlie'), (4, 'Diana');
+
+# UNION (removes duplicates)
+query IT
+SELECT * FROM set_a UNION SELECT * FROM set_b ORDER BY id;
+----
+1
+Alice
+2
+Bob
+3
+Charlie
+4
+Diana
+
+# UNION ALL (keeps duplicates)
+query IT
+SELECT * FROM set_a UNION ALL SELECT * FROM set_b ORDER BY id, name;
+----
+1
+Alice
+2
+Bob
+2
+Bob
+3
+Charlie
+3
+Charlie
+4
+Diana
+
+# INTERSECT (common rows)
+query IT
+SELECT * FROM set_a INTERSECT SELECT * FROM set_b ORDER BY id;
+----
+2
+Bob
+3
+Charlie
+
+# EXCEPT (rows in first but not second)
+query IT
+SELECT * FROM set_a EXCEPT SELECT * FROM set_b ORDER BY id;
+----
+1
+Alice
+
+# EXCEPT reverse direction
+query IT
+SELECT * FROM set_b EXCEPT SELECT * FROM set_a ORDER BY id;
+----
+4
+Diana
+
+# UNION with single column
+query I
+SELECT id FROM set_a UNION SELECT id FROM set_b ORDER BY id;
+----
+1
+2
+3
+4
+
+# UNION with literals
+query I
+SELECT 1 UNION SELECT 2 UNION SELECT 3 ORDER BY 1;
+----
+1
+2
+3
+
+# UNION ALL with literals
+query I
+SELECT 1 UNION ALL SELECT 1 UNION ALL SELECT 2 ORDER BY 1;
+----
+1
+1
+2
+
+# UNION with different column names (uses first query's names)
+query IT
+SELECT id as num, name as label FROM set_a
+UNION
+SELECT id, name FROM set_b
+ORDER BY 1;
+----
+1
+Alice
+2
+Bob
+3
+Charlie
+4
+Diana
+
+# UNION with expressions
+query I
+SELECT id * 2 FROM set_a UNION SELECT id * 2 FROM set_b ORDER BY 1;
+----
+2
+4
+6
+8
+
+# UNION with WHERE clause
+query IT
+SELECT * FROM set_a WHERE id > 1
+UNION
+SELECT * FROM set_b WHERE id < 4
+ORDER BY id;
+----
+2
+Bob
+3
+Charlie
+
+# INTERSECT with WHERE
+query IT
+SELECT * FROM set_a WHERE id >= 2
+INTERSECT
+SELECT * FROM set_b WHERE id <= 3
+ORDER BY id;
+----
+2
+Bob
+3
+Charlie
+
+# Multiple UNIONs
+query I
+SELECT 1 as n
+UNION
+SELECT 2
+UNION
+SELECT 3
+ORDER BY 1;
+----
+1
+2
+3
+
+# UNION with aggregate
+query I
+SELECT COUNT(*) FROM set_a
+UNION
+SELECT COUNT(*) FROM set_b
+ORDER BY 1;
+----
+3
+
+# Nested set operations with parentheses
+query I
+(SELECT id FROM set_a UNION SELECT id FROM set_b)
+INTERSECT
+(SELECT id FROM set_a)
+ORDER BY 1;
+----
+1
+2
+3
+
+# EXCEPT ALL (if supported, keeps duplicates)
+statement ok
+CREATE TABLE dup_a (val INTEGER);
+
+statement ok
+INSERT INTO dup_a VALUES (1), (1), (2), (3);
+
+statement ok
+CREATE TABLE dup_b (val INTEGER);
+
+statement ok
+INSERT INTO dup_b VALUES (1), (2), (2);
+
+# UNION with NULL values
+statement ok
+CREATE TABLE null_set (id INTEGER, name TEXT);
+
+statement ok
+INSERT INTO null_set VALUES (1, NULL), (NULL, 'test');
+
+query IT
+SELECT * FROM null_set
+UNION
+SELECT * FROM set_a
+ORDER BY id, name;
+----
+1
+Alice
+1
+NULL
+2
+Bob
+3
+Charlie
+NULL
+test
+
+# INTERSECT with empty result
+query IT
+SELECT * FROM set_a WHERE id > 100
+INTERSECT
+SELECT * FROM set_b
+ORDER BY id;
+----
+
+# UNION with subquery
+query I
+SELECT id FROM (SELECT * FROM set_a UNION SELECT * FROM set_b) sub ORDER BY id;
+----
+1
+2
+3
+4
+
+# UNION with ORDER BY and LIMIT
+query IT
+SELECT * FROM set_a
+UNION
+SELECT * FROM set_b
+ORDER BY id DESC
+LIMIT 2;
+----
+4
+Diana
+3
+Charlie
+
+# INTERSECT between derived tables
+query I
+SELECT id FROM (SELECT id FROM set_a WHERE id >= 2) a
+INTERSECT
+SELECT id FROM (SELECT id FROM set_b WHERE id <= 3) b
+ORDER BY id;
+----
+2
+3
+
+# Simple EXCEPT
+query I
+SELECT id FROM set_a
+EXCEPT
+SELECT id FROM set_b
+ORDER BY id;
+----
+1

@@ -3,14 +3,68 @@
 use crate::expression::{evaluate, evaluate_with_ctx, EvalContext};
 use ironduck_catalog::Catalog;
 use ironduck_common::{Error, LogicalType, Result, Value};
-use ironduck_planner::{Expression, LogicalOperator, LogicalPlan, TableFunctionKind, WindowFunction};
-use ironduck_storage::TableStorage;
+use ironduck_planner::{Expression, LogicalOperator, LogicalPlan, TableFunctionKind, TransactionOp, WindowFrame, WindowFrameBound, WindowFunction};
+use ironduck_storage::{IndexKey, IndexStorage, TableStorage};
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::sync::Arc;
+
+// Thread-local catalog reference for expression evaluation in functions like compute_aggregate
+thread_local! {
+    static CURRENT_CATALOG: RefCell<Option<Arc<Catalog>>> = const { RefCell::new(None) };
+    static OUTER_ROW: RefCell<Option<Vec<Value>>> = const { RefCell::new(None) };
+}
+
+/// Set the catalog for the current thread during execution
+fn with_catalog<T>(catalog: Arc<Catalog>, f: impl FnOnce() -> T) -> T {
+    CURRENT_CATALOG.with(|c| {
+        let old = c.borrow_mut().replace(catalog);
+        let result = f();
+        *c.borrow_mut() = old;
+        result
+    })
+}
+
+/// Get the current thread's catalog (for expression evaluation)
+fn current_catalog() -> Option<Arc<Catalog>> {
+    CURRENT_CATALOG.with(|c| c.borrow().clone())
+}
+
+/// Set the outer row for the current thread during correlated subquery execution
+fn with_outer_row<T>(outer_row: Vec<Value>, f: impl FnOnce() -> T) -> T {
+    OUTER_ROW.with(|r| {
+        let old = r.borrow_mut().replace(outer_row);
+        let result = f();
+        *r.borrow_mut() = old;
+        result
+    })
+}
+
+/// Get the current thread's outer row (for correlated subqueries)
+fn current_outer_row() -> Option<Vec<Value>> {
+    OUTER_ROW.with(|r| r.borrow().clone())
+}
+
+/// Evaluate expression using the thread-local catalog and outer row if available
+fn eval_with_catalog(expr: &Expression, row: &[Value]) -> Result<Value> {
+    let mut ctx = EvalContext::new();
+    if let Some(catalog) = current_catalog() {
+        ctx = EvalContext::with_catalog(catalog);
+    }
+    if let Some(outer_row) = current_outer_row() {
+        ctx = ctx.with_outer_row(outer_row);
+    }
+    evaluate_with_ctx(expr, row, &ctx)
+}
 
 /// The main query executor
 pub struct Executor {
     catalog: Arc<Catalog>,
     storage: Arc<TableStorage>,
+    index_storage: Arc<IndexStorage>,
+    /// Working tables for recursive CTE execution
+    /// Maps CTE name to the current iteration's rows
+    recursive_working_tables: RefCell<HashMap<String, Vec<Vec<Value>>>>,
 }
 
 impl Executor {
@@ -18,12 +72,33 @@ impl Executor {
         Executor {
             catalog,
             storage: Arc::new(TableStorage::new()),
+            index_storage: Arc::new(IndexStorage::new()),
+            recursive_working_tables: RefCell::new(HashMap::new()),
         }
     }
 
     /// Create executor with shared storage
     pub fn with_storage(catalog: Arc<Catalog>, storage: Arc<TableStorage>) -> Self {
-        Executor { catalog, storage }
+        Executor {
+            catalog,
+            storage,
+            index_storage: Arc::new(IndexStorage::new()),
+            recursive_working_tables: RefCell::new(HashMap::new()),
+        }
+    }
+
+    /// Create executor with shared storage and index storage
+    pub fn with_storage_and_indexes(
+        catalog: Arc<Catalog>,
+        storage: Arc<TableStorage>,
+        index_storage: Arc<IndexStorage>,
+    ) -> Self {
+        Executor {
+            catalog,
+            storage,
+            index_storage,
+            recursive_working_tables: RefCell::new(HashMap::new()),
+        }
     }
 
     /// Get storage reference
@@ -31,9 +106,94 @@ impl Executor {
         &self.storage
     }
 
+    /// Get evaluation context with catalog access
+    fn eval_ctx(&self) -> EvalContext {
+        EvalContext::with_catalog(self.catalog.clone())
+    }
+
+    /// Evaluate expression with catalog access (for NEXTVAL, etc.)
+    fn eval(&self, expr: &Expression, row: &[Value]) -> Result<Value> {
+        evaluate_with_ctx(expr, row, &self.eval_ctx())
+    }
+
+    /// Execute a LATERAL join - the right side is re-executed for each left row
+    /// with the left row available as outer context for OuterColumnRef expressions
+    fn execute_lateral_join(
+        &self,
+        _left: &LogicalOperator,
+        right: &LogicalOperator,
+        join_type: &ironduck_planner::JoinType,
+        condition: &Option<Expression>,
+        left_rows: &[Vec<Value>],
+    ) -> Result<Vec<Vec<Value>>> {
+        let mut result = Vec::new();
+        let right_width = right.output_types().len();
+
+        for left_row in left_rows {
+            // Substitute OuterColumnRef in the right plan with values from left_row
+            let substituted_right = substitute_outer_refs(right, left_row);
+
+            // Execute the modified right plan
+            let right_rows = self.execute_operator(&substituted_right)?;
+
+            // Combine results based on join type
+            match join_type {
+                ironduck_planner::JoinType::Cross | ironduck_planner::JoinType::Inner => {
+                    for r in &right_rows {
+                        let mut row = left_row.clone();
+                        row.extend(r.clone());
+
+                        let matches = match condition {
+                            Some(cond) => matches!(evaluate(cond, &row)?, Value::Boolean(true)),
+                            None => true,
+                        };
+
+                        if matches {
+                            result.push(row);
+                        }
+                    }
+                }
+                ironduck_planner::JoinType::Left => {
+                    let mut matched = false;
+                    for r in &right_rows {
+                        let mut row = left_row.clone();
+                        row.extend(r.clone());
+
+                        let matches = match condition {
+                            Some(cond) => matches!(evaluate(cond, &row)?, Value::Boolean(true)),
+                            None => true,
+                        };
+
+                        if matches {
+                            result.push(row);
+                            matched = true;
+                        }
+                    }
+                    if !matched {
+                        let mut row = left_row.clone();
+                        row.extend(vec![Value::Null; right_width]);
+                        result.push(row);
+                    }
+                }
+                _ => {
+                    // For other join types, fall back to cross product behavior
+                    for r in &right_rows {
+                        let mut row = left_row.clone();
+                        row.extend(r.clone());
+                        result.push(row);
+                    }
+                }
+            }
+        }
+
+        Ok(result)
+    }
+
     /// Execute a logical plan and return results
     pub fn execute(&self, plan: &LogicalPlan) -> Result<QueryResult> {
-        let rows = self.execute_operator(&plan.root)?;
+        // Set the catalog for the current thread so aggregate functions can access it
+        let catalog = self.catalog.clone();
+        let rows = with_catalog(catalog, || self.execute_operator(&plan.root))?;
 
         Ok(QueryResult {
             columns: plan.output_names.clone(),
@@ -84,21 +244,28 @@ impl Executor {
                             let ctx = EvalContext::with_row_index(row_idx as i64);
                             evaluate_with_ctx(expr, row, &ctx)?
                         } else {
-                            evaluate(expr, row)?
+                            // Use eval_with_catalog to support outer column references in correlated subqueries
+                            eval_with_catalog(expr, row)?
                         };
                         output_row.push(value);
                     }
                     output_rows.push(output_row);
                 }
 
-                // Handle case of no input rows but constant expressions
-                if input_rows.is_empty() && expressions.iter().all(is_constant) {
+                // Handle case of DummyScan with constant expressions (SELECT 1)
+                // Note: We only do this for DummyScan, not for empty results from Filter
+                // because SELECT 1 WHERE FALSE should return no rows
+                if input_rows.is_empty()
+                    && expressions.iter().all(is_constant)
+                    && matches!(input.as_ref(), LogicalOperator::DummyScan)
+                {
                     let mut output_row = Vec::new();
                     for expr in expressions {
                         let value = if has_subquery {
                             evaluate_with_subqueries(self, expr, &[])?
                         } else {
-                            evaluate(expr, &[])?
+                            // Use eval_with_catalog to support outer column references in correlated subqueries
+                            eval_with_catalog(expr, &[])?
                         };
                         output_row.push(value);
                     }
@@ -121,7 +288,8 @@ impl Executor {
                         let ctx = EvalContext::with_row_index(row_idx as i64);
                         evaluate_with_ctx(predicate, &row, &ctx)?
                     } else {
-                        evaluate(predicate, &row)?
+                        // Use eval_with_catalog to support outer column references in correlated subqueries
+                        eval_with_catalog(predicate, &row)?
                     };
                     if matches!(result, Value::Boolean(true)) {
                         output_rows.push(row);
@@ -283,8 +451,16 @@ impl Executor {
                 right,
                 join_type,
                 condition,
+                is_lateral, asof_condition,
             } => {
                 let left_rows = self.execute_operator(left)?;
+
+                // For LATERAL joins, we need to re-execute the right side for each left row
+                // with the left row as outer context
+                if *is_lateral {
+                    return self.execute_lateral_join(left, right, join_type, condition, &left_rows);
+                }
+
                 let right_rows = self.execute_operator(right)?;
                 let mut result = Vec::new();
 
@@ -419,7 +595,111 @@ impl Executor {
                             }
                         }
                     }
-                    _ => return Err(Error::NotImplemented(format!("Join type: {:?}", join_type))),
+                    ironduck_planner::JoinType::Semi => {
+                        // SEMI JOIN - return left rows that have at least one match in right
+                        // Only returns columns from the left side
+                        for l in &left_rows {
+                            let mut has_match = false;
+                            for r in &right_rows {
+                                let mut combined = l.clone();
+                                combined.extend(r.clone());
+
+                                let matches = match condition {
+                                    Some(cond) => {
+                                        matches!(evaluate(cond, &combined)?, Value::Boolean(true))
+                                    }
+                                    None => true,
+                                };
+
+                                if matches {
+                                    has_match = true;
+                                    break; // Only need to find one match
+                                }
+                            }
+                            if has_match {
+                                result.push(l.clone()); // Only left side columns
+                            }
+                        }
+                    }
+                    ironduck_planner::JoinType::Anti => {
+                        // ANTI JOIN - return left rows that have NO match in right
+                        // Only returns columns from the left side
+                        for l in &left_rows {
+                            let mut has_match = false;
+                            for r in &right_rows {
+                                let mut combined = l.clone();
+                                combined.extend(r.clone());
+
+                                let matches = match condition {
+                                    Some(cond) => {
+                                        matches!(evaluate(cond, &combined)?, Value::Boolean(true))
+                                    }
+                                    None => true,
+                                };
+
+                                if matches {
+                                    has_match = true;
+                                    break;
+                                }
+                            }
+                            if !has_match {
+                                result.push(l.clone()); // Only left side columns
+                            }
+                        }
+                    }
+                    ironduck_planner::JoinType::AsOf => {
+                        // ASOF JOIN - for each left row, find the best matching right row
+                        // based on the match condition (typically time >= comparison)
+                        // The asof_condition contains the inequality (e.g., left.time >= right.time)
+                        // The regular condition contains equality requirements (e.g., left.symbol = right.symbol)
+
+                        for l in &left_rows {
+                            let mut best_match: Option<Vec<Value>> = None;
+
+                            for r in &right_rows {
+                                let mut combined = l.clone();
+                                combined.extend(r.clone());
+
+                                // First check the equality condition (if any)
+                                let eq_matches = match condition {
+                                    Some(cond) => {
+                                        matches!(evaluate(cond, &combined)?, Value::Boolean(true))
+                                    }
+                                    None => true,
+                                };
+
+                                if !eq_matches {
+                                    continue;
+                                }
+
+                                // Then check the ASOF inequality condition
+                                let asof_matches = match asof_condition {
+                                    Some(asof_cond) => {
+                                        matches!(evaluate(asof_cond, &combined)?, Value::Boolean(true))
+                                    }
+                                    None => true,
+                                };
+
+                                if asof_matches {
+                                    // For ASOF join, we want the "best" match
+                                    // The semantics is: find the row with the largest right.time that is <= left.time
+                                    // For now, we take the last matching row (assuming right is sorted)
+                                    best_match = Some(combined);
+                                }
+                            }
+
+                            // If we found a match, add it; otherwise add left + NULLs
+                            match best_match {
+                                Some(row) => result.push(row),
+                                None => {
+                                    // No match - treat like LEFT join, add NULLs
+                                    let mut row = l.clone();
+                                    row.extend(vec![Value::Null; right_width]);
+                                    result.push(row);
+                                }
+                            }
+                        }
+                    }
                 }
 
                 Ok(result)
@@ -441,6 +721,7 @@ impl Executor {
                 schema,
                 name,
                 columns,
+                default_values,
                 if_not_exists,
                 source,
             } => {
@@ -453,8 +734,16 @@ impl Executor {
                     }
                 }
 
-                // Create the table in catalog
-                self.catalog.create_table(schema, name, columns.clone())?;
+                // Evaluate default value expressions
+                let defaults: Vec<Option<Value>> = default_values
+                    .iter()
+                    .map(|opt_expr| {
+                        opt_expr.as_ref().map(|expr| evaluate(expr, &[]).unwrap_or(Value::Null))
+                    })
+                    .collect();
+
+                // Create the table in catalog with defaults
+                self.catalog.create_table_with_defaults(schema, name, columns.clone(), defaults)?;
 
                 // Create storage for the table
                 let types: Vec<_> = columns.iter().map(|(_, t)| t.clone()).collect();
@@ -501,10 +790,41 @@ impl Executor {
                 Ok(vec![vec![Value::Varchar(format!("Created view {}", name))]])
             }
 
+            LogicalOperator::CreateSequence {
+                schema,
+                name,
+                start,
+                increment,
+                min_value,
+                max_value,
+                cycle,
+                if_not_exists,
+            } => {
+                // Check if sequence exists
+                if self.catalog.get_sequence(schema, name).is_some() {
+                    if *if_not_exists {
+                        return Ok(vec![vec![Value::Varchar("Sequence already exists".to_string())]]);
+                    } else {
+                        return Err(Error::SequenceAlreadyExists(name.clone()));
+                    }
+                }
+
+                self.catalog.create_sequence(
+                    schema,
+                    name,
+                    *start,
+                    *increment,
+                    *min_value,
+                    *max_value,
+                    *cycle,
+                )?;
+                Ok(vec![vec![Value::Varchar(format!("Created sequence {}", name))]])
+            }
+
             LogicalOperator::Insert {
                 schema,
                 table,
-                columns,
+                columns: insert_columns,
                 values,
                 source,
             } => {
@@ -514,35 +834,88 @@ impl Executor {
                     .get_table(schema, table)
                     .ok_or_else(|| Error::TableNotFound(table.clone()))?;
 
-                // Get column types
+                // Get column types and defaults
                 let types: Vec<_> = table_info.columns.iter().map(|c| c.logical_type.clone()).collect();
+                let defaults: Vec<Option<Value>> = table_info.columns.iter().map(|c| c.default_value.clone()).collect();
+                let table_column_names: Vec<_> = table_info.columns.iter().map(|c| c.name.to_lowercase()).collect();
 
                 // Get or create storage
                 let table_data = self.storage.get_or_create(schema, table, &types);
 
                 let mut count = 0;
 
+                // Build column mapping if we have a partial column list
+                let column_indices: Option<Vec<usize>> = if !insert_columns.is_empty() {
+                    Some(insert_columns.iter().map(|col| {
+                        table_column_names.iter().position(|tc| tc == &col.to_lowercase())
+                            .unwrap_or(0) // fallback
+                    }).collect())
+                } else {
+                    None
+                };
+
                 // Handle INSERT ... SELECT ...
                 if let Some(source_op) = source {
                     let source_rows = self.execute_operator(source_op)?;
-                    for row in source_rows {
+                    for source_row in source_rows {
+                        let row = if let Some(indices) = &column_indices {
+                            // Partial column list - map values to correct positions
+                            let mut full_row = vec![Value::Null; types.len()];
+                            for (val_idx, &col_idx) in indices.iter().enumerate() {
+                                if val_idx < source_row.len() && col_idx < full_row.len() {
+                                    full_row[col_idx] = coerce_value(source_row[val_idx].clone(), &types[col_idx])?;
+                                }
+                            }
+                            // Fill in defaults for missing columns
+                            for (idx, val) in full_row.iter_mut().enumerate() {
+                                if *val == Value::Null {
+                                    if let Some(default) = &defaults[idx] {
+                                        *val = default.clone();
+                                    }
+                                }
+                            }
+                            full_row
+                        } else {
+                            source_row
+                        };
                         table_data.insert(row);
                         count += 1;
                     }
                 } else {
                     // Handle INSERT ... VALUES (...)
                     for row_exprs in values {
-                        let mut row = Vec::new();
-                        for (idx, expr) in row_exprs.iter().enumerate() {
-                            let val = evaluate(expr, &[])?;
-                            // Coerce to target column type
-                            let coerced = if idx < types.len() {
-                                coerce_value(val, &types[idx])?
-                            } else {
-                                val
-                            };
-                            row.push(coerced);
-                        }
+                        let row = if let Some(indices) = &column_indices {
+                            // Partial column list - map values to correct positions
+                            let mut full_row = vec![Value::Null; types.len()];
+                            for (val_idx, &col_idx) in indices.iter().enumerate() {
+                                if val_idx < row_exprs.len() && col_idx < full_row.len() {
+                                    let val = evaluate(&row_exprs[val_idx], &[])?;
+                                    full_row[col_idx] = coerce_value(val, &types[col_idx])?;
+                                }
+                            }
+                            // Fill in defaults for missing columns
+                            for (idx, val) in full_row.iter_mut().enumerate() {
+                                if *val == Value::Null {
+                                    if let Some(default) = &defaults[idx] {
+                                        *val = default.clone();
+                                    }
+                                }
+                            }
+                            full_row
+                        } else {
+                            // Full row - evaluate all expressions
+                            let mut row = Vec::new();
+                            for (idx, expr) in row_exprs.iter().enumerate() {
+                                let val = evaluate(expr, &[])?;
+                                let coerced = if idx < types.len() {
+                                    coerce_value(val, &types[idx])?
+                                } else {
+                                    val
+                                };
+                                row.push(coerced);
+                            }
+                            row
+                        };
                         table_data.insert(row);
                         count += 1;
                     }
@@ -564,10 +937,221 @@ impl Executor {
                         self.storage.drop_table(schema_name, name);
                         // TODO: Drop from catalog
                     }
+                    "Index" => {
+                        // Drop from index storage
+                        self.index_storage.drop_index(schema_name, name);
+                        // Drop from catalog
+                        if let Err(e) = self.catalog.drop_index(schema_name, name) {
+                            if !*if_exists {
+                                return Err(e);
+                            }
+                        }
+                    }
                     _ => {}
                 }
 
                 Ok(vec![vec![Value::Varchar(format!("Dropped {} {}", object_type, name))]])
+            }
+
+            LogicalOperator::AlterTable {
+                schema,
+                table_name,
+                operation,
+            } => {
+                use ironduck_planner::AlterTableOp;
+
+                // Get the table
+                let table_data = self
+                    .storage
+                    .get(schema, table_name)
+                    .ok_or_else(|| Error::TableNotFound(table_name.clone()))?;
+
+                match operation {
+                    AlterTableOp::AddColumn { name, data_type, nullable, default } => {
+                        // Add the column to storage
+                        let default_val = default.as_ref()
+                            .map(|e| evaluate(e, &[]))
+                            .transpose()?
+                            .unwrap_or(Value::Null);
+                        table_data.add_column(name, data_type.clone(), default_val.clone());
+
+                        // Update the catalog
+                        let col_name = name.clone();
+                        let col_type = data_type.clone();
+                        let col_nullable = *nullable;
+                        let col_default = default_val;
+                        self.catalog.alter_table(schema, table_name, |t| {
+                            let next_id = t.columns.len() as u32;
+                            let mut col = ironduck_catalog::Column::new(next_id, col_name, col_type);
+                            col.nullable = col_nullable;
+                            if col_default != Value::Null {
+                                col.default_value = Some(col_default);
+                            }
+                            t.add_column(col);
+                        })?;
+
+                        Ok(vec![vec![Value::Varchar(format!("Added column {} to {}", name, table_name))]])
+                    }
+                    AlterTableOp::DropColumn { column_name, if_exists } => {
+                        // Update storage
+                        let dropped = table_data.drop_column(column_name);
+
+                        if dropped {
+                            // Update the catalog
+                            let col_name = column_name.clone();
+                            self.catalog.alter_table(schema, table_name, |t| {
+                                t.drop_column(&col_name);
+                            })?;
+                            Ok(vec![vec![Value::Varchar(format!("Dropped column {} from {}", column_name, table_name))]])
+                        } else if *if_exists {
+                            Ok(vec![vec![Value::Varchar(format!("Column {} does not exist (skipped)", column_name))]])
+                        } else {
+                            Err(Error::ColumnNotFound(column_name.clone()))
+                        }
+                    }
+                    AlterTableOp::RenameColumn { old_name, new_name } => {
+                        if table_data.rename_column(old_name, new_name) {
+                            // Update the catalog
+                            let old = old_name.clone();
+                            let new = new_name.clone();
+                            self.catalog.alter_table(schema, table_name, |t| {
+                                t.rename_column(&old, &new);
+                            })?;
+                            Ok(vec![vec![Value::Varchar(format!("Renamed column {} to {}", old_name, new_name))]])
+                        } else {
+                            Err(Error::ColumnNotFound(old_name.clone()))
+                        }
+                    }
+                    AlterTableOp::RenameTable { new_name } => {
+                        // Update storage
+                        self.storage.rename_table(schema, table_name, new_name);
+                        // Update catalog
+                        self.catalog.rename_table(schema, table_name, new_name)?;
+                        Ok(vec![vec![Value::Varchar(format!("Renamed table {} to {}", table_name, new_name))]])
+                    }
+                    AlterTableOp::AlterColumnType { column_name, new_type } => {
+                        if table_data.alter_column_type(column_name, new_type.clone()) {
+                            // Update the catalog
+                            let col_name = column_name.clone();
+                            let col_type = new_type.clone();
+                            self.catalog.alter_table(schema, table_name, |t| {
+                                t.alter_column_type(&col_name, col_type);
+                            })?;
+                            Ok(vec![vec![Value::Varchar(format!("Changed column {} type to {:?}", column_name, new_type))]])
+                        } else {
+                            Err(Error::ColumnNotFound(column_name.clone()))
+                        }
+                    }
+                    AlterTableOp::SetColumnDefault { column_name, default } => {
+                        let msg = if default.is_some() {
+                            format!("Set default for column {}", column_name)
+                        } else {
+                            format!("Dropped default for column {}", column_name)
+                        };
+                        // Note: defaults are not enforced in current in-memory storage
+                        Ok(vec![vec![Value::Varchar(msg)]])
+                    }
+                    AlterTableOp::SetColumnNotNull { column_name, not_null } => {
+                        let msg = if *not_null {
+                            format!("Set NOT NULL for column {}", column_name)
+                        } else {
+                            format!("Dropped NOT NULL for column {}", column_name)
+                        };
+                        // Note: constraints are not enforced in current in-memory storage
+                        Ok(vec![vec![Value::Varchar(msg)]])
+                    }
+                }
+            }
+
+            LogicalOperator::Copy {
+                to,
+                source,
+                file_path,
+                format,
+                header,
+                delimiter,
+            } => {
+                use ironduck_planner::{CopyFormatKind, CopySourceKind};
+
+                if *to {
+                    // COPY TO - export data to file
+                    let rows = match source.as_ref() {
+                        CopySourceKind::Table { schema, name, columns, .. } => {
+                            // Read from table
+                            let table_data = self
+                                .storage
+                                .get(schema, name)
+                                .ok_or_else(|| Error::TableNotFound(name.clone()))?;
+                            let table_info = self
+                                .catalog
+                                .get_table(schema, name)
+                                .ok_or_else(|| Error::TableNotFound(name.clone()))?;
+
+                            let all_rows = table_data.scan();
+
+                            // If specific columns requested, filter them
+                            if columns.is_empty() {
+                                all_rows
+                            } else {
+                                let col_indices: Vec<usize> = columns.iter()
+                                    .filter_map(|c| table_info.columns.iter().position(|tc| tc.name.eq_ignore_ascii_case(c)))
+                                    .collect();
+                                all_rows.into_iter()
+                                    .map(|row| col_indices.iter().map(|&i| row.get(i).cloned().unwrap_or(Value::Null)).collect())
+                                    .collect()
+                            }
+                        }
+                        CopySourceKind::Query(plan) => {
+                            // Execute the query
+                            self.execute_operator(plan)?
+                        }
+                    };
+
+                    // Write to file
+                    let count = rows.len();
+                    match format {
+                        CopyFormatKind::Csv => {
+                            write_csv_file(file_path, &rows, *header, *delimiter)?;
+                        }
+                        CopyFormatKind::Parquet => {
+                            return Err(Error::NotImplemented("COPY TO PARQUET".to_string()));
+                        }
+                    }
+
+                    Ok(vec![vec![Value::BigInt(count as i64)]])
+                } else {
+                    // COPY FROM - import data from file
+                    match source.as_ref() {
+                        CopySourceKind::Table { schema, name, columns, .. } => {
+                            // Read from file
+                            let rows = match format {
+                                CopyFormatKind::Csv => {
+                                    read_csv_file(file_path, *header, *delimiter)?
+                                }
+                                CopyFormatKind::Parquet => {
+                                    read_parquet_file(file_path)?
+                                }
+                            };
+
+                            // Get table data
+                            let table_data = self
+                                .storage
+                                .get(schema, name)
+                                .ok_or_else(|| Error::TableNotFound(name.clone()))?;
+
+                            // Insert all rows
+                            let count = rows.len();
+                            for row in rows {
+                                table_data.insert(row);
+                            }
+
+                            Ok(vec![vec![Value::BigInt(count as i64)]])
+                        }
+                        CopySourceKind::Query(_) => {
+                            Err(Error::InvalidArguments("COPY FROM with query source".to_string()))
+                        }
+                    }
+                }
             }
 
             LogicalOperator::Delete {
@@ -1006,10 +1590,139 @@ impl Executor {
                                     }
                                 }
                             }
-                            _ => {
-                                // For unsupported window functions, return NULL
-                                for (orig_idx, _) in &partition {
-                                    window_results[win_idx][*orig_idx] = Value::Null;
+                            WindowFunction::Sum => {
+                                // SUM as window function
+                                // By default (no frame), compute cumulative sum up to current row
+                                let mut running_sum: Option<f64> = None;
+                                for (idx, (orig_idx, row)) in partition.iter().enumerate() {
+                                    let (start, end) = get_frame_bounds(&win_expr.frame, idx, partition.len());
+
+                                    // For no frame or ROWS UNBOUNDED PRECEDING TO CURRENT ROW
+                                    // we use cumulative sum for efficiency
+                                    if win_expr.frame.is_none() && start == 0 {
+                                        // Cumulative sum
+                                        if let Some(arg) = win_expr.args.first() {
+                                            let val = evaluate(arg, row).unwrap_or(Value::Null);
+                                            if !val.is_null() {
+                                                let num = val.as_f64().unwrap_or(0.0);
+                                                running_sum = Some(running_sum.unwrap_or(0.0) + num);
+                                            }
+                                        }
+                                        window_results[win_idx][*orig_idx] = running_sum.map_or(Value::Null, Value::Double);
+                                    } else {
+                                        // Frame-aware sum
+                                        let mut sum: Option<f64> = None;
+                                        for i in start..=end.min(partition.len() - 1) {
+                                            if let Some(arg) = win_expr.args.first() {
+                                                let val = evaluate(arg, &partition[i].1).unwrap_or(Value::Null);
+                                                if !val.is_null() {
+                                                    let num = val.as_f64().unwrap_or(0.0);
+                                                    sum = Some(sum.unwrap_or(0.0) + num);
+                                                }
+                                            }
+                                        }
+                                        window_results[win_idx][*orig_idx] = sum.map_or(Value::Null, Value::Double);
+                                    }
+                                }
+                            }
+                            WindowFunction::Count => {
+                                // COUNT as window function
+                                for (idx, (orig_idx, row)) in partition.iter().enumerate() {
+                                    let (start, end) = get_frame_bounds(&win_expr.frame, idx, partition.len());
+
+                                    // Check if counting all (*) or specific expression
+                                    let count = if win_expr.args.is_empty() {
+                                        // COUNT(*) - count all rows in frame
+                                        (end.min(partition.len() - 1) - start + 1) as i64
+                                    } else {
+                                        // COUNT(expr) - count non-null values in frame
+                                        let mut cnt = 0i64;
+                                        for i in start..=end.min(partition.len() - 1) {
+                                            if let Some(arg) = win_expr.args.first() {
+                                                let val = evaluate(arg, &partition[i].1).unwrap_or(Value::Null);
+                                                if !val.is_null() {
+                                                    cnt += 1;
+                                                }
+                                            }
+                                        }
+                                        cnt
+                                    };
+                                    window_results[win_idx][*orig_idx] = Value::BigInt(count);
+                                }
+                            }
+                            WindowFunction::Avg => {
+                                // AVG as window function
+                                for (idx, (orig_idx, row)) in partition.iter().enumerate() {
+                                    let (start, end) = get_frame_bounds(&win_expr.frame, idx, partition.len());
+
+                                    let mut sum = 0.0;
+                                    let mut count = 0i64;
+                                    for i in start..=end.min(partition.len() - 1) {
+                                        if let Some(arg) = win_expr.args.first() {
+                                            let val = evaluate(arg, &partition[i].1).unwrap_or(Value::Null);
+                                            if !val.is_null() {
+                                                sum += val.as_f64().unwrap_or(0.0);
+                                                count += 1;
+                                            }
+                                        }
+                                    }
+                                    window_results[win_idx][*orig_idx] = if count > 0 {
+                                        Value::Double(sum / count as f64)
+                                    } else {
+                                        Value::Null
+                                    };
+                                }
+                            }
+                            WindowFunction::Min => {
+                                // MIN as window function
+                                for (idx, (orig_idx, row)) in partition.iter().enumerate() {
+                                    let (start, end) = get_frame_bounds(&win_expr.frame, idx, partition.len());
+
+                                    let mut min_val: Option<Value> = None;
+                                    for i in start..=end.min(partition.len() - 1) {
+                                        if let Some(arg) = win_expr.args.first() {
+                                            let val = evaluate(arg, &partition[i].1).unwrap_or(Value::Null);
+                                            if !val.is_null() {
+                                                min_val = Some(match &min_val {
+                                                    None => val,
+                                                    Some(current) => {
+                                                        if val.partial_cmp(current) == Some(std::cmp::Ordering::Less) {
+                                                            val
+                                                        } else {
+                                                            current.clone()
+                                                        }
+                                                    }
+                                                });
+                                            }
+                                        }
+                                    }
+                                    window_results[win_idx][*orig_idx] = min_val.unwrap_or(Value::Null);
+                                }
+                            }
+                            WindowFunction::Max => {
+                                // MAX as window function
+                                for (idx, (orig_idx, row)) in partition.iter().enumerate() {
+                                    let (start, end) = get_frame_bounds(&win_expr.frame, idx, partition.len());
+
+                                    let mut max_val: Option<Value> = None;
+                                    for i in start..=end.min(partition.len() - 1) {
+                                        if let Some(arg) = win_expr.args.first() {
+                                            let val = evaluate(arg, &partition[i].1).unwrap_or(Value::Null);
+                                            if !val.is_null() {
+                                                max_val = Some(match &max_val {
+                                                    None => val,
+                                                    Some(current) => {
+                                                        if val.partial_cmp(current) == Some(std::cmp::Ordering::Greater) {
+                                                            val
+                                                        } else {
+                                                            current.clone()
+                                                        }
+                                                    }
+                                                });
+                                            }
+                                        }
+                                    }
+                                    window_results[win_idx][*orig_idx] = max_val.unwrap_or(Value::Null);
                                 }
                             }
                         }
@@ -1033,6 +1746,141 @@ impl Executor {
                 // Format the query plan as a string
                 let plan_str = format_plan(input, 0);
                 Ok(vec![vec![Value::Varchar(plan_str)]])
+            }
+
+            LogicalOperator::RecursiveCTE {
+                name,
+                base_case,
+                recursive_case,
+                output_names: _,
+                output_types: _,
+                union_all,
+            } => {
+                // Execute the recursive CTE using iterative fixpoint computation
+                // 1. Execute the base case (anchor)
+                let base_result = self.execute_operator(base_case)?;
+
+                // Initialize accumulator with base case results
+                let mut result = base_result.clone();
+
+                // The working table starts with the base case results
+                // This is what RecursiveCTEScan will read from
+                let mut working_table = base_result;
+
+                // 2. Iteratively execute the recursive case until no new rows are produced
+                let max_iterations = 1000; // Prevent infinite loops
+                let mut iteration = 0;
+
+                loop {
+                    if iteration >= max_iterations {
+                        return Err(Error::Execution(
+                            "Recursive CTE exceeded maximum iteration limit (1000)".to_string()
+                        ));
+                    }
+                    iteration += 1;
+
+                    // Set the working table for this CTE so RecursiveCTEScan can access it
+                    self.recursive_working_tables
+                        .borrow_mut()
+                        .insert(name.clone(), working_table.clone());
+
+                    // Execute the recursive part - it will read from working_table via RecursiveCTEScan
+                    let new_rows = self.execute_operator(recursive_case)?;
+
+                    // Clear the working table entry after execution
+                    self.recursive_working_tables.borrow_mut().remove(name);
+
+                    if new_rows.is_empty() {
+                        break;
+                    }
+
+                    // Add new rows to result and update working table for next iteration
+                    if *union_all {
+                        // UNION ALL: append all rows, working table becomes new rows only
+                        result.extend(new_rows.clone());
+                        working_table = new_rows;
+                    } else {
+                        // UNION: deduplicate, working table becomes only truly new rows
+                        let mut truly_new = Vec::new();
+                        for row in new_rows {
+                            if !result.contains(&row) {
+                                result.push(row.clone());
+                                truly_new.push(row);
+                            }
+                        }
+                        if truly_new.is_empty() {
+                            break;
+                        }
+                        working_table = truly_new;
+                    }
+                }
+
+                Ok(result)
+            }
+
+            LogicalOperator::CreateIndex {
+                schema,
+                index_name,
+                table_name,
+                columns,
+                column_types,
+                unique,
+                if_not_exists,
+            } => {
+                use ironduck_catalog::IndexType;
+
+                // Check if index already exists
+                if self.catalog.get_index(schema, index_name).is_some() {
+                    if *if_not_exists {
+                        return Ok(vec![vec![Value::Varchar(format!("Index {} already exists", index_name))]]);
+                    }
+                    return Err(Error::IndexAlreadyExists(index_name.clone()));
+                }
+
+                // Create index in catalog
+                self.catalog.create_index(
+                    schema,
+                    index_name,
+                    table_name,
+                    columns.clone(),
+                    column_types.clone(),
+                    IndexType::BTree,
+                    *unique,
+                )?;
+
+                // Create B-tree index in storage
+                let btree_index = self.index_storage.create_index(schema, index_name, *unique);
+
+                // Populate the index with existing data
+                if let Some(table_data) = self.storage.get(schema, table_name) {
+                    // Get column indices for the indexed columns
+                    let table = self.catalog.get_table(schema, table_name)
+                        .ok_or_else(|| Error::TableNotFound(table_name.clone()))?;
+                    let column_indices: Vec<usize> = columns.iter()
+                        .filter_map(|col| table.get_column_index(col))
+                        .collect();
+
+                    // Get all rows and build index
+                    let all_rows = table_data.scan();
+                    btree_index.rebuild(&column_indices, &all_rows)
+                        .map_err(|e| Error::Execution(e))?;
+                }
+
+                Ok(vec![vec![Value::Varchar(format!("Created index {}", index_name))]])
+            }
+
+            LogicalOperator::Transaction { operation } => {
+                // For now, transactions are no-ops in the in-memory database
+                // Full transaction support will require snapshot isolation and WAL
+                let msg = match operation {
+                    TransactionOp::Begin => "BEGIN",
+                    TransactionOp::Commit => "COMMIT",
+                    TransactionOp::Rollback => "ROLLBACK",
+                    TransactionOp::Savepoint(name) => return Ok(vec![vec![Value::Varchar(format!("SAVEPOINT {}", name))]]),
+                    TransactionOp::ReleaseSavepoint(name) => return Ok(vec![vec![Value::Varchar(format!("RELEASE SAVEPOINT {}", name))]]),
+                    TransactionOp::RollbackToSavepoint(name) => return Ok(vec![vec![Value::Varchar(format!("ROLLBACK TO SAVEPOINT {}", name))]]),
+                };
+                Ok(vec![vec![Value::Varchar(msg.to_string())]])
             }
 
             LogicalOperator::NoOp => {
@@ -1144,8 +1992,282 @@ impl Executor {
                             }
                         }
                     }
+
+                    TableFunctionKind::Unnest { array_expr } => {
+                        // Evaluate the array expression
+                        let array_val = evaluate(array_expr, &[])?;
+
+                        match array_val {
+                            Value::List(elements) => {
+                                // Expand each element into a row
+                                Ok(elements.into_iter().map(|elem| vec![elem]).collect())
+                            }
+                            Value::Null => {
+                                // NULL array produces empty result
+                                Ok(vec![])
+                            }
+                            _ => {
+                                // Non-array value produces single row
+                                Ok(vec![vec![array_val]])
+                            }
+                        }
+                    }
+
+                    TableFunctionKind::GenerateSubscripts { array_expr, dim } => {
+                        // Evaluate the array expression
+                        let array_val = evaluate(array_expr, &[])?;
+
+                        match array_val {
+                            Value::List(elements) => {
+                                // For dimension 1, generate 1-based indices for the array
+                                if *dim == 1 {
+                                    let len = elements.len() as i64;
+                                    Ok((1..=len).map(|i| vec![Value::BigInt(i)]).collect())
+                                } else {
+                                    // Higher dimensions not yet supported for simple arrays
+                                    Ok(vec![])
+                                }
+                            }
+                            Value::Null => {
+                                Ok(vec![])
+                            }
+                            _ => {
+                                Err(Error::Execution("generate_subscripts requires an array argument".to_string()))
+                            }
+                        }
+                    }
+                    TableFunctionKind::ReadCsv { path, has_header, delimiter, .. } => {
+                        read_csv_file(path, *has_header, *delimiter)
+                    }
+                    TableFunctionKind::ReadParquet { path, .. } => {
+                        read_parquet_file(path)
+                    }
+                    TableFunctionKind::ReadJson { path, column_names, .. } => {
+                        read_json_file(path, column_names)
+                    }
                 }
             }
+
+            LogicalOperator::RecursiveCTEScan { cte_name, .. } => {
+                // RecursiveCTEScan reads from the working table set by the parent RecursiveCTE operator
+                // The working table contains rows from the previous iteration
+                let working_tables = self.recursive_working_tables.borrow();
+                if let Some(rows) = working_tables.get(cte_name) {
+                    Ok(rows.clone())
+                } else {
+                    // If no working table is set, this means RecursiveCTEScan is being
+                    // executed outside of a RecursiveCTE context, which is an error
+                    Err(Error::Execution(format!(
+                        "RecursiveCTEScan for '{}' executed outside of RecursiveCTE context",
+                        cte_name
+                    )))
+                }
+            }
+
+            LogicalOperator::Pivot {
+                input,
+                aggregate_function,
+                aggregate_arg,
+                value_column: _,
+                value_column_index,
+                pivot_values,
+                group_columns,
+            } => {
+                let input_rows = self.execute_operator(input)?;
+
+                // Group rows by the group columns - use String key since Value doesn't implement Hash
+                let mut groups: std::collections::HashMap<String, (Vec<Value>, Vec<Vec<Value>>)> = std::collections::HashMap::new();
+
+                for row in &input_rows {
+                    let group_key_values: Vec<Value> = group_columns.iter()
+                        .map(|(_, _, idx)| row.get(*idx).cloned().unwrap_or(Value::Null))
+                        .collect();
+                    let group_key = format!("{:?}", group_key_values);
+                    groups.entry(group_key).or_insert_with(|| (group_key_values.clone(), Vec::new())).1.push(row.clone());
+                }
+
+                // For each group, compute aggregates for each pivot value
+                let mut result = Vec::new();
+
+                for (_key, (group_key_values, group_rows)) in groups {
+                    let mut output_row = group_key_values;
+
+                    // For each pivot value, filter rows and compute aggregate
+                    for pivot_val in pivot_values {
+                        // Filter rows where value_column matches pivot_val
+                        let matching_rows: Vec<&Vec<Value>> = group_rows.iter()
+                            .filter(|row| {
+                                if let Some(val) = row.get(*value_column_index) {
+                                    val.to_string() == *pivot_val || format!("{:?}", val) == *pivot_val
+                                } else {
+                                    false
+                                }
+                            })
+                            .collect();
+
+                        // Compute aggregate on matching rows
+                        let agg_result = if matching_rows.is_empty() {
+                            Value::Null
+                        } else {
+                            let agg_values: Vec<Value> = matching_rows.iter()
+                                .map(|row| evaluate(aggregate_arg, row).unwrap_or(Value::Null))
+                                .collect();
+                            compute_pivot_aggregate(aggregate_function, &agg_values)
+                        };
+
+                        output_row.push(agg_result);
+                    }
+
+                    result.push(output_row);
+                }
+
+                Ok(result)
+            }
+
+            LogicalOperator::Unpivot {
+                input,
+                value_column: _,
+                name_column: _,
+                unpivot_columns,
+                keep_columns,
+            } => {
+                let input_rows = self.execute_operator(input)?;
+                let mut result = Vec::new();
+
+                for row in &input_rows {
+                    // For each unpivot column, create a new row
+                    for (col_name, col_idx, _) in unpivot_columns {
+                        let mut output_row = Vec::new();
+
+                        // Add keep columns
+                        for (_, idx, _) in keep_columns {
+                            output_row.push(row.get(*idx).cloned().unwrap_or(Value::Null));
+                        }
+
+                        // Order: keep columns, then name column (column name), then value column (value)
+                        // Add name column (the column name) first
+                        output_row.push(Value::Varchar(col_name.clone()));
+
+                        // Add value column (the actual value from the unpivoted column) second
+                        output_row.push(row.get(*col_idx).cloned().unwrap_or(Value::Null));
+
+                        result.push(output_row);
+                    }
+                }
+
+                Ok(result)
+            }
+        }
+    }
+}
+
+/// Compute a simple aggregate value from a list of values (for PIVOT)
+fn compute_pivot_aggregate(func: &ironduck_planner::AggregateFunction, values: &[Value]) -> Value {
+    use ironduck_planner::AggregateFunction;
+
+    match func {
+        AggregateFunction::Count => Value::BigInt(values.len() as i64),
+        AggregateFunction::Sum => {
+            let mut sum = 0.0f64;
+            let mut has_value = false;
+            for v in values {
+                if let Some(n) = v.as_f64() {
+                    sum += n;
+                    has_value = true;
+                }
+            }
+            if has_value { Value::Double(sum) } else { Value::Null }
+        }
+        AggregateFunction::Avg => {
+            let mut sum = 0.0f64;
+            let mut count = 0;
+            for v in values {
+                if let Some(n) = v.as_f64() {
+                    sum += n;
+                    count += 1;
+                }
+            }
+            if count > 0 { Value::Double(sum / count as f64) } else { Value::Null }
+        }
+        AggregateFunction::Min => {
+            values.iter()
+                .filter(|v| !matches!(v, Value::Null))
+                .min_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+                .cloned()
+                .unwrap_or(Value::Null)
+        }
+        AggregateFunction::Max => {
+            values.iter()
+                .filter(|v| !matches!(v, Value::Null))
+                .max_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+                .cloned()
+                .unwrap_or(Value::Null)
+        }
+        AggregateFunction::First => {
+            values.first().cloned().unwrap_or(Value::Null)
+        }
+        AggregateFunction::Last => {
+            values.last().cloned().unwrap_or(Value::Null)
+        }
+        _ => Value::Null,
+    }
+}
+
+/// Get frame bounds for a window function at a given row index
+/// Returns (start_idx, end_idx) for the frame
+fn get_frame_bounds(frame: &Option<WindowFrame>, current_idx: usize, partition_len: usize) -> (usize, usize) {
+    match frame {
+        None => {
+            // Default frame: RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+            (0, current_idx)
+        }
+        Some(f) => {
+            let start = match &f.start {
+                WindowFrameBound::UnboundedPreceding => 0,
+                WindowFrameBound::CurrentRow => current_idx,
+                WindowFrameBound::Preceding(n) => {
+                    // n is an expression - evaluate it
+                    if let Expression::Constant(val) = n {
+                        let offset = val.as_i64().unwrap_or(0) as usize;
+                        current_idx.saturating_sub(offset)
+                    } else {
+                        current_idx
+                    }
+                }
+                WindowFrameBound::Following(n) => {
+                    if let Expression::Constant(val) = n {
+                        let offset = val.as_i64().unwrap_or(0) as usize;
+                        (current_idx + offset).min(partition_len - 1)
+                    } else {
+                        current_idx
+                    }
+                }
+                WindowFrameBound::UnboundedFollowing => partition_len - 1,
+            };
+
+            let end = match &f.end {
+                WindowFrameBound::UnboundedPreceding => 0,
+                WindowFrameBound::CurrentRow => current_idx,
+                WindowFrameBound::Preceding(n) => {
+                    if let Expression::Constant(val) = n {
+                        let offset = val.as_i64().unwrap_or(0) as usize;
+                        current_idx.saturating_sub(offset)
+                    } else {
+                        current_idx
+                    }
+                }
+                WindowFrameBound::Following(n) => {
+                    if let Expression::Constant(val) = n {
+                        let offset = val.as_i64().unwrap_or(0) as usize;
+                        (current_idx + offset).min(partition_len - 1)
+                    } else {
+                        current_idx
+                    }
+                }
+                WindowFrameBound::UnboundedFollowing => partition_len - 1,
+            };
+
+            (start, end)
         }
     }
 }
@@ -1221,6 +2343,9 @@ fn format_plan(op: &LogicalOperator, indent: usize) -> String {
         LogicalOperator::CreateView { name, .. } => {
             format!("{}CreateView: {}", prefix, name)
         }
+        LogicalOperator::CreateSequence { name, .. } => {
+            format!("{}CreateSequence: {}", prefix, name)
+        }
         LogicalOperator::Insert { table, .. } => {
             format!("{}Insert: {}", prefix, table)
         }
@@ -1232,6 +2357,9 @@ fn format_plan(op: &LogicalOperator, indent: usize) -> String {
         }
         LogicalOperator::Drop { name, .. } => {
             format!("{}Drop: {}", prefix, name)
+        }
+        LogicalOperator::AlterTable { table_name, operation, .. } => {
+            format!("{}AlterTable: {} ({:?})", prefix, table_name, operation)
         }
         LogicalOperator::SetOperation { left, right, op, all } => {
             format!(
@@ -1254,11 +2382,73 @@ fn format_plan(op: &LogicalOperator, indent: usize) -> String {
         LogicalOperator::Explain { input } => {
             format!("{}Explain\n{}", prefix, format_plan(input, indent + 1))
         }
+        LogicalOperator::RecursiveCTE { name, base_case, recursive_case, .. } => {
+            format!(
+                "{}RecursiveCTE: {}\n{}Base:\n{}\n{}Recursive:\n{}",
+                prefix,
+                name,
+                prefix,
+                format_plan(base_case, indent + 1),
+                prefix,
+                format_plan(recursive_case, indent + 1)
+            )
+        }
+        LogicalOperator::CreateIndex { index_name, table_name, columns, .. } => {
+            format!("{}CreateIndex: {} ON {} ({})", prefix, index_name, table_name, columns.join(", "))
+        }
+        LogicalOperator::Transaction { operation } => {
+            let op_name = match operation {
+                TransactionOp::Begin => "BEGIN",
+                TransactionOp::Commit => "COMMIT",
+                TransactionOp::Rollback => "ROLLBACK",
+                TransactionOp::Savepoint(name) => return format!("{}SAVEPOINT {}", prefix, name),
+                TransactionOp::ReleaseSavepoint(name) => return format!("{}RELEASE SAVEPOINT {}", prefix, name),
+                TransactionOp::RollbackToSavepoint(name) => return format!("{}ROLLBACK TO SAVEPOINT {}", prefix, name),
+            };
+            format!("{}{}", prefix, op_name)
+        }
         LogicalOperator::NoOp => {
             format!("{}NoOp", prefix)
         }
-        LogicalOperator::TableFunction { column_name, .. } => {
-            format!("{}TableFunction: range() -> {}", prefix, column_name)
+        LogicalOperator::TableFunction { function, column_name, .. } => {
+            let func_name = match function {
+                TableFunctionKind::Range { .. } => "range",
+                TableFunctionKind::Unnest { .. } => "unnest",
+                TableFunctionKind::GenerateSubscripts { .. } => "generate_subscripts",
+                TableFunctionKind::ReadCsv { path, .. } => return format!("{}TableFunction: read_csv('{}') -> {}", prefix, path, column_name),
+                TableFunctionKind::ReadParquet { path, .. } => return format!("{}TableFunction: read_parquet('{}') -> {}", prefix, path, column_name),
+                TableFunctionKind::ReadJson { path, .. } => return format!("{}TableFunction: read_json('{}') -> {}", prefix, path, column_name),
+            };
+            format!("{}TableFunction: {}() -> {}", prefix, func_name, column_name)
+        }
+        LogicalOperator::RecursiveCTEScan { cte_name, .. } => {
+            format!("{}RecursiveCTEScan: {}", prefix, cte_name)
+        }
+        LogicalOperator::Pivot { input, aggregate_function, value_column, pivot_values, .. } => {
+            format!(
+                "{}Pivot ({:?}({}) FOR {} IN ({}))\n{}",
+                prefix,
+                aggregate_function,
+                value_column,
+                value_column,
+                pivot_values.join(", "),
+                format_plan(input, indent + 1)
+            )
+        }
+        LogicalOperator::Unpivot { input, value_column, name_column, unpivot_columns, .. } => {
+            let col_names: Vec<_> = unpivot_columns.iter().map(|(name, _, _)| name.as_str()).collect();
+            format!(
+                "{}Unpivot ({} FOR {} IN ({}))\n{}",
+                prefix,
+                value_column,
+                name_column,
+                col_names.join(", "),
+                format_plan(input, indent + 1)
+            )
+        }
+        LogicalOperator::Copy { to, file_path, format, .. } => {
+            let direction = if *to { "TO" } else { "FROM" };
+            format!("{}Copy {} '{}' ({:?})", prefix, direction, file_path, format)
         }
     }
 }
@@ -1276,8 +2466,8 @@ fn evaluate_with_subqueries(
                 return Ok(Value::Null);
             }
 
-            // Execute subquery
-            let subquery_rows = executor.execute_operator(subquery)?;
+            // Execute subquery with outer row for correlated subqueries
+            let subquery_rows = with_outer_row(row.to_vec(), || executor.execute_operator(subquery))?;
 
             // Check if value is in subquery results
             let mut found = false;
@@ -1297,8 +2487,8 @@ fn evaluate_with_subqueries(
         }
 
         Expression::Exists { subquery, negated } => {
-            // Execute subquery
-            let subquery_rows = executor.execute_operator(subquery)?;
+            // Execute subquery with outer row for correlated subqueries
+            let subquery_rows = with_outer_row(row.to_vec(), || executor.execute_operator(subquery))?;
 
             let exists = !subquery_rows.is_empty();
             let result = if *negated { !exists } else { exists };
@@ -1306,8 +2496,8 @@ fn evaluate_with_subqueries(
         }
 
         Expression::Subquery(subquery) => {
-            // Execute scalar subquery
-            let subquery_rows = executor.execute_operator(subquery)?;
+            // Execute scalar subquery with outer row for correlated subqueries
+            let subquery_rows = with_outer_row(row.to_vec(), || executor.execute_operator(subquery))?;
 
             // Return the first column of the first row
             if let Some(first_row) = subquery_rows.first() {
@@ -1362,7 +2552,8 @@ fn evaluate_with_subqueries(
         }
 
         // Fall back to regular evaluate for non-subquery expressions
-        _ => evaluate(expr, row),
+        // Use eval_with_catalog to get outer row context for correlated subqueries
+        _ => eval_with_catalog(expr, row),
     }
 }
 
@@ -1373,7 +2564,7 @@ fn contains_subquery(expr: &Expression) -> bool {
         Expression::BinaryOp { left, right, .. } => contains_subquery(left) || contains_subquery(right),
         Expression::UnaryOp { expr, .. } => contains_subquery(expr),
         Expression::Function { args, .. } => args.iter().any(contains_subquery),
-        Expression::Cast { expr, .. } => contains_subquery(expr),
+        Expression::Cast { expr, .. } | Expression::TryCast { expr, .. } => contains_subquery(expr),
         Expression::IsNull(expr) | Expression::IsNotNull(expr) => contains_subquery(expr),
         Expression::Case { operand, conditions, results, else_result } => {
             operand.as_ref().map_or(false, |e| contains_subquery(e))
@@ -1393,7 +2584,7 @@ fn contains_rowid(expr: &Expression) -> bool {
         Expression::BinaryOp { left, right, .. } => contains_rowid(left) || contains_rowid(right),
         Expression::UnaryOp { expr, .. } => contains_rowid(expr),
         Expression::Function { args, .. } => args.iter().any(contains_rowid),
-        Expression::Cast { expr, .. } => contains_rowid(expr),
+        Expression::Cast { expr, .. } | Expression::TryCast { expr, .. } => contains_rowid(expr),
         Expression::IsNull(expr) | Expression::IsNotNull(expr) => contains_rowid(expr),
         Expression::Case { operand, conditions, results, else_result } => {
             operand.as_ref().map_or(false, |e| contains_rowid(e))
@@ -1407,16 +2598,161 @@ fn contains_rowid(expr: &Expression) -> bool {
     }
 }
 
+/// Substitute OuterColumnRef expressions in a logical operator with constant values
+/// This is used for LATERAL joins where we need to execute the right side with
+/// values from the current left row
+fn substitute_outer_refs(op: &LogicalOperator, outer_row: &[Value]) -> LogicalOperator {
+    match op {
+        LogicalOperator::Project { input, expressions, output_names, output_types } => {
+            LogicalOperator::Project {
+                input: Box::new(substitute_outer_refs(input, outer_row)),
+                expressions: expressions.iter().map(|e| substitute_expr_outer_refs(e, outer_row)).collect(),
+                output_names: output_names.clone(),
+                output_types: output_types.clone(),
+            }
+        }
+        LogicalOperator::Filter { input, predicate } => {
+            LogicalOperator::Filter {
+                input: Box::new(substitute_outer_refs(input, outer_row)),
+                predicate: substitute_expr_outer_refs(predicate, outer_row),
+            }
+        }
+        LogicalOperator::Aggregate { input, group_by, aggregates } => {
+            LogicalOperator::Aggregate {
+                input: Box::new(substitute_outer_refs(input, outer_row)),
+                group_by: group_by.iter().map(|e| substitute_expr_outer_refs(e, outer_row)).collect(),
+                aggregates: aggregates.iter().map(|agg| {
+                    ironduck_planner::AggregateExpression {
+                        function: agg.function.clone(),
+                        args: agg.args.iter().map(|e| substitute_expr_outer_refs(e, outer_row)).collect(),
+                        distinct: agg.distinct,
+                        filter: agg.filter.as_ref().map(|e| substitute_expr_outer_refs(e, outer_row)),
+                        order_by: agg.order_by.iter().map(|(e, asc, nf)| (substitute_expr_outer_refs(e, outer_row), *asc, *nf)).collect(),
+                    }
+                }).collect(),
+            }
+        }
+        LogicalOperator::Scan { schema, table, column_names, output_types } => {
+            LogicalOperator::Scan {
+                schema: schema.clone(),
+                table: table.clone(),
+                column_names: column_names.clone(),
+                output_types: output_types.clone(),
+            }
+        }
+        LogicalOperator::Join { left, right, join_type, condition, is_lateral, asof_condition } => {
+            LogicalOperator::Join {
+                left: Box::new(substitute_outer_refs(left, outer_row)),
+                right: Box::new(substitute_outer_refs(right, outer_row)),
+                join_type: *join_type,
+                condition: condition.as_ref().map(|e| substitute_expr_outer_refs(e, outer_row)),
+                is_lateral: *is_lateral,
+                asof_condition: asof_condition.as_ref().map(|e| substitute_expr_outer_refs(e, outer_row)),
+            }
+        }
+        LogicalOperator::Sort { input, order_by } => {
+            LogicalOperator::Sort {
+                input: Box::new(substitute_outer_refs(input, outer_row)),
+                order_by: order_by.iter().map(|o| ironduck_planner::OrderByExpression {
+                    expr: substitute_expr_outer_refs(&o.expr, outer_row),
+                    ascending: o.ascending,
+                    nulls_first: o.nulls_first,
+                }).collect(),
+            }
+        }
+        LogicalOperator::Limit { input, limit, offset } => {
+            LogicalOperator::Limit {
+                input: Box::new(substitute_outer_refs(input, outer_row)),
+                limit: *limit,
+                offset: *offset,
+            }
+        }
+        LogicalOperator::Distinct { input, on_exprs } => {
+            LogicalOperator::Distinct {
+                input: Box::new(substitute_outer_refs(input, outer_row)),
+                on_exprs: on_exprs.as_ref().map(|es| es.iter().map(|e| substitute_expr_outer_refs(e, outer_row)).collect()),
+            }
+        }
+        // For operators that don't contain expressions, just return as-is
+        _ => op.clone(),
+    }
+}
+
+/// Substitute OuterColumnRef in an expression with constant values
+fn substitute_expr_outer_refs(expr: &Expression, outer_row: &[Value]) -> Expression {
+    match expr {
+        Expression::OuterColumnRef { column_index, .. } => {
+            // Replace with constant value from outer row
+            if let Some(value) = outer_row.get(*column_index) {
+                Expression::Constant(value.clone())
+            } else {
+                Expression::Constant(Value::Null)
+            }
+        }
+        Expression::BinaryOp { left, op, right } => {
+            Expression::BinaryOp {
+                left: Box::new(substitute_expr_outer_refs(left, outer_row)),
+                op: *op,
+                right: Box::new(substitute_expr_outer_refs(right, outer_row)),
+            }
+        }
+        Expression::UnaryOp { op, expr } => {
+            Expression::UnaryOp {
+                op: *op,
+                expr: Box::new(substitute_expr_outer_refs(expr, outer_row)),
+            }
+        }
+        Expression::Function { name, args } => {
+            Expression::Function {
+                name: name.clone(),
+                args: args.iter().map(|e| substitute_expr_outer_refs(e, outer_row)).collect(),
+            }
+        }
+        Expression::Cast { expr, target_type } => {
+            Expression::Cast {
+                expr: Box::new(substitute_expr_outer_refs(expr, outer_row)),
+                target_type: target_type.clone(),
+            }
+        }
+        Expression::TryCast { expr, target_type } => {
+            Expression::TryCast {
+                expr: Box::new(substitute_expr_outer_refs(expr, outer_row)),
+                target_type: target_type.clone(),
+            }
+        }
+        Expression::IsNull(e) => Expression::IsNull(Box::new(substitute_expr_outer_refs(e, outer_row))),
+        Expression::IsNotNull(e) => Expression::IsNotNull(Box::new(substitute_expr_outer_refs(e, outer_row))),
+        Expression::Case { operand, conditions, results, else_result } => {
+            Expression::Case {
+                operand: operand.as_ref().map(|e| Box::new(substitute_expr_outer_refs(e, outer_row))),
+                conditions: conditions.iter().map(|e| substitute_expr_outer_refs(e, outer_row)).collect(),
+                results: results.iter().map(|e| substitute_expr_outer_refs(e, outer_row)).collect(),
+                else_result: else_result.as_ref().map(|e| Box::new(substitute_expr_outer_refs(e, outer_row))),
+            }
+        }
+        Expression::InList { expr, list, negated } => {
+            Expression::InList {
+                expr: Box::new(substitute_expr_outer_refs(expr, outer_row)),
+                list: list.iter().map(|e| substitute_expr_outer_refs(e, outer_row)).collect(),
+                negated: *negated,
+            }
+        }
+        // For other expressions (Constant, ColumnRef, etc.), return as-is
+        _ => expr.clone(),
+    }
+}
+
 /// Check if an expression is constant (no column references)
 fn is_constant(expr: &Expression) -> bool {
     match expr {
         Expression::Constant(_) => true,
         Expression::ColumnRef { .. } => false,
+        Expression::OuterColumnRef { .. } => false, // Depends on outer row
         Expression::RowId { .. } => false,
         Expression::BinaryOp { left, right, .. } => is_constant(left) && is_constant(right),
         Expression::UnaryOp { expr, .. } => is_constant(expr),
         Expression::Function { args, .. } => args.iter().all(is_constant),
-        Expression::Cast { expr, .. } => is_constant(expr),
+        Expression::Cast { expr, .. } | Expression::TryCast { expr, .. } => is_constant(expr),
         Expression::IsNull(expr) | Expression::IsNotNull(expr) => is_constant(expr),
         Expression::Case {
             operand,
@@ -1435,6 +2771,70 @@ fn is_constant(expr: &Expression) -> bool {
     }
 }
 
+/// Sort rows based on ORDER BY expressions for ordered aggregates
+fn sort_rows_for_aggregate(
+    rows: &[Vec<Value>],
+    order_by: &[(Expression, bool, bool)],
+) -> Result<Vec<Vec<Value>>> {
+    use std::cmp::Ordering;
+
+    let mut indexed_rows: Vec<(usize, Vec<Value>)> = rows
+        .iter()
+        .enumerate()
+        .map(|(i, row)| (i, row.clone()))
+        .collect();
+
+    // Sort with error handling
+    let mut sort_error: Option<Error> = None;
+    indexed_rows.sort_by(|(_, row_a), (_, row_b)| {
+        if sort_error.is_some() {
+            return Ordering::Equal;
+        }
+
+        for (expr, ascending, nulls_first) in order_by {
+            let val_a = match evaluate(expr, row_a) {
+                Ok(v) => v,
+                Err(e) => {
+                    sort_error = Some(e);
+                    return Ordering::Equal;
+                }
+            };
+            let val_b = match evaluate(expr, row_b) {
+                Ok(v) => v,
+                Err(e) => {
+                    sort_error = Some(e);
+                    return Ordering::Equal;
+                }
+            };
+
+            // Handle nulls
+            match (&val_a, &val_b) {
+                (Value::Null, Value::Null) => continue,
+                (Value::Null, _) => {
+                    return if *nulls_first { Ordering::Less } else { Ordering::Greater };
+                }
+                (_, Value::Null) => {
+                    return if *nulls_first { Ordering::Greater } else { Ordering::Less };
+                }
+                _ => {}
+            }
+
+            let cmp = val_a.partial_cmp(&val_b).unwrap_or(Ordering::Equal);
+            let cmp = if *ascending { cmp } else { cmp.reverse() };
+            if cmp != Ordering::Equal {
+                return cmp;
+            }
+        }
+        Ordering::Equal
+    });
+
+    if let Some(e) = sort_error {
+        return Err(e);
+    }
+
+    Ok(indexed_rows.into_iter().map(|(_, row)| row).collect())
+}
+
 /// Compute an aggregate function
 fn compute_aggregate(
     agg: &ironduck_planner::AggregateExpression,
@@ -1444,6 +2844,34 @@ fn compute_aggregate(
 
     let args = &agg.args;
     let distinct = agg.distinct;
+    let has_order_by = !agg.order_by.is_empty();
+
+    // Apply FILTER clause if present - filter out rows that don't match
+    let filtered_rows: Vec<Vec<Value>>;
+    let rows = if let Some(filter) = &agg.filter {
+        filtered_rows = rows
+            .iter()
+            .filter(|row| {
+                match eval_with_catalog(filter, row) {
+                    Ok(Value::Boolean(true)) => true,
+                    _ => false, // NULL or false means exclude the row
+                }
+            })
+            .cloned()
+            .collect();
+        &filtered_rows[..]
+    } else {
+        rows
+    };
+
+    // If there's an ORDER BY clause, sort the rows first
+    let sorted_rows: Vec<Vec<Value>>;
+    let rows = if !agg.order_by.is_empty() {
+        sorted_rows = sort_rows_for_aggregate(rows, &agg.order_by)?;
+        &sorted_rows[..]
+    } else {
+        rows
+    };
 
     match agg.function {
         Count => {
@@ -1454,7 +2882,7 @@ fn compute_aggregate(
                 // COUNT(DISTINCT expr) - count distinct non-NULL values
                 let mut seen = std::collections::HashSet::new();
                 for row in rows {
-                    let val = evaluate(&args[0], row)?;
+                    let val = eval_with_catalog(&args[0], row)?;
                     if !val.is_null() {
                         seen.insert(format!("{:?}", val));
                     }
@@ -1464,7 +2892,7 @@ fn compute_aggregate(
                 // COUNT(expr) - count non-NULL values
                 let mut count = 0i64;
                 for row in rows {
-                    let val = evaluate(&args[0], row)?;
+                    let val = eval_with_catalog(&args[0], row)?;
                     if !val.is_null() {
                         count += 1;
                     }
@@ -1484,7 +2912,7 @@ fn compute_aggregate(
                 if args.is_empty() {
                     continue;
                 }
-                let val = evaluate(&args[0], row)?;
+                let val = eval_with_catalog(&args[0], row)?;
                 match val {
                     Value::TinyInt(i) => {
                         has_value = true;
@@ -1554,6 +2982,7 @@ fn compute_aggregate(
                 Timestamp,
                 Date,
                 Time,
+                TimeTz,
                 TimestampTz,
                 Interval,
             }
@@ -1566,7 +2995,7 @@ fn compute_aggregate(
                 if args.is_empty() {
                     continue;
                 }
-                let val = evaluate(&args[0], row)?;
+                let val = eval_with_catalog(&args[0], row)?;
                 if val.is_null() {
                     continue;
                 }
@@ -1653,6 +3082,21 @@ fn compute_aggregate(
                         sum += nanos as f64;
                         count += 1;
                     }
+                    Value::TimeTz(t, offset_secs) => {
+                        avg_type.get_or_insert(AvgType::TimeTz);
+                        // Convert to nanoseconds since midnight, then normalize to UTC
+                        // by subtracting the offset
+                        let local_nanos = t.num_seconds_from_midnight() as i64 * 1_000_000_000
+                            + t.nanosecond() as i64;
+                        // Offset is in seconds, convert to nanos and subtract to get UTC
+                        let offset_nanos = offset_secs as i64 * 1_000_000_000;
+                        let utc_nanos = local_nanos - offset_nanos;
+                        // Wrap around 24 hours (handle times that cross midnight)
+                        let day_nanos: i64 = 24 * 60 * 60 * 1_000_000_000;
+                        let utc_nanos = ((utc_nanos % day_nanos) + day_nanos) % day_nanos;
+                        sum += utc_nanos as f64;
+                        count += 1;
+                    }
                     Value::TimestampTz(ts) => {
                         avg_type.get_or_insert(AvgType::TimestampTz);
                         let micros = ts.timestamp_micros();
@@ -1708,6 +3152,15 @@ fn compute_aggregate(
                         let time = NaiveTime::from_num_seconds_from_midnight_opt(secs, nanos)
                             .unwrap_or_else(|| NaiveTime::from_hms_opt(0, 0, 0).unwrap());
                         Ok(Value::Time(time))
+                    }
+                    Some(AvgType::TimeTz) => {
+                        let avg_nanos = (sum / count as f64) as i64;
+                        let secs = (avg_nanos / 1_000_000_000) as u32;
+                        let nanos = (avg_nanos % 1_000_000_000) as u32;
+                        let time = NaiveTime::from_num_seconds_from_midnight_opt(secs, nanos)
+                            .unwrap_or_else(|| NaiveTime::from_hms_opt(0, 0, 0).unwrap());
+                        // Return with UTC offset (0)
+                        Ok(Value::TimeTz(time, 0))
                     }
                     Some(AvgType::TimestampTz) => {
                         let avg_micros = (sum / count as f64) as i64;
@@ -1848,15 +3301,15 @@ fn compute_aggregate(
                 return Ok(Value::Null);
             }
 
-            // Handle DISTINCT
+            // Handle DISTINCT while preserving order
             if distinct {
                 let mut seen = std::collections::HashSet::new();
                 values.retain(|v| seen.insert(v.clone()));
             }
 
-            // Sort values if DISTINCT (for consistent ordering)
-            // TODO: Support ORDER BY clause within aggregate
-            if distinct {
+            // Sort values alphabetically if DISTINCT and no ORDER BY was specified
+            // (for consistent ordering when no explicit order is requested)
+            if distinct && !has_order_by {
                 values.sort();
             }
 
@@ -2105,16 +3558,26 @@ fn compute_aggregate(
         }
 
         PercentileCont => {
-            // PERCENTILE_CONT(percentile, column) - continuous percentile with interpolation
-            // First arg is percentile (0.0-1.0), second arg is the column
-            if args.len() < 2 {
+            // PERCENTILE_CONT(percentile) WITHIN GROUP (ORDER BY column) - continuous percentile
+            // OR PERCENTILE_CONT(percentile, column) for backwards compatibility
+            // First arg is percentile (0.0-1.0)
+            if args.is_empty() {
                 return Ok(Value::Null);
             }
             let percentile = evaluate(&args[0], &[])?.as_f64().unwrap_or(0.5);
 
+            // Get the column expression: either from args[1] or from ORDER BY (WITHIN GROUP)
+            let column_expr = if args.len() >= 2 {
+                &args[1]
+            } else if !agg.order_by.is_empty() {
+                &agg.order_by[0].0
+            } else {
+                return Ok(Value::Null);
+            };
+
             let mut values: Vec<f64> = Vec::new();
             for row in rows {
-                let val = evaluate(&args[1], row)?;
+                let val = evaluate(column_expr, row)?;
                 if let Some(f) = val.as_f64() {
                     values.push(f);
                 }
@@ -2144,16 +3607,26 @@ fn compute_aggregate(
         }
 
         PercentileDisc => {
-            // PERCENTILE_DISC(percentile, column) - discrete percentile (returns actual value)
-            // First arg is percentile (0.0-1.0), second arg is the column
-            if args.len() < 2 {
+            // PERCENTILE_DISC(percentile) WITHIN GROUP (ORDER BY column) - discrete percentile
+            // OR PERCENTILE_DISC(percentile, column) for backwards compatibility
+            // First arg is percentile (0.0-1.0)
+            if args.is_empty() {
                 return Ok(Value::Null);
             }
             let percentile = evaluate(&args[0], &[])?.as_f64().unwrap_or(0.5);
 
+            // Get the column expression: either from args[1] or from ORDER BY (WITHIN GROUP)
+            let column_expr = if args.len() >= 2 {
+                &args[1]
+            } else if !agg.order_by.is_empty() {
+                &agg.order_by[0].0
+            } else {
+                return Ok(Value::Null);
+            };
+
             let mut values: Vec<Value> = Vec::new();
             for row in rows {
-                let val = evaluate(&args[1], row)?;
+                let val = evaluate(column_expr, row)?;
                 if !val.is_null() {
                     values.push(val);
                 }
@@ -2320,6 +3793,671 @@ fn compute_aggregate(
             let corr = covar / (std_x * std_y);
             Ok(Value::Double(corr))
         }
+
+        // New aggregate functions
+        ArgMax => {
+            // ARG_MAX(arg, val) - return arg value when val is maximum
+            if args.len() < 2 {
+                return Ok(Value::Null);
+            }
+
+            let mut max_val: Option<f64> = None;
+            let mut max_arg: Value = Value::Null;
+
+            for row in rows {
+                let arg = evaluate(&args[0], row)?;
+                let val = evaluate(&args[1], row)?;
+                if let Some(v) = val.as_f64() {
+                    if max_val.is_none() || v > max_val.unwrap() {
+                        max_val = Some(v);
+                        max_arg = arg;
+                    }
+                }
+            }
+
+            Ok(max_arg)
+        }
+
+        ArgMin => {
+            // ARG_MIN(arg, val) - return arg value when val is minimum
+            if args.len() < 2 {
+                return Ok(Value::Null);
+            }
+
+            let mut min_val: Option<f64> = None;
+            let mut min_arg: Value = Value::Null;
+
+            for row in rows {
+                let arg = evaluate(&args[0], row)?;
+                let val = evaluate(&args[1], row)?;
+                if let Some(v) = val.as_f64() {
+                    if min_val.is_none() || v < min_val.unwrap() {
+                        min_val = Some(v);
+                        min_arg = arg;
+                    }
+                }
+            }
+
+            Ok(min_arg)
+        }
+
+        Histogram => {
+            // HISTOGRAM(col) - returns a list of structs with value counts
+            let mut counts: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
+
+            for row in rows {
+                if args.is_empty() {
+                    continue;
+                }
+                let val = evaluate(&args[0], row)?;
+                if !val.is_null() {
+                    let key = format!("{}", val);
+                    *counts.entry(key).or_insert(0) += 1;
+                }
+            }
+
+            // Convert to list of structs (represented as nested lists)
+            let mut result: Vec<Value> = Vec::new();
+            for (key, count) in counts {
+                // Represent as a list [key, count]
+                result.push(Value::List(vec![Value::Varchar(key), Value::BigInt(count)]));
+            }
+            Ok(Value::List(result))
+        }
+
+        Entropy => {
+            // Information entropy: -sum(p * log2(p))
+            let mut counts: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
+            let mut total: i64 = 0;
+
+            for row in rows {
+                if args.is_empty() {
+                    continue;
+                }
+                let val = evaluate(&args[0], row)?;
+                if !val.is_null() {
+                    let key = format!("{:?}", val);
+                    *counts.entry(key).or_insert(0) += 1;
+                    total += 1;
+                }
+            }
+
+            if total == 0 {
+                return Ok(Value::Null);
+            }
+
+            let n = total as f64;
+            let entropy: f64 = counts.values()
+                .map(|&count| {
+                    let p = count as f64 / n;
+                    if p > 0.0 { -p * p.log2() } else { 0.0 }
+                })
+                .sum();
+
+            Ok(Value::Double(entropy))
+        }
+
+        Kurtosis => {
+            // Excess kurtosis: E[(X-μ)^4] / σ^4 - 3
+            let mut values: Vec<f64> = Vec::new();
+            for row in rows {
+                if args.is_empty() {
+                    continue;
+                }
+                let val = evaluate(&args[0], row)?;
+                if let Some(f) = val.as_f64() {
+                    values.push(f);
+                }
+            }
+
+            if values.len() < 4 {
+                return Ok(Value::Null);
+            }
+
+            let n = values.len() as f64;
+            let mean: f64 = values.iter().sum::<f64>() / n;
+            let variance: f64 = values.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / n;
+
+            if variance == 0.0 {
+                return Ok(Value::Null);
+            }
+
+            let std_dev = variance.sqrt();
+            let m4: f64 = values.iter().map(|x| ((x - mean) / std_dev).powi(4)).sum::<f64>() / n;
+            let kurtosis = m4 - 3.0;
+
+            Ok(Value::Double(kurtosis))
+        }
+
+        Skewness => {
+            // Skewness: E[(X-μ)^3] / σ^3
+            let mut values: Vec<f64> = Vec::new();
+            for row in rows {
+                if args.is_empty() {
+                    continue;
+                }
+                let val = evaluate(&args[0], row)?;
+                if let Some(f) = val.as_f64() {
+                    values.push(f);
+                }
+            }
+
+            if values.len() < 3 {
+                return Ok(Value::Null);
+            }
+
+            let n = values.len() as f64;
+            let mean: f64 = values.iter().sum::<f64>() / n;
+            let variance: f64 = values.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / n;
+
+            if variance == 0.0 {
+                return Ok(Value::Null);
+            }
+
+            let std_dev = variance.sqrt();
+            let m3: f64 = values.iter().map(|x| ((x - mean) / std_dev).powi(3)).sum::<f64>() / n;
+
+            Ok(Value::Double(m3))
+        }
+
+        ApproxCountDistinct => {
+            // Approximate count distinct using simple hash-based approach
+            // (A proper implementation would use HyperLogLog)
+            let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+            for row in rows {
+                if args.is_empty() {
+                    continue;
+                }
+                let val = evaluate(&args[0], row)?;
+                if !val.is_null() {
+                    seen.insert(format!("{:?}", val));
+                }
+            }
+
+            Ok(Value::BigInt(seen.len() as i64))
+        }
+
+        RegrSlope => {
+            // Linear regression slope: Cov(X,Y) / Var(X)
+            if args.len() < 2 {
+                return Ok(Value::Null);
+            }
+
+            let mut x_values: Vec<f64> = Vec::new();
+            let mut y_values: Vec<f64> = Vec::new();
+
+            for row in rows {
+                let y = evaluate(&args[0], row)?;
+                let x = evaluate(&args[1], row)?;
+                if let (Some(xf), Some(yf)) = (x.as_f64(), y.as_f64()) {
+                    x_values.push(xf);
+                    y_values.push(yf);
+                }
+            }
+
+            if x_values.len() < 2 {
+                return Ok(Value::Null);
+            }
+
+            let n = x_values.len() as f64;
+            let mean_x: f64 = x_values.iter().sum::<f64>() / n;
+            let mean_y: f64 = y_values.iter().sum::<f64>() / n;
+
+            let sxx: f64 = x_values.iter().map(|x| (x - mean_x).powi(2)).sum();
+            let sxy: f64 = x_values.iter().zip(y_values.iter())
+                .map(|(x, y)| (x - mean_x) * (y - mean_y))
+                .sum();
+
+            if sxx == 0.0 {
+                return Ok(Value::Null);
+            }
+
+            Ok(Value::Double(sxy / sxx))
+        }
+
+        RegrIntercept => {
+            // Linear regression intercept: mean(Y) - slope * mean(X)
+            if args.len() < 2 {
+                return Ok(Value::Null);
+            }
+
+            let mut x_values: Vec<f64> = Vec::new();
+            let mut y_values: Vec<f64> = Vec::new();
+
+            for row in rows {
+                let y = evaluate(&args[0], row)?;
+                let x = evaluate(&args[1], row)?;
+                if let (Some(xf), Some(yf)) = (x.as_f64(), y.as_f64()) {
+                    x_values.push(xf);
+                    y_values.push(yf);
+                }
+            }
+
+            if x_values.len() < 2 {
+                return Ok(Value::Null);
+            }
+
+            let n = x_values.len() as f64;
+            let mean_x: f64 = x_values.iter().sum::<f64>() / n;
+            let mean_y: f64 = y_values.iter().sum::<f64>() / n;
+
+            let sxx: f64 = x_values.iter().map(|x| (x - mean_x).powi(2)).sum();
+            let sxy: f64 = x_values.iter().zip(y_values.iter())
+                .map(|(x, y)| (x - mean_x) * (y - mean_y))
+                .sum();
+
+            if sxx == 0.0 {
+                return Ok(Value::Null);
+            }
+
+            let slope = sxy / sxx;
+            Ok(Value::Double(mean_y - slope * mean_x))
+        }
+
+        RegrCount => {
+            // Count of non-null pairs
+            if args.len() < 2 {
+                return Ok(Value::BigInt(0));
+            }
+
+            let mut count: i64 = 0;
+            for row in rows {
+                let y = evaluate(&args[0], row)?;
+                let x = evaluate(&args[1], row)?;
+                if !y.is_null() && !x.is_null() {
+                    count += 1;
+                }
+            }
+
+            Ok(Value::BigInt(count))
+        }
+
+        RegrR2 => {
+            // Coefficient of determination (R²)
+            if args.len() < 2 {
+                return Ok(Value::Null);
+            }
+
+            let mut x_values: Vec<f64> = Vec::new();
+            let mut y_values: Vec<f64> = Vec::new();
+
+            for row in rows {
+                let y = evaluate(&args[0], row)?;
+                let x = evaluate(&args[1], row)?;
+                if let (Some(xf), Some(yf)) = (x.as_f64(), y.as_f64()) {
+                    x_values.push(xf);
+                    y_values.push(yf);
+                }
+            }
+
+            if x_values.len() < 2 {
+                return Ok(Value::Null);
+            }
+
+            let n = x_values.len() as f64;
+            let mean_x: f64 = x_values.iter().sum::<f64>() / n;
+            let mean_y: f64 = y_values.iter().sum::<f64>() / n;
+
+            let sxx: f64 = x_values.iter().map(|x| (x - mean_x).powi(2)).sum();
+            let syy: f64 = y_values.iter().map(|y| (y - mean_y).powi(2)).sum();
+            let sxy: f64 = x_values.iter().zip(y_values.iter())
+                .map(|(x, y)| (x - mean_x) * (y - mean_y))
+                .sum();
+
+            if sxx == 0.0 || syy == 0.0 {
+                return Ok(Value::Null);
+            }
+
+            let r2 = (sxy * sxy) / (sxx * syy);
+            Ok(Value::Double(r2))
+        }
+
+        RegrAvgX => {
+            if args.len() < 2 {
+                return Ok(Value::Null);
+            }
+
+            let mut sum: f64 = 0.0;
+            let mut count: i64 = 0;
+
+            for row in rows {
+                let y = evaluate(&args[0], row)?;
+                let x = evaluate(&args[1], row)?;
+                if let (Some(xf), Some(_yf)) = (x.as_f64(), y.as_f64()) {
+                    sum += xf;
+                    count += 1;
+                }
+            }
+
+            if count == 0 {
+                return Ok(Value::Null);
+            }
+
+            Ok(Value::Double(sum / count as f64))
+        }
+
+        RegrAvgY => {
+            if args.len() < 2 {
+                return Ok(Value::Null);
+            }
+
+            let mut sum: f64 = 0.0;
+            let mut count: i64 = 0;
+
+            for row in rows {
+                let y = evaluate(&args[0], row)?;
+                let x = evaluate(&args[1], row)?;
+                if let (Some(_xf), Some(yf)) = (x.as_f64(), y.as_f64()) {
+                    sum += yf;
+                    count += 1;
+                }
+            }
+
+            if count == 0 {
+                return Ok(Value::Null);
+            }
+
+            Ok(Value::Double(sum / count as f64))
+        }
+
+        RegrSXX => {
+            if args.len() < 2 {
+                return Ok(Value::Null);
+            }
+
+            let mut x_values: Vec<f64> = Vec::new();
+
+            for row in rows {
+                let y = evaluate(&args[0], row)?;
+                let x = evaluate(&args[1], row)?;
+                if let (Some(xf), Some(_yf)) = (x.as_f64(), y.as_f64()) {
+                    x_values.push(xf);
+                }
+            }
+
+            if x_values.is_empty() {
+                return Ok(Value::Null);
+            }
+
+            let n = x_values.len() as f64;
+            let mean_x: f64 = x_values.iter().sum::<f64>() / n;
+            let sxx: f64 = x_values.iter().map(|x| (x - mean_x).powi(2)).sum();
+
+            Ok(Value::Double(sxx))
+        }
+
+        RegrSYY => {
+            if args.len() < 2 {
+                return Ok(Value::Null);
+            }
+
+            let mut y_values: Vec<f64> = Vec::new();
+
+            for row in rows {
+                let y = evaluate(&args[0], row)?;
+                let x = evaluate(&args[1], row)?;
+                if let (Some(_xf), Some(yf)) = (x.as_f64(), y.as_f64()) {
+                    y_values.push(yf);
+                }
+            }
+
+            if y_values.is_empty() {
+                return Ok(Value::Null);
+            }
+
+            let n = y_values.len() as f64;
+            let mean_y: f64 = y_values.iter().sum::<f64>() / n;
+            let syy: f64 = y_values.iter().map(|y| (y - mean_y).powi(2)).sum();
+
+            Ok(Value::Double(syy))
+        }
+
+        RegrSXY => {
+            if args.len() < 2 {
+                return Ok(Value::Null);
+            }
+
+            let mut x_values: Vec<f64> = Vec::new();
+            let mut y_values: Vec<f64> = Vec::new();
+
+            for row in rows {
+                let y = evaluate(&args[0], row)?;
+                let x = evaluate(&args[1], row)?;
+                if let (Some(xf), Some(yf)) = (x.as_f64(), y.as_f64()) {
+                    x_values.push(xf);
+                    y_values.push(yf);
+                }
+            }
+
+            if x_values.is_empty() {
+                return Ok(Value::Null);
+            }
+
+            let n = x_values.len() as f64;
+            let mean_x: f64 = x_values.iter().sum::<f64>() / n;
+            let mean_y: f64 = y_values.iter().sum::<f64>() / n;
+            let sxy: f64 = x_values.iter().zip(y_values.iter())
+                .map(|(x, y)| (x - mean_x) * (y - mean_y))
+                .sum();
+
+            Ok(Value::Double(sxy))
+        }
+
+        // Additional aggregate functions
+        AnyValue | Arbitrary => {
+            // Return the first non-null value
+            for row in rows {
+                if !args.is_empty() {
+                    let val = evaluate(&args[0], row)?;
+                    if !val.is_null() {
+                        return Ok(val);
+                    }
+                }
+            }
+            Ok(Value::Null)
+        }
+
+        ListAgg | GroupConcat => {
+            // Like StringAgg - concatenate values with separator
+            let separator = if args.len() > 1 {
+                match evaluate(&args[1], &rows.first().cloned().unwrap_or_default())? {
+                    Value::Varchar(s) => s,
+                    _ => ",".to_string(),
+                }
+            } else {
+                ",".to_string()
+            };
+
+            let mut parts: Vec<String> = Vec::new();
+            for row in rows {
+                if !args.is_empty() {
+                    let val = evaluate(&args[0], row)?;
+                    if !val.is_null() {
+                        parts.push(format!("{}", val));
+                    }
+                }
+            }
+
+            if parts.is_empty() {
+                Ok(Value::Null)
+            } else {
+                Ok(Value::Varchar(parts.join(&separator)))
+            }
+        }
+
+        FSum => {
+            // Kahan summation for better precision with floats
+            let mut sum = 0.0f64;
+            let mut c = 0.0f64; // Compensation for lost low-order bits
+            let mut has_value = false;
+
+            for row in rows {
+                if !args.is_empty() {
+                    let val = evaluate(&args[0], row)?;
+                    if let Some(f) = val.as_f64() {
+                        has_value = true;
+                        let y = f - c;
+                        let t = sum + y;
+                        c = (t - sum) - y;
+                        sum = t;
+                    }
+                }
+            }
+
+            if has_value {
+                Ok(Value::Double(sum))
+            } else {
+                Ok(Value::Null)
+            }
+        }
+
+        Quantile | ApproxQuantile => {
+            // Quantile is an alias for percentile
+            // quantile(col, p) returns the p-th quantile (0-1)
+            let p = if args.len() > 1 {
+                match evaluate(&args[1], &rows.first().cloned().unwrap_or_default())? {
+                    Value::Float(f) => f as f64,
+                    Value::Double(f) => f,
+                    _ => 0.5,
+                }
+            } else {
+                0.5 // Default to median
+            };
+
+            let mut values: Vec<f64> = Vec::new();
+            for row in rows {
+                if !args.is_empty() {
+                    let val = evaluate(&args[0], row)?;
+                    if let Some(f) = val.as_f64() {
+                        values.push(f);
+                    }
+                }
+            }
+
+            if values.is_empty() {
+                return Ok(Value::Null);
+            }
+
+            values.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            let idx = ((values.len() - 1) as f64 * p).round() as usize;
+            Ok(Value::Double(values[idx.min(values.len() - 1)]))
+        }
+
+        CountIf => {
+            // COUNT_IF(condition) - count rows where condition is true
+            let mut count: i64 = 0;
+            for row in rows {
+                if !args.is_empty() {
+                    let val = evaluate(&args[0], row)?;
+                    if matches!(val, Value::Boolean(true)) {
+                        count += 1;
+                    }
+                }
+            }
+            Ok(Value::BigInt(count))
+        }
+
+        SumIf => {
+            // SUM_IF(value, condition) - sum values where condition is true
+            let mut sum: i128 = 0;
+            let mut float_sum: f64 = 0.0;
+            let mut has_float = false;
+            let mut has_value = false;
+
+            for row in rows {
+                if args.len() >= 2 {
+                    let cond = evaluate(&args[1], row)?;
+                    if matches!(cond, Value::Boolean(true)) {
+                        let val = evaluate(&args[0], row)?;
+                        match val {
+                            Value::Integer(i) => { has_value = true; sum += i as i128; }
+                            Value::BigInt(i) => { has_value = true; sum += i as i128; }
+                            Value::Float(f) => { has_value = true; has_float = true; float_sum += f as f64; }
+                            Value::Double(f) => { has_value = true; has_float = true; float_sum += f; }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+
+            if !has_value {
+                Ok(Value::Null)
+            } else if has_float {
+                Ok(Value::Double(float_sum + sum as f64))
+            } else {
+                Ok(Value::HugeInt(sum))
+            }
+        }
+
+        AvgIf => {
+            // AVG_IF(value, condition) - average values where condition is true
+            let mut sum: f64 = 0.0;
+            let mut count: i64 = 0;
+
+            for row in rows {
+                if args.len() >= 2 {
+                    let cond = evaluate(&args[1], row)?;
+                    if matches!(cond, Value::Boolean(true)) {
+                        let val = evaluate(&args[0], row)?;
+                        if let Some(f) = val.as_f64() {
+                            sum += f;
+                            count += 1;
+                        }
+                    }
+                }
+            }
+
+            if count == 0 {
+                Ok(Value::Null)
+            } else {
+                Ok(Value::Double(sum / count as f64))
+            }
+        }
+
+        MinIf => {
+            // MIN_IF(value, condition) - minimum value where condition is true
+            let mut min_val: Option<Value> = None;
+
+            for row in rows {
+                if args.len() >= 2 {
+                    let cond = evaluate(&args[1], row)?;
+                    if matches!(cond, Value::Boolean(true)) {
+                        let val = evaluate(&args[0], row)?;
+                        if !val.is_null() {
+                            min_val = Some(match min_val {
+                                None => val,
+                                Some(m) => if val < m { val } else { m },
+                            });
+                        }
+                    }
+                }
+            }
+
+            Ok(min_val.unwrap_or(Value::Null))
+        }
+
+        MaxIf => {
+            // MAX_IF(value, condition) - maximum value where condition is true
+            let mut max_val: Option<Value> = None;
+
+            for row in rows {
+                if args.len() >= 2 {
+                    let cond = evaluate(&args[1], row)?;
+                    if matches!(cond, Value::Boolean(true)) {
+                        let val = evaluate(&args[0], row)?;
+                        if !val.is_null() {
+                            max_val = Some(match max_val {
+                                None => val,
+                                Some(m) => if val > m { val } else { m },
+                            });
+                        }
+                    }
+                }
+            }
+
+            Ok(max_val.unwrap_or(Value::Null))
+        }
     }
 }
 
@@ -2370,12 +4508,17 @@ fn coerce_value(value: Value, target_type: &LogicalType) -> Result<Value> {
         (Value::Timestamp(_), LogicalType::Timestamp) => Ok(value),
         (Value::Date(_), LogicalType::Date) => Ok(value),
         (Value::Time(_), LogicalType::Time) => Ok(value),
+        (Value::TimeTz(_, _), LogicalType::TimeTz) => Ok(value),
         (Value::TimestampTz(_), LogicalType::TimestampTz) => Ok(value),
         (Value::Integer(_), LogicalType::Integer) => Ok(value),
         (Value::BigInt(_), LogicalType::BigInt) => Ok(value),
         (Value::Double(_), LogicalType::Double) => Ok(value),
         (Value::Varchar(_), LogicalType::Varchar) => Ok(value),
         (Value::Boolean(_), LogicalType::Boolean) => Ok(value),
+        // String to TimeTz conversion
+        (Value::Varchar(s), LogicalType::TimeTz) => {
+            parse_timetz(&s).map(|(time, offset)| Value::TimeTz(time, offset))
+        }
         // For other types, just return the value (may need more conversions later)
         _ => Ok(value),
     }
@@ -2460,4 +4603,410 @@ fn parse_interval(s: &str) -> Result<ironduck_common::value::Interval> {
     }
 
     Ok(Interval::new(months, days, micros))
+}
+
+/// Parse a TIMETZ string like "00:00:00+1559" or "12:30:45-0500"
+fn parse_timetz(s: &str) -> Result<(chrono::NaiveTime, i32)> {
+    use chrono::NaiveTime;
+
+    let s = s.trim();
+
+    // Find the timezone offset (+ or -)
+    let (time_part, offset_secs) = if let Some(pos) = s.rfind('+') {
+        let time_str = &s[..pos];
+        let offset_str = &s[pos + 1..];
+        let offset = parse_tz_offset_str(offset_str);
+        (time_str, offset)
+    } else if let Some(pos) = s.rfind('-') {
+        // Make sure we don't split on something that's not a timezone
+        if pos > 5 {
+            let time_str = &s[..pos];
+            let offset_str = &s[pos + 1..];
+            let offset = -parse_tz_offset_str(offset_str);
+            (time_str, offset)
+        } else {
+            (s, 0)
+        }
+    } else {
+        (s, 0)
+    };
+
+    // Handle 24:00:00 which is valid in SQL but not in chrono
+    // It represents midnight at the end of the day (same as 00:00:00 the next day)
+    let time_part_owned: String;
+    let time_part_ref = if time_part.starts_with("24:") {
+        time_part_owned = time_part.replacen("24:", "00:", 1);
+        time_part_owned.as_str()
+    } else {
+        time_part
+    };
+
+    let time = NaiveTime::parse_from_str(time_part_ref, "%H:%M:%S")
+        .or_else(|_| NaiveTime::parse_from_str(time_part_ref, "%H:%M:%S%.f"))
+        .or_else(|_| NaiveTime::parse_from_str(time_part_ref, "%H:%M"))
+        .map_err(|_| Error::Parse(format!("Invalid TIMETZ format: {}", s)))?;
+
+    Ok((time, offset_secs))
+}
+
+/// Parse a timezone offset string like "0530" or "05:30" or "04:30:45" to seconds
+fn parse_tz_offset_str(s: &str) -> i32 {
+    // Split by colons first to handle HH:MM:SS format
+    let parts: Vec<&str> = s.split(':').collect();
+    if parts.len() >= 3 {
+        // HH:MM:SS format
+        let hours: i32 = parts[0].parse().unwrap_or(0);
+        let mins: i32 = parts[1].parse().unwrap_or(0);
+        let secs: i32 = parts[2].parse().unwrap_or(0);
+        return hours * 3600 + mins * 60 + secs;
+    } else if parts.len() == 2 {
+        // HH:MM format
+        let hours: i32 = parts[0].parse().unwrap_or(0);
+        let mins: i32 = parts[1].parse().unwrap_or(0);
+        return hours * 3600 + mins * 60;
+    }
+
+    // No colons - try HHMM or HHMMSS format
+    let s = s.replace(':', "");
+    if s.len() >= 6 {
+        let hours: i32 = s[..2].parse().unwrap_or(0);
+        let mins: i32 = s[2..4].parse().unwrap_or(0);
+        let secs: i32 = s[4..6].parse().unwrap_or(0);
+        hours * 3600 + mins * 60 + secs
+    } else if s.len() >= 4 {
+        let hours: i32 = s[..2].parse().unwrap_or(0);
+        let mins: i32 = s[2..4].parse().unwrap_or(0);
+        hours * 3600 + mins * 60
+    } else if s.len() >= 2 {
+        let hours: i32 = s[..2].parse().unwrap_or(0);
+        hours * 3600
+    } else {
+        0
+    }
+}
+
+/// Read a CSV file and return rows as Value vectors
+fn read_csv_file(path: &str, has_header: bool, delimiter: char) -> Result<Vec<Vec<Value>>> {
+    use arrow_csv::reader::ReaderBuilder;
+    use arrow_csv::reader::Format;
+    use std::fs::File;
+    use std::io::BufReader;
+
+    // First, infer the schema by reading the file
+    let file_for_schema = File::open(path)
+        .map_err(|e| Error::Execution(format!("Failed to open CSV file '{}': {}", path, e)))?;
+
+    let format = Format::default()
+        .with_header(has_header)
+        .with_delimiter(delimiter as u8);
+
+    // Infer schema from up to 100 rows
+    let (schema, _) = format.infer_schema(BufReader::new(file_for_schema), Some(100))
+        .map_err(|e| Error::Execution(format!("Failed to infer CSV schema: {}", e)))?;
+
+    // Now reopen and read with the inferred schema
+    let file = File::open(path)
+        .map_err(|e| Error::Execution(format!("Failed to open CSV file '{}': {}", path, e)))?;
+
+    let reader = ReaderBuilder::new(std::sync::Arc::new(schema))
+        .with_format(format)
+        .build(file)
+        .map_err(|e| Error::Execution(format!("Failed to create CSV reader: {}", e)))?;
+
+    let mut all_rows = Vec::new();
+
+    for batch_result in reader {
+        let batch = batch_result
+            .map_err(|e| Error::Execution(format!("Failed to read CSV batch: {}", e)))?;
+
+        // Convert Arrow RecordBatch to rows of Values
+        let num_rows = batch.num_rows();
+        let num_cols = batch.num_columns();
+
+        for row_idx in 0..num_rows {
+            let mut row = Vec::with_capacity(num_cols);
+            for col_idx in 0..num_cols {
+                let col = batch.column(col_idx);
+                let value = arrow_array_to_value(col, row_idx)?;
+                row.push(value);
+            }
+            all_rows.push(row);
+        }
+    }
+
+    Ok(all_rows)
+}
+
+/// Read a Parquet file and return rows as Value vectors
+fn read_parquet_file(path: &str) -> Result<Vec<Vec<Value>>> {
+    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+    use std::fs::File;
+
+    let file = File::open(path)
+        .map_err(|e| Error::Execution(format!("Failed to open Parquet file '{}': {}", path, e)))?;
+
+    let reader = ParquetRecordBatchReaderBuilder::try_new(file)
+        .map_err(|e| Error::Execution(format!("Failed to create Parquet reader: {}", e)))?
+        .build()
+        .map_err(|e| Error::Execution(format!("Failed to build Parquet reader: {}", e)))?;
+
+    let mut all_rows = Vec::new();
+
+    for batch_result in reader {
+        let batch = batch_result
+            .map_err(|e| Error::Execution(format!("Failed to read Parquet batch: {}", e)))?;
+
+        // Convert Arrow RecordBatch to rows of Values
+        let num_rows = batch.num_rows();
+        let num_cols = batch.num_columns();
+
+        for row_idx in 0..num_rows {
+            let mut row = Vec::with_capacity(num_cols);
+            for col_idx in 0..num_cols {
+                let col = batch.column(col_idx);
+                let value = arrow_array_to_value(col, row_idx)?;
+                row.push(value);
+            }
+            all_rows.push(row);
+        }
+    }
+
+    Ok(all_rows)
+}
+
+/// Read JSON file and return rows
+fn read_json_file(path: &str, column_names: &[String]) -> Result<Vec<Vec<Value>>> {
+    use std::fs::File;
+    use std::io::{BufRead, BufReader};
+
+    let file = File::open(path)
+        .map_err(|e| Error::Execution(format!("Failed to open JSON file '{}': {}", path, e)))?;
+
+    let reader = BufReader::new(file);
+    let mut all_rows = Vec::new();
+
+    for line in reader.lines() {
+        let line = line.map_err(|e| Error::Execution(format!("Failed to read JSON line: {}", e)))?;
+        let line = line.trim();
+
+        if line.is_empty() {
+            continue;
+        }
+
+        // Parse as JSON object
+        let json: serde_json::Value = serde_json::from_str(line)
+            .map_err(|e| Error::Execution(format!("Failed to parse JSON: {}", e)))?;
+
+        if let serde_json::Value::Object(obj) = json {
+            let mut row = Vec::with_capacity(column_names.len());
+            for col_name in column_names {
+                let value = obj.get(col_name)
+                    .map(|v| json_value_to_ironduck_value(v))
+                    .unwrap_or(Value::Null);
+                row.push(value);
+            }
+            all_rows.push(row);
+        }
+    }
+
+    Ok(all_rows)
+}
+
+/// Convert a serde_json Value to an IronDuck Value
+fn json_value_to_ironduck_value(v: &serde_json::Value) -> Value {
+    match v {
+        serde_json::Value::Null => Value::Null,
+        serde_json::Value::Bool(b) => Value::Boolean(*b),
+        serde_json::Value::Number(n) => {
+            if let Some(i) = n.as_i64() {
+                Value::BigInt(i)
+            } else if let Some(f) = n.as_f64() {
+                Value::Double(f)
+            } else {
+                Value::Varchar(n.to_string())
+            }
+        }
+        serde_json::Value::String(s) => Value::Varchar(s.clone()),
+        serde_json::Value::Array(arr) => {
+            let values: Vec<Value> = arr.iter().map(json_value_to_ironduck_value).collect();
+            Value::List(values)
+        }
+        serde_json::Value::Object(_) => {
+            // Serialize nested objects as JSON strings
+            Value::Varchar(v.to_string())
+        }
+    }
+}
+
+/// Convert an Arrow array value at a given index to a Value
+fn arrow_array_to_value(array: &std::sync::Arc<dyn arrow::array::Array>, row_idx: usize) -> Result<Value> {
+    use arrow::array::*;
+    use arrow::datatypes::DataType;
+
+    if array.is_null(row_idx) {
+        return Ok(Value::Null);
+    }
+
+    match array.data_type() {
+        DataType::Boolean => {
+            let arr = array.as_any().downcast_ref::<BooleanArray>().unwrap();
+            Ok(Value::Boolean(arr.value(row_idx)))
+        }
+        DataType::Int8 => {
+            let arr = array.as_any().downcast_ref::<Int8Array>().unwrap();
+            Ok(Value::Integer(arr.value(row_idx) as i32))
+        }
+        DataType::Int16 => {
+            let arr = array.as_any().downcast_ref::<Int16Array>().unwrap();
+            Ok(Value::Integer(arr.value(row_idx) as i32))
+        }
+        DataType::Int32 => {
+            let arr = array.as_any().downcast_ref::<Int32Array>().unwrap();
+            Ok(Value::Integer(arr.value(row_idx)))
+        }
+        DataType::Int64 => {
+            let arr = array.as_any().downcast_ref::<Int64Array>().unwrap();
+            Ok(Value::BigInt(arr.value(row_idx)))
+        }
+        DataType::UInt8 => {
+            let arr = array.as_any().downcast_ref::<UInt8Array>().unwrap();
+            Ok(Value::Integer(arr.value(row_idx) as i32))
+        }
+        DataType::UInt16 => {
+            let arr = array.as_any().downcast_ref::<UInt16Array>().unwrap();
+            Ok(Value::Integer(arr.value(row_idx) as i32))
+        }
+        DataType::UInt32 => {
+            let arr = array.as_any().downcast_ref::<UInt32Array>().unwrap();
+            Ok(Value::BigInt(arr.value(row_idx) as i64))
+        }
+        DataType::UInt64 => {
+            let arr = array.as_any().downcast_ref::<UInt64Array>().unwrap();
+            Ok(Value::BigInt(arr.value(row_idx) as i64))
+        }
+        DataType::Float32 => {
+            let arr = array.as_any().downcast_ref::<Float32Array>().unwrap();
+            Ok(Value::Double(arr.value(row_idx) as f64))
+        }
+        DataType::Float64 => {
+            let arr = array.as_any().downcast_ref::<Float64Array>().unwrap();
+            Ok(Value::Double(arr.value(row_idx)))
+        }
+        DataType::Utf8 => {
+            let arr = array.as_any().downcast_ref::<StringArray>().unwrap();
+            Ok(Value::Varchar(arr.value(row_idx).to_string()))
+        }
+        DataType::LargeUtf8 => {
+            let arr = array.as_any().downcast_ref::<LargeStringArray>().unwrap();
+            Ok(Value::Varchar(arr.value(row_idx).to_string()))
+        }
+        DataType::Date32 => {
+            let arr = array.as_any().downcast_ref::<Date32Array>().unwrap();
+            let days = arr.value(row_idx);
+            let date = chrono::NaiveDate::from_num_days_from_ce_opt(days + 719163)
+                .unwrap_or_else(|| chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap());
+            Ok(Value::Date(date))
+        }
+        DataType::Date64 => {
+            let arr = array.as_any().downcast_ref::<Date64Array>().unwrap();
+            let millis = arr.value(row_idx);
+            let datetime = chrono::DateTime::from_timestamp_millis(millis)
+                .map(|dt| dt.naive_utc().date())
+                .unwrap_or_else(|| chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap());
+            Ok(Value::Date(datetime))
+        }
+        DataType::Timestamp(_, _) => {
+            let arr = array.as_any().downcast_ref::<TimestampMicrosecondArray>()
+                .or_else(|| Some(array.as_any().downcast_ref::<TimestampMicrosecondArray>()?));
+            if let Some(arr) = arr {
+                let micros = arr.value(row_idx);
+                let dt = chrono::DateTime::from_timestamp_micros(micros)
+                    .map(|dt| dt.naive_utc())
+                    .unwrap_or_else(|| chrono::NaiveDateTime::from_timestamp_opt(0, 0).unwrap());
+                Ok(Value::Timestamp(dt))
+            } else {
+                Ok(Value::Null)
+            }
+        }
+        _ => {
+            // For unsupported types, convert to string representation
+            let formatter = arrow::util::display::ArrayFormatter::try_new(array.as_ref(), &Default::default())
+                .map_err(|e| Error::Execution(format!("Failed to format array: {}", e)))?;
+            Ok(Value::Varchar(formatter.value(row_idx).to_string()))
+        }
+    }
+}
+
+/// Write rows to a CSV file
+fn write_csv_file(path: &str, rows: &[Vec<Value>], _header: bool, delimiter: char) -> Result<()> {
+    use std::fs::File;
+    use std::io::Write;
+
+    let mut file = File::create(path)
+        .map_err(|e| Error::Execution(format!("Failed to create file '{}': {}", path, e)))?;
+
+    for row in rows {
+        let line: Vec<String> = row.iter().map(|v| format_value_for_csv(v, delimiter)).collect();
+        writeln!(file, "{}", line.join(&delimiter.to_string()))
+            .map_err(|e| Error::Execution(format!("Failed to write to file: {}", e)))?;
+    }
+
+    Ok(())
+}
+
+/// Format a Value for CSV output
+fn format_value_for_csv(value: &Value, delimiter: char) -> String {
+    match value {
+        Value::Null => "".to_string(),
+        Value::Boolean(b) => if *b { "true".to_string() } else { "false".to_string() },
+        Value::TinyInt(i) => i.to_string(),
+        Value::SmallInt(i) => i.to_string(),
+        Value::Integer(i) => i.to_string(),
+        Value::BigInt(i) => i.to_string(),
+        Value::HugeInt(i) => i.to_string(),
+        Value::UTinyInt(i) => i.to_string(),
+        Value::USmallInt(i) => i.to_string(),
+        Value::UInteger(i) => i.to_string(),
+        Value::UBigInt(i) => i.to_string(),
+        Value::UHugeInt(i) => i.to_string(),
+        Value::Float(f) => f.to_string(),
+        Value::Double(d) => d.to_string(),
+        Value::Decimal(d) => d.to_string(),
+        Value::Varchar(s) => {
+            // Escape quotes and wrap in quotes if contains delimiter or quote
+            if s.contains(delimiter) || s.contains('"') || s.contains('\n') {
+                format!("\"{}\"", s.replace('"', "\"\""))
+            } else {
+                s.clone()
+            }
+        }
+        Value::Blob(b) => {
+            // Convert bytes to hex string
+            let hex: String = b.iter().map(|byte| format!("{:02x}", byte)).collect();
+            format!("0x{}", hex)
+        }
+        Value::Date(d) => d.format("%Y-%m-%d").to_string(),
+        Value::Time(t) => t.format("%H:%M:%S").to_string(),
+        Value::TimeTz(t, _offset) => t.format("%H:%M:%S").to_string(),
+        Value::Timestamp(ts) => ts.format("%Y-%m-%d %H:%M:%S").to_string(),
+        Value::TimestampTz(ts) => ts.format("%Y-%m-%d %H:%M:%S UTC").to_string(),
+        Value::Interval(i) => format!("{:?}", i),
+        Value::List(items) => {
+            let inner: Vec<String> = items.iter().map(|v| format_value_for_csv(v, delimiter)).collect();
+            format!("[{}]", inner.join(","))
+        }
+        Value::Struct(fields) => {
+            let inner: Vec<String> = fields.iter()
+                .map(|(k, v)| format!("{}:{}", k, format_value_for_csv(v, delimiter)))
+                .collect();
+            format!("{{{}}}", inner.join(","))
+        }
+        Value::Map(pairs) => {
+            let inner: Vec<String> = pairs.iter()
+                .map(|(k, v)| format!("{}=>{}", format_value_for_csv(k, delimiter), format_value_for_csv(v, delimiter)))
+                .collect();
+            format!("{{{}}}", inner.join(","))
+        }
+        Value::Uuid(u) => u.to_string(),
+    }
 }

@@ -1,9 +1,10 @@
 //! Plan builder - converts bound statements to logical plans
 
-use super::{LogicalOperator, LogicalPlan, SetOperationType};
+use super::{AlterTableOp, CopyFormatKind, CopySourceKind, LogicalOperator, LogicalPlan, SetOperationType, TransactionOp};
 use ironduck_binder::{
-    BoundDelete, BoundExpression, BoundExpressionKind, BoundSelect, BoundSetOperation,
-    BoundStatement, BoundTableRef, BoundUpdate, DistinctKind,
+    AlterTableOperation, BoundCTE, BoundCopy, BoundCreateIndex, BoundDelete, BoundExpression, BoundExpressionKind,
+    BoundSelect, BoundSetOperation, BoundStatement, BoundTableRef, BoundUpdate, CopyFormatType,
+    CopySource, DistinctKind, SetOperand, TransactionStatement,
 };
 use ironduck_common::{Error, LogicalType, Result, Value};
 
@@ -28,6 +29,11 @@ pub fn build_plan(statement: &BoundStatement) -> Result<LogicalPlan> {
                         .columns
                         .iter()
                         .map(|c| (c.name.clone(), c.data_type.clone()))
+                        .collect(),
+                    default_values: create
+                        .columns
+                        .iter()
+                        .map(|c| c.default.as_ref().map(convert_expression))
                         .collect(),
                     if_not_exists: create.if_not_exists,
                     source,
@@ -78,6 +84,19 @@ pub fn build_plan(statement: &BoundStatement) -> Result<LogicalPlan> {
             },
             vec!["Success".to_string()],
         )),
+        BoundStatement::CreateSequence(seq) => Ok(LogicalPlan::new(
+            LogicalOperator::CreateSequence {
+                schema: seq.schema.clone(),
+                name: seq.name.clone(),
+                start: seq.start,
+                increment: seq.increment,
+                min_value: seq.min_value,
+                max_value: seq.max_value,
+                cycle: seq.cycle,
+                if_not_exists: seq.if_not_exists,
+            },
+            vec!["Success".to_string()],
+        )),
         BoundStatement::Drop(drop) => Ok(LogicalPlan::new(
             LogicalOperator::Drop {
                 object_type: format!("{:?}", drop.object_type),
@@ -87,6 +106,17 @@ pub fn build_plan(statement: &BoundStatement) -> Result<LogicalPlan> {
             },
             vec!["Success".to_string()],
         )),
+        BoundStatement::AlterTable(alter) => {
+            let operation = convert_alter_table_operation(&alter.operation);
+            Ok(LogicalPlan::new(
+                LogicalOperator::AlterTable {
+                    schema: alter.schema.clone(),
+                    table_name: alter.table_name.clone(),
+                    operation,
+                },
+                vec!["Success".to_string()],
+            ))
+        }
         BoundStatement::Delete(delete) => {
             let predicate = delete.where_clause.as_ref().map(convert_expression);
 
@@ -125,6 +155,33 @@ pub fn build_plan(statement: &BoundStatement) -> Result<LogicalPlan> {
                 vec!["plan".to_string()],
             ))
         }
+        BoundStatement::Copy(copy) => build_copy_plan(copy),
+        BoundStatement::CreateIndex(create) => Ok(LogicalPlan::new(
+            LogicalOperator::CreateIndex {
+                schema: create.schema.clone(),
+                index_name: create.index_name.clone(),
+                table_name: create.table_name.clone(),
+                columns: create.columns.clone(),
+                column_types: create.column_types.clone(),
+                unique: create.unique,
+                if_not_exists: create.if_not_exists,
+            },
+            vec!["Success".to_string()],
+        )),
+        BoundStatement::Transaction(tx) => {
+            let operation = match tx {
+                TransactionStatement::Begin => TransactionOp::Begin,
+                TransactionStatement::Commit => TransactionOp::Commit,
+                TransactionStatement::Rollback => TransactionOp::Rollback,
+                TransactionStatement::Savepoint(name) => TransactionOp::Savepoint(name.clone()),
+                TransactionStatement::ReleaseSavepoint(name) => TransactionOp::ReleaseSavepoint(name.clone()),
+                TransactionStatement::RollbackToSavepoint(name) => TransactionOp::RollbackToSavepoint(name.clone()),
+            };
+            Ok(LogicalPlan::new(
+                LogicalOperator::Transaction { operation },
+                vec!["Success".to_string()],
+            ))
+        }
         BoundStatement::NoOp => {
             // No-op statements (PRAGMA, SET, etc.) produce an empty result
             Ok(LogicalPlan::new(
@@ -135,10 +192,78 @@ pub fn build_plan(statement: &BoundStatement) -> Result<LogicalPlan> {
     }
 }
 
+/// Build a plan for COPY statement
+fn build_copy_plan(copy: &BoundCopy) -> Result<LogicalPlan> {
+    // Convert source
+    let source = match &copy.source {
+        CopySource::Table { schema, name, columns } => {
+            CopySourceKind::Table {
+                schema: schema.clone(),
+                name: name.clone(),
+                columns: columns.clone(),
+                column_types: vec![], // Will be populated during execution
+            }
+        }
+        CopySource::Query(query) => {
+            let query_plan = build_select_plan(query)?;
+            CopySourceKind::Query(Box::new(query_plan.root))
+        }
+    };
+
+    // Convert format
+    let format = match copy.format.format_type {
+        CopyFormatType::Csv => CopyFormatKind::Csv,
+        CopyFormatType::Parquet => CopyFormatKind::Parquet,
+    };
+
+    Ok(LogicalPlan::new(
+        LogicalOperator::Copy {
+            to: copy.to,
+            source: Box::new(source),
+            file_path: copy.file_path.clone(),
+            format,
+            header: copy.format.header,
+            delimiter: copy.format.delimiter,
+        },
+        vec!["Count".to_string()],
+    ))
+}
+
+/// Build a plan for a SetOperand (either a SELECT or a nested set operation)
+fn build_operand_plan(operand: &SetOperand) -> Result<LogicalPlan> {
+    match operand {
+        SetOperand::Select(select) => build_select_plan(select),
+        SetOperand::SetOperation(set_op) => build_set_operation_plan_inner(set_op),
+    }
+}
+
+/// Build a plan for a set operation (UNION, INTERSECT, EXCEPT) - inner helper
+fn build_set_operation_plan_inner(set_op: &BoundSetOperation) -> Result<LogicalPlan> {
+    let left_plan = build_operand_plan(&set_op.left)?;
+    let right_plan = build_operand_plan(&set_op.right)?;
+
+    let op = match set_op.set_op {
+        ironduck_binder::SetOperationType::Union => SetOperationType::Union,
+        ironduck_binder::SetOperationType::Intersect => SetOperationType::Intersect,
+        ironduck_binder::SetOperationType::Except => SetOperationType::Except,
+    };
+
+    let plan = LogicalOperator::SetOperation {
+        left: Box::new(left_plan.root),
+        right: Box::new(right_plan.root),
+        op,
+        all: set_op.all,
+    };
+
+    // Note: ORDER BY and LIMIT are only applied to the outermost set operation
+    // (handled in build_set_operation_plan), not to nested operations
+    Ok(LogicalPlan::new(plan, left_plan.output_names))
+}
+
 /// Build a plan for a set operation (UNION, INTERSECT, EXCEPT)
 fn build_set_operation_plan(set_op: &BoundSetOperation) -> Result<LogicalPlan> {
-    let left_plan = build_select_plan(&set_op.left)?;
-    let right_plan = build_select_plan(&set_op.right)?;
+    let left_plan = build_operand_plan(&set_op.left)?;
+    let right_plan = build_operand_plan(&set_op.right)?;
 
     let op = match set_op.set_op {
         ironduck_binder::SetOperationType::Union => SetOperationType::Union,
@@ -188,8 +313,53 @@ fn build_set_operation_plan(set_op: &BoundSetOperation) -> Result<LogicalPlan> {
 fn build_select_plan(select: &BoundSelect) -> Result<LogicalPlan> {
     let output_names = select.output_names();
 
+    // Check if this is a VALUES clause
+    if !select.values_rows.is_empty() {
+        // Build a Values operator
+        let values: Vec<Vec<super::Expression>> = select
+            .values_rows
+            .iter()
+            .map(|row| row.iter().map(convert_expression).collect())
+            .collect();
+        let output_types = select.output_types();
+
+        let mut plan = super::LogicalOperator::Values { values, output_types };
+
+        // Apply ORDER BY if present
+        if !select.order_by.is_empty() {
+            let order_by: Vec<_> = select
+                .order_by
+                .iter()
+                .map(|o| super::OrderByExpression {
+                    expr: convert_expression(&o.expr),
+                    ascending: o.ascending,
+                    nulls_first: o.nulls_first,
+                })
+                .collect();
+            plan = super::LogicalOperator::Sort {
+                input: Box::new(plan),
+                order_by,
+            };
+        }
+
+        // Apply LIMIT/OFFSET if present
+        if select.limit.is_some() || select.offset.is_some() {
+            plan = super::LogicalOperator::Limit {
+                input: Box::new(plan),
+                limit: select.limit,
+                offset: select.offset,
+            };
+        }
+
+        return Ok(LogicalPlan {
+            root: plan,
+            output_names,
+        });
+    }
+
     // Start with the source (FROM clause)
-    let mut plan = build_from_plan(&select.from)?;
+    // Pass CTEs so recursive CTE references can be resolved
+    let mut plan = build_from_plan_with_ctes(&select.from, &select.ctes)?;
 
     // Add WHERE filter
     if let Some(where_clause) = &select.where_clause {
@@ -202,7 +372,13 @@ fn build_select_plan(select: &BoundSelect) -> Result<LogicalPlan> {
     // Check if we have aggregates
     let has_aggregates = select.select_list.iter().any(has_aggregate);
     let has_group_by = !select.group_by.is_empty();
+    let has_grouping_sets = !select.grouping_sets.is_empty();
     let has_having_aggregates = select.having.as_ref().map_or(false, has_aggregate);
+
+    // Handle GROUPING SETS / ROLLUP / CUBE
+    if has_grouping_sets {
+        return build_grouping_sets_plan(select, plan, &output_names);
+    }
 
     if has_aggregates || has_group_by || has_having_aggregates {
         // Build aggregate plan
@@ -250,12 +426,24 @@ fn build_select_plan(select: &BoundSelect) -> Result<LogicalPlan> {
 
         for (idx, bound_expr) in select.select_list.iter().enumerate() {
             if is_aggregate_expr(bound_expr) {
-                // This is an aggregate - reference its position in the aggregate output
+                // This is a direct aggregate - reference its position in the aggregate output
                 expressions.push(super::Expression::ColumnRef {
                     table_index: 0,
                     column_index: num_group_by + agg_idx,
                     name: output_names.get(idx).cloned().unwrap_or_default(),
                 });
+                agg_idx += 1;
+            } else if has_aggregate(bound_expr) {
+                // This is an expression wrapping an aggregate (e.g., CAST(SUM(x) AS BIGINT))
+                // We need to reference the aggregate output and wrap it with the outer expression
+                let agg_ref = super::Expression::ColumnRef {
+                    table_index: 0,
+                    column_index: num_group_by + agg_idx,
+                    name: output_names.get(idx).cloned().unwrap_or_default(),
+                };
+                // Apply the outer wrapper (e.g., Cast) to the aggregate result reference
+                let wrapped = wrap_aggregate_reference(bound_expr, agg_ref);
+                expressions.push(wrapped);
                 agg_idx += 1;
             } else if has_group_by {
                 // This should be a group by column - find its position
@@ -284,16 +472,23 @@ fn build_select_plan(select: &BoundSelect) -> Result<LogicalPlan> {
             output_types,
         };
     } else {
-        // Check for window functions
-        let has_windows = select.select_list.iter().any(has_window_function);
+        // Check for window functions in SELECT or QUALIFY
+        let has_windows = select.select_list.iter().any(has_window_function)
+            || select.qualify.as_ref().map_or(false, has_window_function);
 
         if has_windows {
-            // Extract window expressions
-            let window_exprs: Vec<_> = select
+            // Extract window expressions from SELECT list
+            let mut window_exprs: Vec<_> = select
                 .select_list
                 .iter()
                 .filter_map(extract_window_expression)
                 .collect();
+
+            // Also extract window functions from QUALIFY clause
+            let select_window_count = window_exprs.len();
+            if let Some(qualify) = &select.qualify {
+                extract_all_window_expressions(qualify, &mut window_exprs);
+            }
 
             // Get input types for the Window operator
             let input_types = plan.output_types();
@@ -312,9 +507,25 @@ fn build_select_plan(select: &BoundSelect) -> Result<LogicalPlan> {
             plan = LogicalOperator::Window {
                 input: Box::new(plan),
                 window_exprs,
-                output_names: window_output_names,
+                output_names: window_output_names.clone(),
                 output_types: window_output_types,
             };
+
+            // Apply QUALIFY filter if present (filters after window functions)
+            if let Some(qualify) = &select.qualify {
+                // Convert qualify expression, replacing window function references
+                // with column references to the Window operator output
+                let qualify_predicate = convert_qualify_expression(
+                    qualify,
+                    &select.select_list,
+                    input_cols,
+                    select_window_count,
+                );
+                plan = LogicalOperator::Filter {
+                    input: Box::new(plan),
+                    predicate: qualify_predicate,
+                };
+            }
 
             // Build projection that references window output
             let mut expressions = Vec::new();
@@ -435,8 +646,223 @@ fn build_select_plan(select: &BoundSelect) -> Result<LogicalPlan> {
     Ok(LogicalPlan::new(plan, output_names))
 }
 
+/// Build a plan for GROUPING SETS / ROLLUP / CUBE queries.
+/// Each grouping set results in a separate aggregate, and all are combined via UNION ALL.
+fn build_grouping_sets_plan(
+    select: &BoundSelect,
+    input_plan: LogicalOperator,
+    output_names: &[String],
+) -> Result<LogicalPlan> {
+    // Collect aggregates from SELECT list
+    let mut aggregates: Vec<_> = select
+        .select_list
+        .iter()
+        .filter_map(|expr| extract_aggregate(expr))
+        .collect();
+
+    // Also collect aggregates from HAVING clause
+    let having_agg_start = aggregates.len();
+    if let Some(having) = &select.having {
+        collect_aggregates_from_expr(having, &mut aggregates);
+    }
+
+    // Get all unique grouping columns across all grouping sets
+    // These define the canonical column order for the output
+    let all_group_exprs: Vec<super::Expression> = select
+        .grouping_sets
+        .iter()
+        .flatten()
+        .map(convert_expression)
+        .collect::<Vec<_>>();
+
+    // Deduplicate while preserving order
+    let mut unique_group_exprs: Vec<super::Expression> = Vec::new();
+    for expr in &all_group_exprs {
+        if !unique_group_exprs.iter().any(|e| expressions_equal(e, expr)) {
+            unique_group_exprs.push(expr.clone());
+        }
+    }
+    let num_unique_groups = unique_group_exprs.len();
+
+    // Build a plan for each grouping set
+    let mut grouping_set_plans: Vec<LogicalOperator> = Vec::new();
+
+    for grouping_set in &select.grouping_sets {
+        // Convert this grouping set's expressions
+        let gs_exprs: Vec<super::Expression> = grouping_set.iter().map(convert_expression).collect();
+        let gs_len = gs_exprs.len();
+
+        // Build the aggregate for this grouping set
+        let agg_plan = LogicalOperator::Aggregate {
+            input: Box::new(input_plan.clone()),
+            group_by: gs_exprs.clone(),
+            aggregates: aggregates.clone(),
+        };
+
+        // Apply HAVING filter if present
+        let filtered_plan = if let Some(having) = &select.having {
+            let having_predicate = convert_having_expression(
+                having,
+                &gs_exprs,
+                gs_len,
+                &select.select_list,
+                having_agg_start,
+            );
+            LogicalOperator::Filter {
+                input: Box::new(agg_plan),
+                predicate: having_predicate,
+            }
+        } else {
+            agg_plan
+        };
+
+        // Build projection that maps columns to canonical positions
+        // For columns in this grouping set: reference from aggregate output
+        // For columns not in this grouping set: NULL
+        // For aggregates: reference from aggregate output
+        let mut expressions = Vec::new();
+        let mut agg_idx = 0;
+
+        for (idx, bound_expr) in select.select_list.iter().enumerate() {
+            if is_aggregate_expr(bound_expr) {
+                // This is an aggregate - reference it from aggregate output
+                expressions.push(super::Expression::ColumnRef {
+                    table_index: 0,
+                    column_index: gs_len + agg_idx,
+                    name: output_names.get(idx).cloned().unwrap_or_default(),
+                });
+                agg_idx += 1;
+            } else if has_aggregate(bound_expr) {
+                // Expression wrapping an aggregate
+                let agg_ref = super::Expression::ColumnRef {
+                    table_index: 0,
+                    column_index: gs_len + agg_idx,
+                    name: output_names.get(idx).cloned().unwrap_or_default(),
+                };
+                let wrapped = wrap_aggregate_reference(bound_expr, agg_ref);
+                expressions.push(wrapped);
+                agg_idx += 1;
+            } else {
+                // This should be a group by column
+                let converted = convert_expression(bound_expr);
+
+                // Check if this column is in the current grouping set
+                if let Some(pos) = gs_exprs.iter().position(|g| expressions_equal(g, &converted)) {
+                    // Column is in this grouping set - reference it
+                    expressions.push(super::Expression::ColumnRef {
+                        table_index: 0,
+                        column_index: pos,
+                        name: output_names.get(idx).cloned().unwrap_or_default(),
+                    });
+                } else {
+                    // Column is NOT in this grouping set - use NULL
+                    expressions.push(super::Expression::Constant(Value::Null));
+                }
+            }
+        }
+
+        let output_types: Vec<_> = select
+            .select_list
+            .iter()
+            .map(|e| e.return_type.clone())
+            .collect();
+
+        let projected_plan = LogicalOperator::Project {
+            input: Box::new(filtered_plan),
+            expressions,
+            output_names: output_names.to_vec(),
+            output_types,
+        };
+
+        grouping_set_plans.push(projected_plan);
+    }
+
+    // Combine all grouping set plans with UNION ALL
+    let mut result_plan = grouping_set_plans.remove(0);
+    for plan in grouping_set_plans {
+        result_plan = LogicalOperator::SetOperation {
+            left: Box::new(result_plan),
+            right: Box::new(plan),
+            op: SetOperationType::Union,
+            all: true, // UNION ALL to preserve duplicates
+        };
+    }
+
+    // Apply ORDER BY if present
+    if !select.order_by.is_empty() {
+        let order_by: Vec<_> = select
+            .order_by
+            .iter()
+            .map(|o| super::OrderByExpression {
+                expr: convert_order_by_expression(&o.expr, &unique_group_exprs, num_unique_groups, &select.select_list),
+                ascending: o.ascending,
+                nulls_first: o.nulls_first,
+            })
+            .collect();
+
+        result_plan = LogicalOperator::Sort {
+            input: Box::new(result_plan),
+            order_by,
+        };
+    }
+
+    // Apply LIMIT/OFFSET if present
+    if select.limit.is_some() || select.offset.is_some() {
+        result_plan = LogicalOperator::Limit {
+            input: Box::new(result_plan),
+            limit: select.limit,
+            offset: select.offset,
+        };
+    }
+
+    // Apply DISTINCT
+    match &select.distinct {
+        DistinctKind::None => {}
+        DistinctKind::All => {
+            result_plan = LogicalOperator::Distinct {
+                input: Box::new(result_plan),
+                on_exprs: None,
+            };
+        }
+        DistinctKind::On(exprs) => {
+            let on_exprs: Vec<_> = exprs.iter().map(convert_expression).collect();
+            result_plan = LogicalOperator::Distinct {
+                input: Box::new(result_plan),
+                on_exprs: Some(on_exprs),
+            };
+        }
+    }
+
+    Ok(LogicalPlan::new(result_plan, output_names.to_vec()))
+}
+
+/// Convert ORDER BY expression for grouping sets queries
+fn convert_order_by_expression(
+    expr: &BoundExpression,
+    group_by: &[super::Expression],
+    _num_group_by: usize,
+    _select_list: &[BoundExpression],
+) -> super::Expression {
+    let converted = convert_expression(expr);
+
+    // If this is a group by column, reference it directly
+    if let Some(pos) = group_by.iter().position(|g| expressions_equal(g, &converted)) {
+        return super::Expression::ColumnRef {
+            table_index: 0,
+            column_index: pos,
+            name: expr.name(),
+        };
+    }
+
+    converted
+}
+
 /// Build plan for FROM clause
 fn build_from_plan(from: &[BoundTableRef]) -> Result<LogicalOperator> {
+    build_from_plan_with_ctes(from, &[])
+}
+
+fn build_from_plan_with_ctes(from: &[BoundTableRef], ctes: &[BoundCTE]) -> Result<LogicalOperator> {
     if from.is_empty() || matches!(from.first(), Some(BoundTableRef::Empty)) {
         // No FROM clause - return a dummy scan that produces one row
         return Ok(LogicalOperator::DummyScan);
@@ -445,20 +871,63 @@ fn build_from_plan(from: &[BoundTableRef]) -> Result<LogicalOperator> {
     let mut result: Option<LogicalOperator> = None;
 
     for table_ref in from {
-        let table_plan = build_table_ref_plan(table_ref)?;
+        let table_plan = build_table_ref_plan_with_ctes(table_ref, ctes)?;
 
         result = Some(match result {
             None => table_plan,
-            Some(left) => LogicalOperator::Join {
-                left: Box::new(left),
-                right: Box::new(table_plan),
-                join_type: super::JoinType::Cross,
-                condition: None,
+            Some(left) => {
+                // Check if this is a LATERAL cross join (FROM a, LATERAL (...))
+                let is_lateral = matches!(table_ref, BoundTableRef::Subquery { is_lateral: true, .. });
+                LogicalOperator::Join {
+                    left: Box::new(left),
+                    right: Box::new(table_plan),
+                    join_type: super::JoinType::Cross,
+                    condition: None,
+                    is_lateral,
+                    asof_condition: None,
+                }
             },
         });
     }
 
     Ok(result.unwrap_or(LogicalOperator::DummyScan))
+}
+
+/// Build plan for a table reference with CTE context
+fn build_table_ref_plan_with_ctes(table_ref: &BoundTableRef, ctes: &[BoundCTE]) -> Result<LogicalOperator> {
+    // Special handling for RecursiveCTERef - look up the CTE and build RecursiveCTE operator
+    if let BoundTableRef::RecursiveCTERef { cte_name, column_names, column_types, .. } = table_ref {
+        // Look for matching recursive CTE
+        if let Some(cte) = ctes.iter().find(|c| c.is_recursive && c.name.eq_ignore_ascii_case(cte_name)) {
+            // Build the base case plan
+            let base_plan = build_select_plan(&cte.query)?;
+
+            // Build the recursive case plan (this will contain RecursiveCTEScan for self-reference)
+            // The recursive case references the CTE which becomes RecursiveCTEScan
+            let recursive_plan = if let Some(ref recursive_query) = cte.recursive_query {
+                build_select_plan(recursive_query)?
+            } else {
+                // No recursive case - this shouldn't happen for recursive CTEs
+                return Err(ironduck_common::Error::Internal(
+                    "Recursive CTE missing recursive case".to_string()
+                ));
+            };
+
+            return Ok(LogicalOperator::RecursiveCTE {
+                name: cte_name.clone(),
+                base_case: Box::new(base_plan.root),
+                recursive_case: Box::new(recursive_plan.root),
+                output_names: column_names.clone(),
+                output_types: column_types.clone(),
+                union_all: cte.union_all,
+            });
+        }
+        // If CTE not found in ctes list, fall through to RecursiveCTEScan
+        // (This happens when building the recursive case itself)
+    }
+
+    // Delegate to regular build_table_ref_plan for other cases
+    build_table_ref_plan(table_ref)
 }
 
 /// Build plan for a table reference
@@ -487,10 +956,14 @@ fn build_table_ref_plan(table_ref: &BoundTableRef) -> Result<LogicalOperator> {
             right,
             join_type,
             condition,
+            asof_condition,
             ..
         } => {
             let left_plan = build_table_ref_plan(left)?;
             let right_plan = build_table_ref_plan(right)?;
+
+            // Check if the right side is a LATERAL subquery
+            let is_lateral = matches!(right.as_ref(), BoundTableRef::Subquery { is_lateral: true, .. });
 
             let logical_join_type = match join_type {
                 ironduck_binder::BoundJoinType::Inner => super::JoinType::Inner,
@@ -498,6 +971,9 @@ fn build_table_ref_plan(table_ref: &BoundTableRef) -> Result<LogicalOperator> {
                 ironduck_binder::BoundJoinType::Right => super::JoinType::Right,
                 ironduck_binder::BoundJoinType::Full => super::JoinType::Full,
                 ironduck_binder::BoundJoinType::Cross => super::JoinType::Cross,
+                ironduck_binder::BoundJoinType::Semi => super::JoinType::Semi,
+                ironduck_binder::BoundJoinType::Anti => super::JoinType::Anti,
+                ironduck_binder::BoundJoinType::AsOf => super::JoinType::AsOf,
             };
 
             Ok(LogicalOperator::Join {
@@ -505,6 +981,8 @@ fn build_table_ref_plan(table_ref: &BoundTableRef) -> Result<LogicalOperator> {
                 right: Box::new(right_plan),
                 join_type: logical_join_type,
                 condition: condition.as_ref().map(convert_expression),
+                is_lateral,
+                asof_condition: asof_condition.as_ref().map(convert_expression),
             })
         }
 
@@ -524,8 +1002,354 @@ fn build_table_ref_plan(table_ref: &BoundTableRef) -> Result<LogicalOperator> {
                         output_type: ironduck_common::LogicalType::BigInt,
                     })
                 }
+                ironduck_binder::TableFunctionType::Unnest { array_expr } => {
+                    let column_name = column_alias.clone().unwrap_or_else(|| "unnest".to_string());
+                    // Get element type from array expression
+                    let output_type = match &array_expr.return_type {
+                        ironduck_common::LogicalType::List(elem_type) => (**elem_type).clone(),
+                        _ => ironduck_common::LogicalType::Unknown,
+                    };
+                    Ok(LogicalOperator::TableFunction {
+                        function: super::TableFunctionKind::Unnest {
+                            array_expr: convert_expression(array_expr),
+                        },
+                        column_name,
+                        output_type,
+                    })
+                }
+                ironduck_binder::TableFunctionType::GenerateSubscripts { array_expr, dim } => {
+                    let column_name = column_alias.clone().unwrap_or_else(|| "generate_subscripts".to_string());
+                    Ok(LogicalOperator::TableFunction {
+                        function: super::TableFunctionKind::GenerateSubscripts {
+                            array_expr: convert_expression(array_expr),
+                            dim: *dim,
+                        },
+                        column_name,
+                        output_type: ironduck_common::LogicalType::BigInt,
+                    })
+                }
+                ironduck_binder::TableFunctionType::ReadCsv { path, has_header, delimiter } => {
+                    // Note: column_names and column_types are populated during execution
+                    // since we need to read the file to know the schema
+                    Ok(LogicalOperator::TableFunction {
+                        function: super::TableFunctionKind::ReadCsv {
+                            path: path.clone(),
+                            has_header: *has_header,
+                            delimiter: *delimiter,
+                            column_names: vec![],  // Populated during execution
+                            column_types: vec![],  // Populated during execution
+                        },
+                        column_name: "csv".to_string(),
+                        output_type: ironduck_common::LogicalType::Unknown,
+                    })
+                }
+                ironduck_binder::TableFunctionType::ReadParquet { path } => {
+                    // Note: column_names and column_types are populated during execution
+                    Ok(LogicalOperator::TableFunction {
+                        function: super::TableFunctionKind::ReadParquet {
+                            path: path.clone(),
+                            column_names: vec![],  // Populated during execution
+                            column_types: vec![],  // Populated during execution
+                        },
+                        column_name: "parquet".to_string(),
+                        output_type: ironduck_common::LogicalType::Unknown,
+                    })
+                }
             }
         }
+
+        BoundTableRef::RecursiveCTERef {
+            cte_name,
+            column_names,
+            column_types,
+            ..
+        } => Ok(LogicalOperator::RecursiveCTEScan {
+            cte_name: cte_name.clone(),
+            column_names: column_names.clone(),
+            output_types: column_types.clone(),
+        }),
+
+        BoundTableRef::SetOperationSubquery { set_operation, .. } => {
+            // Build the set operation plan
+            let plan = build_set_operation_plan(set_operation)?;
+            Ok(plan.root)
+        }
+
+        BoundTableRef::Pivot {
+            source,
+            aggregate_function,
+            aggregate_arg,
+            value_column,
+            pivot_values,
+            ..
+        } => {
+            // Build the source plan
+            let source_plan = build_table_ref_plan(source)?;
+
+            // Get column info from source
+            let source_output = get_table_ref_columns(source);
+            let source_types = get_table_ref_types(source);
+
+            // Find the value column index
+            let value_column_lower = value_column.to_lowercase();
+            let value_column_index = source_output.iter()
+                .position(|c| c.to_lowercase() == value_column_lower)
+                .unwrap_or(0);
+
+            // Find the aggregate arg column index (if it's a column ref)
+            let agg_arg_index = match &aggregate_arg.expr {
+                ironduck_binder::BoundExpressionKind::ColumnRef { column_idx, .. } => Some(*column_idx),
+                _ => None,
+            };
+
+            // Group columns are all columns except the value column and aggregate arg
+            let group_columns: Vec<(String, ironduck_common::LogicalType, usize)> = source_output.iter()
+                .enumerate()
+                .filter(|(idx, _)| *idx != value_column_index && agg_arg_index.map_or(true, |ai| *idx != ai))
+                .map(|(idx, name)| (name.clone(), source_types.get(idx).cloned().unwrap_or(ironduck_common::LogicalType::Unknown), idx))
+                .collect();
+
+            // Convert aggregate function name to AggregateFunction
+            let agg_func = convert_aggregate_function(aggregate_function)?;
+
+            Ok(LogicalOperator::Pivot {
+                input: Box::new(source_plan),
+                aggregate_function: agg_func,
+                aggregate_arg: convert_expression(aggregate_arg),
+                value_column: value_column.clone(),
+                value_column_index,
+                pivot_values: pivot_values.clone(),
+                group_columns,
+            })
+        }
+
+        BoundTableRef::Unpivot {
+            source,
+            value_column,
+            name_column,
+            unpivot_columns,
+            ..
+        } => {
+            // Build the source plan
+            let source_plan = build_table_ref_plan(source)?;
+
+            // Get column info from source
+            let source_output = get_table_ref_columns(source);
+            let source_types = get_table_ref_types(source);
+
+            // Find indices of columns to unpivot
+            let unpivot_lower: Vec<String> = unpivot_columns.iter().map(|c| c.to_lowercase()).collect();
+            let unpivot_cols: Vec<(String, usize, ironduck_common::LogicalType)> = source_output.iter()
+                .enumerate()
+                .filter(|(_, name)| unpivot_lower.contains(&name.to_lowercase()))
+                .map(|(idx, name)| (name.clone(), idx, source_types.get(idx).cloned().unwrap_or(ironduck_common::LogicalType::Unknown)))
+                .collect();
+
+            // Keep columns are all columns not being unpivoted
+            let keep_cols: Vec<(String, usize, ironduck_common::LogicalType)> = source_output.iter()
+                .enumerate()
+                .filter(|(_, name)| !unpivot_lower.contains(&name.to_lowercase()))
+                .map(|(idx, name)| (name.clone(), idx, source_types.get(idx).cloned().unwrap_or(ironduck_common::LogicalType::Unknown)))
+                .collect();
+
+            Ok(LogicalOperator::Unpivot {
+                input: Box::new(source_plan),
+                value_column: value_column.clone(),
+                name_column: name_column.clone(),
+                unpivot_columns: unpivot_cols,
+                keep_columns: keep_cols,
+            })
+        }
+
+        BoundTableRef::FileTableFunction {
+            path,
+            file_type,
+            column_names,
+            column_types,
+            ..
+        } => {
+            match file_type {
+                ironduck_binder::FileTableType::Csv { has_header, delimiter } => {
+                    Ok(LogicalOperator::TableFunction {
+                        function: super::TableFunctionKind::ReadCsv {
+                            path: path.clone(),
+                            has_header: *has_header,
+                            delimiter: *delimiter,
+                            column_names: column_names.clone(),
+                            column_types: column_types.clone(),
+                        },
+                        column_name: "csv".to_string(),
+                        output_type: ironduck_common::LogicalType::Unknown,
+                    })
+                }
+                ironduck_binder::FileTableType::Parquet => {
+                    Ok(LogicalOperator::TableFunction {
+                        function: super::TableFunctionKind::ReadParquet {
+                            path: path.clone(),
+                            column_names: column_names.clone(),
+                            column_types: column_types.clone(),
+                        },
+                        column_name: "parquet".to_string(),
+                        output_type: ironduck_common::LogicalType::Unknown,
+                    })
+                }
+                ironduck_binder::FileTableType::Json => {
+                    Ok(LogicalOperator::TableFunction {
+                        function: super::TableFunctionKind::ReadJson {
+                            path: path.clone(),
+                            column_names: column_names.clone(),
+                            column_types: column_types.clone(),
+                        },
+                        column_name: "json".to_string(),
+                        output_type: ironduck_common::LogicalType::Unknown,
+                    })
+                }
+            }
+        }
+
+        BoundTableRef::Empty => {
+            // Empty table for SELECT without FROM
+            Ok(LogicalOperator::DummyScan)
+        }
+    }
+}
+
+/// Convert aggregate function name to AggregateFunction enum
+fn convert_aggregate_function(name: &str) -> Result<super::AggregateFunction> {
+    match name.to_uppercase().as_str() {
+        "SUM" => Ok(super::AggregateFunction::Sum),
+        "COUNT" => Ok(super::AggregateFunction::Count),
+        "AVG" => Ok(super::AggregateFunction::Avg),
+        "MIN" => Ok(super::AggregateFunction::Min),
+        "MAX" => Ok(super::AggregateFunction::Max),
+        "FIRST" => Ok(super::AggregateFunction::First),
+        "LAST" => Ok(super::AggregateFunction::Last),
+        "STRING_AGG" | "LISTAGG" | "GROUP_CONCAT" => Ok(super::AggregateFunction::StringAgg),
+        "ARRAY_AGG" | "LIST" => Ok(super::AggregateFunction::ArrayAgg),
+        _ => Err(ironduck_common::Error::NotImplemented(format!("Aggregate function {} in PIVOT", name))),
+    }
+}
+
+/// Get column names from a bound table reference
+fn get_table_ref_columns(table_ref: &BoundTableRef) -> Vec<String> {
+    match table_ref {
+        BoundTableRef::BaseTable { column_names, .. } => column_names.clone(),
+        BoundTableRef::Subquery { subquery, .. } => subquery.output_names(),
+        BoundTableRef::Join { left, right, .. } => {
+            let mut cols = get_table_ref_columns(left);
+            cols.extend(get_table_ref_columns(right));
+            cols
+        }
+        BoundTableRef::TableFunction { alias, column_alias, .. } => {
+            vec![column_alias.clone().unwrap_or_else(|| alias.clone().unwrap_or_else(|| "value".to_string()))]
+        }
+        BoundTableRef::RecursiveCTERef { column_names, .. } => column_names.clone(),
+        BoundTableRef::SetOperationSubquery { column_names, .. } => column_names.clone(),
+        BoundTableRef::Pivot { source, aggregate_arg, value_column, pivot_values, .. } => {
+            // For pivot, output is: group columns + pivot value columns
+            // Group columns = all source columns EXCEPT value_column and aggregate_arg column
+            let source_cols = get_table_ref_columns(source);
+            let value_column_lower = value_column.to_lowercase();
+
+            // Find the aggregate arg column name if it's a column ref
+            let agg_arg_name = match &aggregate_arg.expr {
+                ironduck_binder::BoundExpressionKind::ColumnRef { name, .. } => Some(name.to_lowercase()),
+                _ => None,
+            };
+
+            // Filter to get only group columns
+            let mut cols: Vec<String> = source_cols.into_iter()
+                .filter(|c| {
+                    let c_lower = c.to_lowercase();
+                    c_lower != value_column_lower && agg_arg_name.as_ref().map_or(true, |an| c_lower != *an)
+                })
+                .collect();
+
+            // Add pivot value columns
+            cols.extend(pivot_values.iter().cloned());
+            cols
+        }
+        BoundTableRef::Unpivot { source, value_column, name_column, unpivot_columns, .. } => {
+            let source_cols = get_table_ref_columns(source);
+            let unpivot_lower: Vec<String> = unpivot_columns.iter().map(|c| c.to_lowercase()).collect();
+            let mut cols: Vec<String> = source_cols.into_iter()
+                .filter(|c| !unpivot_lower.contains(&c.to_lowercase()))
+                .collect();
+            // Order: keep columns, then name column (column names), then value column (values)
+            cols.push(name_column.clone());
+            cols.push(value_column.clone());
+            cols
+        }
+        BoundTableRef::FileTableFunction { column_names, .. } => column_names.clone(),
+        BoundTableRef::Empty => vec![],
+    }
+}
+
+/// Get column types from a bound table reference
+fn get_table_ref_types(table_ref: &BoundTableRef) -> Vec<ironduck_common::LogicalType> {
+    match table_ref {
+        BoundTableRef::BaseTable { column_types, .. } => column_types.clone(),
+        BoundTableRef::Subquery { subquery, .. } => subquery.output_types(),
+        BoundTableRef::Join { left, right, .. } => {
+            let mut types = get_table_ref_types(left);
+            types.extend(get_table_ref_types(right));
+            types
+        }
+        BoundTableRef::TableFunction { .. } => vec![ironduck_common::LogicalType::Unknown],
+        BoundTableRef::RecursiveCTERef { column_types, .. } => column_types.clone(),
+        BoundTableRef::SetOperationSubquery { column_types, .. } => column_types.clone(),
+        BoundTableRef::Pivot { source, aggregate_arg, value_column, pivot_values, .. } => {
+            // For pivot, types are: group column types + one for each pivot value
+            let source_cols = get_table_ref_columns(source);
+            let source_types = get_table_ref_types(source);
+            let value_column_lower = value_column.to_lowercase();
+
+            // Find the aggregate arg column name if it's a column ref
+            let agg_arg_name = match &aggregate_arg.expr {
+                ironduck_binder::BoundExpressionKind::ColumnRef { name, .. } => Some(name.to_lowercase()),
+                _ => None,
+            };
+
+            // Get types for group columns
+            let mut types: Vec<ironduck_common::LogicalType> = source_cols.iter()
+                .enumerate()
+                .filter(|(_, c)| {
+                    let c_lower = c.to_lowercase();
+                    c_lower != value_column_lower && agg_arg_name.as_ref().map_or(true, |an| c_lower != *an)
+                })
+                .map(|(i, _)| source_types.get(i).cloned().unwrap_or(ironduck_common::LogicalType::Unknown))
+                .collect();
+
+            // Add types for pivot value columns (aggregate result type, typically numeric)
+            for _ in pivot_values {
+                types.push(ironduck_common::LogicalType::Unknown);
+            }
+            types
+        }
+        BoundTableRef::Unpivot { source, unpivot_columns, .. } => {
+            let source_types = get_table_ref_types(source);
+            let source_cols = get_table_ref_columns(source);
+            let unpivot_lower: Vec<String> = unpivot_columns.iter().map(|c| c.to_lowercase()).collect();
+            let mut types: Vec<ironduck_common::LogicalType> = source_cols.iter()
+                .enumerate()
+                .filter(|(_, c)| !unpivot_lower.contains(&c.to_lowercase()))
+                .map(|(i, _)| source_types.get(i).cloned().unwrap_or(ironduck_common::LogicalType::Unknown))
+                .collect();
+            // Order: keep columns, then name column (varchar), then value column (from source)
+            // Name column is always varchar
+            types.push(ironduck_common::LogicalType::Varchar);
+            // Value column type - take from first unpivoted column
+            if let Some(first_unpivot) = source_cols.iter()
+                .enumerate()
+                .find(|(_, c)| unpivot_lower.contains(&c.to_lowercase())) {
+                types.push(source_types.get(first_unpivot.0).cloned().unwrap_or(ironduck_common::LogicalType::Unknown));
+            } else {
+                types.push(ironduck_common::LogicalType::Unknown);
+            }
+            types
+        }
+        BoundTableRef::FileTableFunction { column_types, .. } => column_types.clone(),
+        BoundTableRef::Empty => vec![],
     }
 }
 
@@ -540,6 +1364,16 @@ fn convert_expression(expr: &BoundExpression) -> super::Expression {
             name,
         } => super::Expression::ColumnRef {
             table_index: *table_idx,
+            column_index: *column_idx,
+            name: name.clone(),
+        },
+
+        BoundExpressionKind::OuterColumnRef {
+            depth,
+            column_idx,
+            name,
+        } => super::Expression::OuterColumnRef {
+            depth: *depth,
             column_index: *column_idx,
             name: name.clone(),
         },
@@ -568,6 +1402,11 @@ fn convert_expression(expr: &BoundExpression) -> super::Expression {
                 ironduck_binder::BoundBinaryOperator::Concat => super::BinaryOperator::Concat,
                 ironduck_binder::BoundBinaryOperator::Like => super::BinaryOperator::Like,
                 ironduck_binder::BoundBinaryOperator::ILike => super::BinaryOperator::ILike,
+                ironduck_binder::BoundBinaryOperator::BitwiseAnd => super::BinaryOperator::BitwiseAnd,
+                ironduck_binder::BoundBinaryOperator::BitwiseOr => super::BinaryOperator::BitwiseOr,
+                ironduck_binder::BoundBinaryOperator::BitwiseXor => super::BinaryOperator::BitwiseXor,
+                ironduck_binder::BoundBinaryOperator::ShiftLeft => super::BinaryOperator::ShiftLeft,
+                ironduck_binder::BoundBinaryOperator::ShiftRight => super::BinaryOperator::ShiftRight,
             };
 
             super::Expression::BinaryOp {
@@ -596,6 +1435,8 @@ fn convert_expression(expr: &BoundExpression) -> super::Expression {
             args,
             is_aggregate: _,
             distinct: _, // distinct is handled in extract_aggregate
+            order_by: _, // order_by is handled in extract_aggregate
+            filter: _,   // filter is handled in extract_aggregate
         } => {
             // Return function expression - aggregates are handled specially in Aggregate operator
             super::Expression::Function {
@@ -605,6 +1446,11 @@ fn convert_expression(expr: &BoundExpression) -> super::Expression {
         }
 
         BoundExpressionKind::Cast { expr, target_type } => super::Expression::Cast {
+            expr: Box::new(convert_expression(expr)),
+            target_type: target_type.clone(),
+        },
+
+        BoundExpressionKind::TryCast { expr, target_type } => super::Expression::TryCast {
             expr: Box::new(convert_expression(expr)),
             target_type: target_type.clone(),
         },
@@ -747,6 +1593,7 @@ fn has_aggregate(expr: &BoundExpression) -> bool {
             has_aggregate(left) || has_aggregate(right)
         }
         BoundExpressionKind::UnaryOp { expr, .. } => has_aggregate(expr),
+        BoundExpressionKind::Cast { expr, .. } | BoundExpressionKind::TryCast { expr, .. } => has_aggregate(expr),
         BoundExpressionKind::Case {
             operand,
             when_clauses,
@@ -763,6 +1610,97 @@ fn has_aggregate(expr: &BoundExpression) -> bool {
 /// Check if an expression is directly an aggregate function (not nested)
 fn is_aggregate_expr(expr: &BoundExpression) -> bool {
     matches!(&expr.expr, BoundExpressionKind::Function { is_aggregate: true, .. })
+}
+
+/// Wrap an aggregate output reference with the outer expression wrapper
+/// For example, if bound_expr is CAST(SUM(x) AS BIGINT), this returns CAST(agg_ref AS BIGINT)
+fn wrap_aggregate_reference(bound_expr: &BoundExpression, agg_ref: super::Expression) -> super::Expression {
+    match &bound_expr.expr {
+        // If this is the aggregate function itself, return the reference
+        BoundExpressionKind::Function { is_aggregate: true, .. } => agg_ref,
+        // If this is a Cast wrapping something containing an aggregate, recurse and wrap with Cast
+        BoundExpressionKind::Cast { expr, target_type } => {
+            let inner = wrap_aggregate_reference(expr, agg_ref);
+            super::Expression::Cast {
+                expr: Box::new(inner),
+                target_type: target_type.clone(),
+            }
+        }
+        // If this is a TryCast wrapping something containing an aggregate, recurse and wrap with TryCast
+        BoundExpressionKind::TryCast { expr, target_type } => {
+            let inner = wrap_aggregate_reference(expr, agg_ref);
+            super::Expression::TryCast {
+                expr: Box::new(inner),
+                target_type: target_type.clone(),
+            }
+        }
+        // If this is a BinaryOp containing an aggregate, recurse on the appropriate side
+        BoundExpressionKind::BinaryOp { left, op, right } => {
+            let has_left_agg = has_aggregate(left);
+            let has_right_agg = has_aggregate(right);
+
+            let left_expr = if has_left_agg {
+                wrap_aggregate_reference(left, agg_ref.clone())
+            } else {
+                convert_expression(left)
+            };
+            let right_expr = if has_right_agg {
+                wrap_aggregate_reference(right, agg_ref)
+            } else {
+                convert_expression(right)
+            };
+
+            super::Expression::BinaryOp {
+                left: Box::new(left_expr),
+                op: convert_binary_op(op),
+                right: Box::new(right_expr),
+            }
+        }
+        // If this is a Case expression containing an aggregate, recursively handle it
+        BoundExpressionKind::Case { operand, when_clauses, else_result } => {
+            let converted_operand = operand.as_ref().map(|op| {
+                if has_aggregate(op) {
+                    Box::new(wrap_aggregate_reference(op, agg_ref.clone()))
+                } else {
+                    Box::new(convert_expression(op))
+                }
+            });
+
+            let mut conditions = Vec::new();
+            let mut results = Vec::new();
+            for (cond, result) in when_clauses {
+                let c = if has_aggregate(cond) {
+                    wrap_aggregate_reference(cond, agg_ref.clone())
+                } else {
+                    convert_expression(cond)
+                };
+                let r = if has_aggregate(result) {
+                    wrap_aggregate_reference(result, agg_ref.clone())
+                } else {
+                    convert_expression(result)
+                };
+                conditions.push(c);
+                results.push(r);
+            }
+
+            let converted_else = else_result.as_ref().map(|e| {
+                if has_aggregate(e) {
+                    Box::new(wrap_aggregate_reference(e, agg_ref))
+                } else {
+                    Box::new(convert_expression(e))
+                }
+            });
+
+            super::Expression::Case {
+                operand: converted_operand,
+                conditions,
+                results,
+                else_result: converted_else,
+            }
+        }
+        // For other cases, just convert normally (shouldn't happen if has_aggregate was true)
+        _ => convert_expression(bound_expr),
+    }
 }
 
 /// Simple expression equality check for group by matching
@@ -782,11 +1720,41 @@ fn expressions_equal(a: &super::Expression, b: &super::Expression) -> bool {
 /// Extract aggregate expression
 fn extract_aggregate(expr: &BoundExpression) -> Option<super::AggregateExpression> {
     match &expr.expr {
+        // Handle Cast/TryCast expressions - look inside them for aggregates
+        BoundExpressionKind::Cast { expr, .. } | BoundExpressionKind::TryCast { expr, .. } => extract_aggregate(expr),
+        // Handle BinaryOp - check both sides for aggregates
+        BoundExpressionKind::BinaryOp { left, right, .. } => {
+            extract_aggregate(left).or_else(|| extract_aggregate(right))
+        }
+        // Handle Case - check all parts for aggregates
+        BoundExpressionKind::Case { operand, when_clauses, else_result } => {
+            if let Some(op) = operand {
+                if let Some(agg) = extract_aggregate(op) {
+                    return Some(agg);
+                }
+            }
+            for (cond, result) in when_clauses {
+                if let Some(agg) = extract_aggregate(cond) {
+                    return Some(agg);
+                }
+                if let Some(agg) = extract_aggregate(result) {
+                    return Some(agg);
+                }
+            }
+            if let Some(else_expr) = else_result {
+                if let Some(agg) = extract_aggregate(else_expr) {
+                    return Some(agg);
+                }
+            }
+            None
+        }
         BoundExpressionKind::Function {
             name,
             args,
             is_aggregate,
             distinct,
+            order_by,
+            filter,
         } if *is_aggregate => {
             let func = match name.as_str() {
                 "COUNT" => super::AggregateFunction::Count,
@@ -796,8 +1764,8 @@ fn extract_aggregate(expr: &BoundExpression) -> Option<super::AggregateExpressio
                 "MAX" => super::AggregateFunction::Max,
                 "FIRST" => super::AggregateFunction::First,
                 "LAST" => super::AggregateFunction::Last,
-                "STRING_AGG" | "GROUP_CONCAT" | "LISTAGG" => super::AggregateFunction::StringAgg,
-                "ARRAY_AGG" => super::AggregateFunction::ArrayAgg,
+                "STRING_AGG" | "GROUP_CONCAT" => super::AggregateFunction::StringAgg,
+                "ARRAY_AGG" | "LIST_AGG" | "LIST" => super::AggregateFunction::ArrayAgg,
                 "STDDEV" | "STDDEV_SAMP" => super::AggregateFunction::StdDev,
                 "STDDEV_POP" => super::AggregateFunction::StdDevPop,
                 "VARIANCE" | "VAR_SAMP" => super::AggregateFunction::Variance,
@@ -815,6 +1783,34 @@ fn extract_aggregate(expr: &BoundExpression) -> Option<super::AggregateExpressio
                 "COVAR_POP" => super::AggregateFunction::CovarPop,
                 "COVAR_SAMP" => super::AggregateFunction::CovarSamp,
                 "CORR" => super::AggregateFunction::Corr,
+                // New aggregate functions
+                "ARG_MAX" | "ARGMAX" | "MAX_BY" => super::AggregateFunction::ArgMax,
+                "ARG_MIN" | "ARGMIN" | "MIN_BY" => super::AggregateFunction::ArgMin,
+                "HISTOGRAM" => super::AggregateFunction::Histogram,
+                "ENTROPY" => super::AggregateFunction::Entropy,
+                "KURTOSIS" | "KURTOSIS_POP" => super::AggregateFunction::Kurtosis,
+                "SKEWNESS" | "SKEW" => super::AggregateFunction::Skewness,
+                "APPROX_COUNT_DISTINCT" | "APPROX_DISTINCT" => super::AggregateFunction::ApproxCountDistinct,
+                "REGR_SLOPE" => super::AggregateFunction::RegrSlope,
+                "REGR_INTERCEPT" => super::AggregateFunction::RegrIntercept,
+                "REGR_COUNT" => super::AggregateFunction::RegrCount,
+                "REGR_R2" => super::AggregateFunction::RegrR2,
+                "REGR_AVGX" => super::AggregateFunction::RegrAvgX,
+                "REGR_AVGY" => super::AggregateFunction::RegrAvgY,
+                "REGR_SXX" => super::AggregateFunction::RegrSXX,
+                "REGR_SYY" => super::AggregateFunction::RegrSYY,
+                "REGR_SXY" => super::AggregateFunction::RegrSXY,
+                // Additional aggregate functions
+                "ANY_VALUE" | "ARBITRARY" => super::AggregateFunction::AnyValue,
+                "LISTAGG" => super::AggregateFunction::StringAgg,
+                "FSUM" | "KAHAN_SUM" => super::AggregateFunction::FSum,
+                "QUANTILE" => super::AggregateFunction::Quantile,
+                "APPROX_QUANTILE" => super::AggregateFunction::ApproxQuantile,
+                "COUNT_IF" | "COUNTIF" => super::AggregateFunction::CountIf,
+                "SUM_IF" | "SUMIF" => super::AggregateFunction::SumIf,
+                "AVG_IF" | "AVGIF" => super::AggregateFunction::AvgIf,
+                "MIN_IF" | "MINIF" => super::AggregateFunction::MinIf,
+                "MAX_IF" | "MAXIF" => super::AggregateFunction::MaxIf,
                 _ => return None,
             };
 
@@ -829,11 +1825,23 @@ fn extract_aggregate(expr: &BoundExpression) -> Option<super::AggregateExpressio
                 args.iter().map(convert_expression).collect()
             };
 
+            // Convert order_by expressions
+            let converted_order_by: Vec<_> = order_by
+                .iter()
+                .map(|(expr, asc, nulls_first)| {
+                    (convert_expression(expr), *asc, *nulls_first)
+                })
+                .collect();
+
+            // Convert filter expression if present
+            let converted_filter = filter.as_ref().map(|f| convert_expression(f));
+
             Some(super::AggregateExpression {
                 function: func,
                 args: converted_args,
                 distinct: *distinct,
-                filter: None,
+                filter: converted_filter,
+                order_by: converted_order_by,
             })
         }
         _ => None,
@@ -848,12 +1856,49 @@ fn has_window_function(expr: &BoundExpression) -> bool {
             has_window_function(left) || has_window_function(right)
         }
         BoundExpressionKind::UnaryOp { expr, .. } => has_window_function(expr),
+        BoundExpressionKind::Cast { expr, .. } | BoundExpressionKind::TryCast { expr, .. } => has_window_function(expr),
         BoundExpressionKind::Case { operand, when_clauses, else_result } => {
             operand.as_ref().map_or(false, |e| has_window_function(e))
                 || when_clauses.iter().any(|(c, r)| has_window_function(c) || has_window_function(r))
                 || else_result.as_ref().map_or(false, |e| has_window_function(e))
         }
         _ => false,
+    }
+}
+
+/// Recursively extract all window expressions from an expression (e.g., in QUALIFY)
+fn extract_all_window_expressions(
+    expr: &BoundExpression,
+    result: &mut Vec<super::WindowExpression>,
+) {
+    match &expr.expr {
+        BoundExpressionKind::WindowFunction { .. } => {
+            if let Some(win_expr) = extract_window_expression(expr) {
+                result.push(win_expr);
+            }
+        }
+        BoundExpressionKind::BinaryOp { left, right, .. } => {
+            extract_all_window_expressions(left, result);
+            extract_all_window_expressions(right, result);
+        }
+        BoundExpressionKind::UnaryOp { expr: inner, .. } => {
+            extract_all_window_expressions(inner, result);
+        }
+        BoundExpressionKind::Function { args, .. } => {
+            for arg in args {
+                extract_all_window_expressions(arg, result);
+            }
+        }
+        BoundExpressionKind::Case { when_clauses, else_result, .. } => {
+            for (cond, res) in when_clauses {
+                extract_all_window_expressions(cond, result);
+                extract_all_window_expressions(res, result);
+            }
+            if let Some(else_res) = else_result {
+                extract_all_window_expressions(else_res, result);
+            }
+        }
+        _ => {}
     }
 }
 
@@ -865,6 +1910,7 @@ fn extract_window_expression(expr: &BoundExpression) -> Option<super::WindowExpr
             args,
             partition_by,
             order_by,
+            frame,
         } => {
             let func = match name.as_str() {
                 "ROW_NUMBER" => super::WindowFunction::RowNumber,
@@ -886,6 +1932,9 @@ fn extract_window_expression(expr: &BoundExpression) -> Option<super::WindowExpr
                 _ => return None,
             };
 
+            // Convert window frame if present
+            let converted_frame = frame.as_ref().map(|f| convert_window_frame(f));
+
             Some(super::WindowExpression {
                 function: func,
                 args: args.iter().map(convert_expression).collect(),
@@ -898,10 +1947,44 @@ fn extract_window_expression(expr: &BoundExpression) -> Option<super::WindowExpr
                         nulls_first: *nulls_first,
                     })
                     .collect(),
+                frame: converted_frame,
                 output_type: expr.return_type.clone(),
             })
         }
         _ => None,
+    }
+}
+
+/// Convert bound window frame to logical window frame
+fn convert_window_frame(frame: &ironduck_binder::WindowFrame) -> super::WindowFrame {
+    use ironduck_binder::{WindowFrameBound as BoundBound, WindowFrameType as BoundType};
+
+    let frame_type = match frame.frame_type {
+        BoundType::Rows => super::WindowFrameType::Rows,
+        BoundType::Range => super::WindowFrameType::Range,
+        BoundType::Groups => super::WindowFrameType::Groups,
+    };
+
+    let start = convert_window_frame_bound(&frame.start);
+    let end = convert_window_frame_bound(&frame.end);
+
+    super::WindowFrame {
+        frame_type,
+        start,
+        end,
+    }
+}
+
+/// Convert bound window frame bound to logical window frame bound
+fn convert_window_frame_bound(bound: &ironduck_binder::WindowFrameBound) -> super::WindowFrameBound {
+    use ironduck_binder::WindowFrameBound as BoundBound;
+
+    match bound {
+        BoundBound::UnboundedPreceding => super::WindowFrameBound::UnboundedPreceding,
+        BoundBound::Preceding(expr) => super::WindowFrameBound::Preceding(convert_expression(expr)),
+        BoundBound::CurrentRow => super::WindowFrameBound::CurrentRow,
+        BoundBound::Following(expr) => super::WindowFrameBound::Following(convert_expression(expr)),
+        BoundBound::UnboundedFollowing => super::WindowFrameBound::UnboundedFollowing,
     }
 }
 
@@ -924,6 +2007,11 @@ fn convert_binary_op(op: &ironduck_binder::BoundBinaryOperator) -> super::Binary
         ironduck_binder::BoundBinaryOperator::Concat => super::BinaryOperator::Concat,
         ironduck_binder::BoundBinaryOperator::Like => super::BinaryOperator::Like,
         ironduck_binder::BoundBinaryOperator::ILike => super::BinaryOperator::ILike,
+        ironduck_binder::BoundBinaryOperator::BitwiseAnd => super::BinaryOperator::BitwiseAnd,
+        ironduck_binder::BoundBinaryOperator::BitwiseOr => super::BinaryOperator::BitwiseOr,
+        ironduck_binder::BoundBinaryOperator::BitwiseXor => super::BinaryOperator::BitwiseXor,
+        ironduck_binder::BoundBinaryOperator::ShiftLeft => super::BinaryOperator::ShiftLeft,
+        ironduck_binder::BoundBinaryOperator::ShiftRight => super::BinaryOperator::ShiftRight,
     }
 }
 
@@ -1065,6 +2153,82 @@ fn convert_having_expression(
     convert_inner(expr, group_by, num_group_by, select_list, &mut having_agg_idx)
 }
 
+/// Convert QUALIFY expression with proper window function column references
+/// The QUALIFY clause filters rows after window functions are computed.
+/// Window functions are at columns [input_cols..input_cols + num_windows]
+/// select_window_count is the number of window functions from the SELECT list
+fn convert_qualify_expression(
+    expr: &BoundExpression,
+    select_list: &[BoundExpression],
+    input_cols: usize,
+    select_window_count: usize,
+) -> super::Expression {
+    fn convert_inner(
+        expr: &BoundExpression,
+        select_list: &[BoundExpression],
+        input_cols: usize,
+        select_window_count: usize,
+        qualify_window_idx: &mut usize,
+    ) -> super::Expression {
+        match &expr.expr {
+            BoundExpressionKind::WindowFunction { name, .. } => {
+                // Find matching window function in SELECT list
+                let mut select_window_idx = 0;
+                for sel_expr in select_list {
+                    if let BoundExpressionKind::WindowFunction { name: sel_name, .. } = &sel_expr.expr {
+                        if name == sel_name {
+                            // Found a match - reference the window output column
+                            return super::Expression::ColumnRef {
+                                table_index: 0,
+                                column_index: input_cols + select_window_idx,
+                                name: name.clone(),
+                            };
+                        }
+                        select_window_idx += 1;
+                    }
+                }
+                // Not found in SELECT - it's a window function in QUALIFY only
+                // These are positioned after select window functions
+                let idx = select_window_count + *qualify_window_idx;
+                *qualify_window_idx += 1;
+                super::Expression::ColumnRef {
+                    table_index: 0,
+                    column_index: input_cols + idx,
+                    name: name.clone(),
+                }
+            }
+            BoundExpressionKind::ColumnRef { table_idx, column_idx, name } => {
+                // Column reference - pass through
+                super::Expression::ColumnRef {
+                    table_index: *table_idx,
+                    column_index: *column_idx,
+                    name: name.clone(),
+                }
+            }
+            BoundExpressionKind::BinaryOp { left, op, right } => {
+                let logical_op = convert_binary_op(op);
+                super::Expression::BinaryOp {
+                    left: Box::new(convert_inner(left, select_list, input_cols, select_window_count, qualify_window_idx)),
+                    op: logical_op,
+                    right: Box::new(convert_inner(right, select_list, input_cols, select_window_count, qualify_window_idx)),
+                }
+            }
+            BoundExpressionKind::UnaryOp { op, expr: inner } => {
+                let logical_op = convert_unary_op(op);
+                super::Expression::UnaryOp {
+                    op: logical_op,
+                    expr: Box::new(convert_inner(inner, select_list, input_cols, select_window_count, qualify_window_idx)),
+                }
+            }
+            BoundExpressionKind::Constant(v) => super::Expression::Constant(v.clone()),
+            _ => convert_expression(expr),
+        }
+    }
+
+    let mut qualify_window_idx = 0;
+    convert_inner(expr, select_list, input_cols, select_window_count, &mut qualify_window_idx)
+}
+
 /// Find a matching output column for an ORDER BY expression
 /// Returns a ColumnRef pointing to the correct output column index if found
 fn find_matching_output_column(
@@ -1118,4 +2282,53 @@ fn find_matching_output_column(
     }
 
     None
+}
+
+/// Convert bound AlterTableOperation to planner AlterTableOp
+fn convert_alter_table_operation(op: &AlterTableOperation) -> AlterTableOp {
+    match op {
+        AlterTableOperation::AddColumn { column } => {
+            AlterTableOp::AddColumn {
+                name: column.name.clone(),
+                data_type: column.data_type.clone(),
+                nullable: column.nullable,
+                default: column.default.as_ref().map(convert_expression),
+            }
+        }
+        AlterTableOperation::DropColumn { column_name, if_exists } => {
+            AlterTableOp::DropColumn {
+                column_name: column_name.clone(),
+                if_exists: *if_exists,
+            }
+        }
+        AlterTableOperation::RenameColumn { old_name, new_name } => {
+            AlterTableOp::RenameColumn {
+                old_name: old_name.clone(),
+                new_name: new_name.clone(),
+            }
+        }
+        AlterTableOperation::RenameTable { new_name } => {
+            AlterTableOp::RenameTable {
+                new_name: new_name.clone(),
+            }
+        }
+        AlterTableOperation::AlterColumnType { column_name, new_type } => {
+            AlterTableOp::AlterColumnType {
+                column_name: column_name.clone(),
+                new_type: new_type.clone(),
+            }
+        }
+        AlterTableOperation::SetColumnDefault { column_name, default } => {
+            AlterTableOp::SetColumnDefault {
+                column_name: column_name.clone(),
+                default: default.as_ref().map(convert_expression),
+            }
+        }
+        AlterTableOperation::SetColumnNotNull { column_name, not_null } => {
+            AlterTableOp::SetColumnNotNull {
+                column_name: column_name.clone(),
+                not_null: *not_null,
+            }
+        }
+    }
 }

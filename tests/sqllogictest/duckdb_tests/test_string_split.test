@@ -1,0 +1,36 @@
+# STRING_SPLIT tests
+
+# Basic split
+query T
+SELECT STRING_SPLIT('a,b,c', ',');
+----
+[a, b, c]
+
+# Split with different delimiter
+query T
+SELECT STRING_SPLIT('hello world foo', ' ');
+----
+[hello, world, foo]
+
+# Split single element
+query T
+SELECT STRING_SPLIT('hello', ',');
+----
+[hello]
+
+# FORMAT function tests
+query T
+SELECT FORMAT('{} + {} = {}', 1, 2, 3);
+----
+1 + 2 = 3
+
+query T
+SELECT FORMAT('Hello {}!', 'World');
+----
+Hello World!
+
+query T
+SELECT FORMAT('Value is {}', 42);
+----
+Value is 42
+

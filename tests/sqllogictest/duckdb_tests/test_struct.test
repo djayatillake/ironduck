@@ -1,0 +1,42 @@
+# Struct/Dictionary tests
+
+# Struct literal
+query T
+SELECT {'a': 1, 'b': 2};
+----
+{a: 1, b: 2}
+
+# STRUCT_EXTRACT
+query I
+SELECT STRUCT_EXTRACT({'a': 1, 'b': 2}, 'a');
+----
+1
+
+query I
+SELECT STRUCT_EXTRACT({'a': 1, 'b': 2}, 'b');
+----
+2
+
+# Struct field access with bracket notation
+query I
+SELECT {'a': 1, 'b': 2}['a'];
+----
+1
+
+query T
+SELECT {'name': 'Alice', 'age': 30}['name'];
+----
+Alice
+
+# STRUCT_KEYS
+query T
+SELECT STRUCT_KEYS({'a': 1, 'b': 2});
+----
+[a, b]
+
+# STRUCT_VALUES
+query T
+SELECT STRUCT_VALUES({'a': 1, 'b': 2});
+----
+[1, 2]
+

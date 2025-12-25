@@ -1,0 +1,200 @@
+# Subquery tests
+
+# Setup
+statement ok
+CREATE TABLE employees (id INTEGER, name TEXT, dept_id INTEGER, salary INTEGER);
+
+statement ok
+INSERT INTO employees VALUES
+(1, 'Alice', 1, 50000),
+(2, 'Bob', 1, 60000),
+(3, 'Charlie', 2, 55000),
+(4, 'Diana', 2, 70000),
+(5, 'Eve', 3, 45000);
+
+statement ok
+CREATE TABLE departments (id INTEGER, name TEXT);
+
+statement ok
+INSERT INTO departments VALUES
+(1, 'Engineering'),
+(2, 'Sales'),
+(3, 'HR'),
+(4, 'Marketing');
+
+# Scalar subquery in SELECT
+query TI
+SELECT name, (SELECT MAX(salary) FROM employees) as max_sal FROM employees ORDER BY name LIMIT 3;
+----
+Alice
+70000
+Bob
+70000
+Charlie
+70000
+
+# Scalar subquery in WHERE
+query IT
+SELECT id, name FROM employees WHERE salary > (SELECT AVG(salary) FROM employees) ORDER BY id;
+----
+2
+Bob
+4
+Diana
+
+# Scalar subquery with alias
+query TI
+SELECT name, salary - (SELECT AVG(salary) FROM employees) as diff FROM employees ORDER BY name;
+----
+Alice
+-6000
+Bob
+4000
+Charlie
+-1000
+Diana
+14000
+Eve
+-11000
+
+# IN subquery
+query IT
+SELECT id, name FROM employees WHERE dept_id IN (SELECT id FROM departments WHERE name = 'Engineering') ORDER BY id;
+----
+1
+Alice
+2
+Bob
+
+# NOT IN subquery
+query IT
+SELECT id, name FROM departments WHERE id NOT IN (SELECT DISTINCT dept_id FROM employees) ORDER BY id;
+----
+4
+Marketing
+
+# Departments with employees (via JOIN)
+query IT
+SELECT DISTINCT d.id, d.name FROM departments d JOIN employees e ON d.id = e.dept_id ORDER BY d.id;
+----
+1
+Engineering
+2
+Sales
+3
+HR
+
+# Subquery in FROM clause (derived table)
+query TI
+SELECT sub.dept_name, sub.emp_count FROM (SELECT d.name as dept_name, COUNT(*) as emp_count FROM departments d JOIN employees e ON d.id = e.dept_id GROUP BY d.id, d.name) sub ORDER BY sub.emp_count DESC;
+----
+Engineering
+2
+Sales
+2
+HR
+1
+
+# Nested subqueries (simple)
+query IT
+SELECT id, name FROM employees WHERE salary > (SELECT AVG(salary) FROM employees) ORDER BY id;
+----
+2
+Bob
+4
+Diana
+
+# Subquery with aggregate comparison
+query TI
+SELECT name, salary FROM employees WHERE salary = (SELECT MAX(salary) FROM employees);
+----
+Diana
+70000
+
+query TI
+SELECT name, salary FROM employees WHERE salary = (SELECT MIN(salary) FROM employees);
+----
+Eve
+45000
+
+# Multiple scalar subqueries in SELECT
+query TIII
+SELECT name, salary, (SELECT MIN(salary) FROM employees) as min_sal, (SELECT MAX(salary) FROM employees) as max_sal FROM employees ORDER BY name;
+----
+Alice
+50000
+45000
+70000
+Bob
+60000
+45000
+70000
+Charlie
+55000
+45000
+70000
+Diana
+70000
+45000
+70000
+Eve
+45000
+45000
+70000
+
+# Subquery in HAVING
+query TI
+SELECT d.name, COUNT(*) as cnt FROM departments d JOIN employees e ON d.id = e.dept_id GROUP BY d.id, d.name HAVING COUNT(*) >= 2 ORDER BY d.name;
+----
+Engineering
+2
+Sales
+2
+
+# Subquery returning multiple columns in FROM
+query TII
+SELECT * FROM (SELECT dept_id, COUNT(*) as cnt, AVG(salary) as avg_sal FROM employees GROUP BY dept_id) sub ORDER BY dept_id;
+----
+1
+2
+55000
+2
+2
+62500
+3
+1
+45000
+
+# Subquery with ORDER BY and LIMIT
+query IT
+SELECT id, name FROM employees WHERE salary IN (SELECT salary FROM employees ORDER BY salary DESC LIMIT 2) ORDER BY id;
+----
+2
+Bob
+4
+Diana
+
+# Chained subqueries in FROM
+query I
+SELECT total FROM (SELECT SUM(cnt) as total FROM (SELECT COUNT(*) as cnt FROM employees GROUP BY dept_id) inner_sub) outer_sub;
+----
+5
+
+# Subquery with DISTINCT
+query I
+SELECT COUNT(*) FROM (SELECT DISTINCT dept_id FROM employees) sub;
+----
+3
+
+# IN with list of values
+query IT
+SELECT id, name FROM employees WHERE dept_id IN (1, 2) ORDER BY id;
+----
+1
+Alice
+2
+Bob
+3
+Charlie
+4
+Diana

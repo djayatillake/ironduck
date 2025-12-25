@@ -7,9 +7,39 @@ use ironduck_planner::LogicalPlan;
 
 pub mod rules;
 
-/// Optimize a logical plan
-pub fn optimize(plan: LogicalPlan) -> Result<LogicalPlan> {
-    // TODO: Apply optimization rules
+use rules::{ConstantFolding, FilterPushdown, LimitPushdown, PredicateSimplification, ProjectionPushdown};
+
+/// All optimization rules in order of application
+fn get_rules() -> Vec<Box<dyn OptimizationRule>> {
+    vec![
+        Box::new(ConstantFolding),
+        Box::new(PredicateSimplification),
+        Box::new(FilterPushdown),
+        Box::new(ProjectionPushdown),
+        Box::new(LimitPushdown),
+    ]
+}
+
+/// Optimize a logical plan by applying all rules repeatedly until no changes
+pub fn optimize(mut plan: LogicalPlan) -> Result<LogicalPlan> {
+    let rules = get_rules();
+    let max_iterations = 10; // Prevent infinite loops
+
+    for _ in 0..max_iterations {
+        let mut changed = false;
+
+        for rule in &rules {
+            if let Some(new_plan) = rule.apply(&plan) {
+                plan = new_plan;
+                changed = true;
+            }
+        }
+
+        if !changed {
+            break;
+        }
+    }
+
     Ok(plan)
 }
 

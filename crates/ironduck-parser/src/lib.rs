@@ -11,7 +11,8 @@ pub mod ast;
 
 /// Parse a SQL string into a list of statements
 pub fn parse_sql(sql: &str) -> Result<Vec<Statement>> {
-    // Use GenericDialect for now - we'll create a DuckDB dialect later
+    // Use GenericDialect for broader SQL compatibility
+    // DuckDB-specific features are handled in the binder
     let dialect = GenericDialect {};
     Parser::parse_sql(&dialect, sql).map_err(|e| Error::Parse(e.to_string()))
 }

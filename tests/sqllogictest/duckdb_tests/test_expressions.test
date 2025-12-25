@@ -1,0 +1,370 @@
+# Expression and operator tests
+
+# Arithmetic operators
+query I
+SELECT 1 + 2;
+----
+3
+
+query I
+SELECT 10 - 3;
+----
+7
+
+query I
+SELECT 4 * 5;
+----
+20
+
+query I
+SELECT 15 / 3;
+----
+5
+
+query I
+SELECT 17 % 5;
+----
+2
+
+query I
+SELECT -5;
+----
+-5
+
+# Comparison operators
+query I
+SELECT 5 > 3;
+----
+1
+
+query I
+SELECT 5 < 3;
+----
+0
+
+query I
+SELECT 5 >= 5;
+----
+1
+
+query I
+SELECT 5 <= 4;
+----
+0
+
+query I
+SELECT 5 = 5;
+----
+1
+
+query I
+SELECT 5 != 3;
+----
+1
+
+query I
+SELECT 5 <> 3;
+----
+1
+
+# BETWEEN
+query I
+SELECT 5 BETWEEN 1 AND 10;
+----
+1
+
+query I
+SELECT 15 BETWEEN 1 AND 10;
+----
+0
+
+query I
+SELECT 5 NOT BETWEEN 10 AND 20;
+----
+1
+
+# IN operator
+query I
+SELECT 3 IN (1, 2, 3, 4);
+----
+1
+
+query I
+SELECT 5 IN (1, 2, 3, 4);
+----
+0
+
+query I
+SELECT 5 NOT IN (1, 2, 3, 4);
+----
+1
+
+# IS NULL / IS NOT NULL
+query I
+SELECT NULL IS NULL;
+----
+1
+
+query I
+SELECT 5 IS NULL;
+----
+0
+
+query I
+SELECT 5 IS NOT NULL;
+----
+1
+
+query I
+SELECT NULL IS NOT NULL;
+----
+0
+
+# Boolean operators
+query I
+SELECT TRUE AND TRUE;
+----
+1
+
+query I
+SELECT TRUE AND FALSE;
+----
+0
+
+query I
+SELECT TRUE OR FALSE;
+----
+1
+
+query I
+SELECT FALSE OR FALSE;
+----
+0
+
+query I
+SELECT NOT TRUE;
+----
+0
+
+query I
+SELECT NOT FALSE;
+----
+1
+
+# CASE expression
+query T
+SELECT CASE WHEN 1 = 1 THEN 'yes' ELSE 'no' END;
+----
+yes
+
+query T
+SELECT CASE WHEN 1 = 2 THEN 'yes' ELSE 'no' END;
+----
+no
+
+query I
+SELECT CASE WHEN 5 > 3 THEN 1 WHEN 5 > 2 THEN 2 ELSE 3 END;
+----
+1
+
+query T
+SELECT CASE 2 WHEN 1 THEN 'one' WHEN 2 THEN 'two' ELSE 'other' END;
+----
+two
+
+# COALESCE
+query I
+SELECT COALESCE(NULL, 5);
+----
+5
+
+query I
+SELECT COALESCE(3, 5);
+----
+3
+
+query I
+SELECT COALESCE(NULL, NULL, 7);
+----
+7
+
+# NULLIF
+query I
+SELECT NULLIF(5, 5);
+----
+NULL
+
+query I
+SELECT NULLIF(5, 3);
+----
+5
+
+# IIF (inline if)
+query T
+SELECT IIF(1 > 0, 'positive', 'non-positive');
+----
+positive
+
+query T
+SELECT IIF(0 > 1, 'positive', 'non-positive');
+----
+non-positive
+
+# GREATEST and LEAST
+query I
+SELECT GREATEST(1, 5, 3, 2);
+----
+5
+
+query I
+SELECT LEAST(1, 5, 3, 2);
+----
+1
+
+query T
+SELECT GREATEST('apple', 'banana', 'cherry');
+----
+cherry
+
+query T
+SELECT LEAST('apple', 'banana', 'cherry');
+----
+apple
+
+# CAST expressions
+query I
+SELECT CAST('123' AS INTEGER);
+----
+123
+
+query T
+SELECT CAST(123 AS TEXT);
+----
+123
+
+query I
+SELECT CAST(5 AS REAL);
+----
+5
+
+# String concatenation
+query T
+SELECT 'Hello' || ' ' || 'World';
+----
+Hello World
+
+# LIKE operator
+query I
+SELECT 'hello' LIKE 'h%';
+----
+1
+
+query I
+SELECT 'hello' LIKE '%llo';
+----
+1
+
+query I
+SELECT 'hello' LIKE '%ell%';
+----
+1
+
+query I
+SELECT 'hello' LIKE 'x%';
+----
+0
+
+query I
+SELECT 'hello' NOT LIKE 'x%';
+----
+1
+
+query I
+SELECT 'hello' LIKE 'h_llo';
+----
+1
+
+# ILIKE (case insensitive)
+query I
+SELECT 'Hello' ILIKE 'hello';
+----
+1
+
+query I
+SELECT 'HELLO' ILIKE 'h%';
+----
+1
+
+# Parentheses for precedence
+query I
+SELECT (1 + 2) * 3;
+----
+9
+
+query I
+SELECT 1 + 2 * 3;
+----
+7
+
+# Complex boolean expressions
+query I
+SELECT (TRUE OR FALSE) AND TRUE;
+----
+1
+
+query I
+SELECT TRUE OR FALSE AND FALSE;
+----
+1
+
+query I
+SELECT NOT (TRUE AND FALSE);
+----
+1
+
+# NULL arithmetic
+query I
+SELECT 5 + NULL;
+----
+NULL
+
+query I
+SELECT NULL * 10;
+----
+NULL
+
+# NULL comparisons with IS
+query I
+SELECT NULL IS NULL;
+----
+1
+
+query I
+SELECT NULL IS NOT NULL;
+----
+0
+
+# Expressions in table context
+statement ok
+CREATE TABLE expr_test (a INTEGER, b INTEGER, c TEXT);
+
+statement ok
+INSERT INTO expr_test VALUES (10, 5, 'hello'), (20, 0, 'world'), (NULL, 3, NULL);
+
+query I
+SELECT a + b FROM expr_test WHERE a IS NOT NULL ORDER BY a;
+----
+15
+20
+
+query T
+SELECT COALESCE(c, 'default') FROM expr_test WHERE c IS NOT NULL ORDER BY c;
+----
+hello
+world
+
+query I
+SELECT CASE WHEN b = 0 THEN -1 ELSE a / b END FROM expr_test WHERE a IS NOT NULL ORDER BY a;
+----
+2
+-1

@@ -1,0 +1,237 @@
+# Common Table Expression (CTE) tests
+
+# Setup
+statement ok
+CREATE TABLE employees (id INTEGER, name TEXT, manager_id INTEGER, salary INTEGER);
+
+statement ok
+INSERT INTO employees VALUES
+(1, 'Alice', NULL, 100000),
+(2, 'Bob', 1, 80000),
+(3, 'Charlie', 1, 75000),
+(4, 'Diana', 2, 60000),
+(5, 'Eve', 2, 55000),
+(6, 'Frank', 3, 50000);
+
+# Simple CTE
+query IT
+WITH high_earners AS (
+    SELECT id, name FROM employees WHERE salary > 70000
+)
+SELECT * FROM high_earners ORDER BY id;
+----
+1
+Alice
+2
+Bob
+3
+Charlie
+
+# CTE with aggregate
+query I
+WITH salary_stats AS (
+    SELECT AVG(salary) as avg_salary FROM employees
+)
+SELECT avg_salary FROM salary_stats;
+----
+70000
+
+# CTE used multiple times
+query II
+WITH emp_count AS (
+    SELECT COUNT(*) as cnt FROM employees
+)
+SELECT a.cnt, b.cnt FROM emp_count a, emp_count b;
+----
+6
+6
+
+# Multiple CTEs
+query TI
+WITH
+    managers AS (
+        SELECT id, name FROM employees WHERE manager_id IS NULL
+    ),
+    subordinates AS (
+        SELECT id, name, manager_id FROM employees WHERE manager_id IS NOT NULL
+    )
+SELECT m.name, COUNT(*) as direct_reports
+FROM managers m
+JOIN subordinates s ON m.id = s.manager_id
+GROUP BY m.id, m.name;
+----
+Alice
+2
+
+# CTE with ORDER BY and LIMIT
+query TI
+WITH ranked_employees AS (
+    SELECT name, salary FROM employees ORDER BY salary DESC
+)
+SELECT name, salary FROM ranked_employees LIMIT 3;
+----
+Alice
+100000
+Bob
+80000
+Charlie
+75000
+
+# CTE in subquery
+query I
+SELECT COUNT(*) FROM (
+    WITH high_sal AS (SELECT id FROM employees WHERE salary > 60000)
+    SELECT * FROM high_sal
+) sub;
+----
+3
+
+# CTE with JOIN
+query TTI
+WITH dept_heads AS (
+    SELECT id, name FROM employees WHERE manager_id IS NULL
+)
+SELECT e.name as employee, d.name as boss, e.salary
+FROM employees e
+JOIN dept_heads d ON e.manager_id = d.id
+ORDER BY e.salary DESC;
+----
+Bob
+Alice
+80000
+Charlie
+Alice
+75000
+
+# CTE with GROUP BY
+query II
+WITH salary_groups AS (
+    SELECT
+        CASE
+            WHEN salary >= 80000 THEN 1
+            WHEN salary >= 60000 THEN 2
+            ELSE 3
+        END as tier,
+        salary
+    FROM employees
+)
+SELECT tier, COUNT(*) as cnt FROM salary_groups GROUP BY tier ORDER BY tier;
+----
+1
+2
+2
+2
+3
+2
+
+# CTE with DISTINCT
+query I
+WITH unique_managers AS (
+    SELECT DISTINCT manager_id FROM employees WHERE manager_id IS NOT NULL
+)
+SELECT COUNT(*) FROM unique_managers;
+----
+3
+
+# CTE for running totals
+query TII
+WITH numbered AS (
+    SELECT name, salary, ROW_NUMBER() OVER (ORDER BY salary DESC) as rn
+    FROM employees
+)
+SELECT name, salary, rn FROM numbered ORDER BY rn LIMIT 3;
+----
+Alice
+100000
+1
+Bob
+80000
+2
+Charlie
+75000
+3
+
+# Recursive CTE - generate series
+query I
+WITH RECURSIVE nums(n) AS (
+    SELECT 1
+    UNION ALL
+    SELECT n + 1 FROM nums WHERE n < 5
+)
+SELECT n FROM nums ORDER BY n;
+----
+1
+2
+3
+4
+5
+
+# Recursive CTE - factorial
+query II
+WITH RECURSIVE factorial(n, fact) AS (
+    SELECT 1, 1
+    UNION ALL
+    SELECT n + 1, fact * (n + 1) FROM factorial WHERE n < 5
+)
+SELECT n, fact FROM factorial ORDER BY n;
+----
+1
+1
+2
+2
+3
+6
+4
+24
+5
+120
+
+# Recursive CTE - employee hierarchy
+query TIT
+WITH RECURSIVE hierarchy(id, name, level) AS (
+    SELECT id, name, 0 as level FROM employees WHERE manager_id IS NULL
+    UNION ALL
+    SELECT e.id, e.name, h.level + 1
+    FROM employees e
+    JOIN hierarchy h ON e.manager_id = h.id
+)
+SELECT name, level, CASE WHEN level = 0 THEN 'CEO' WHEN level = 1 THEN 'Manager' ELSE 'Staff' END as title
+FROM hierarchy
+ORDER BY level, name;
+----
+Alice
+0
+CEO
+Bob
+1
+Manager
+Charlie
+1
+Manager
+Diana
+2
+Staff
+Eve
+2
+Staff
+Frank
+2
+Staff
+
+# CTE with window function
+query TII
+WITH ranked AS (
+    SELECT name, salary, RANK() OVER (ORDER BY salary DESC) as rnk
+    FROM employees
+)
+SELECT name, salary, rnk FROM ranked WHERE rnk <= 3 ORDER BY rnk;
+----
+Alice
+100000
+1
+Bob
+80000
+2
+Charlie
+75000
+3

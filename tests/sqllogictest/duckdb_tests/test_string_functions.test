@@ -1,0 +1,150 @@
+# Test string functions
+
+# Basic string functions
+query T
+SELECT UPPER('hello');
+----
+HELLO
+
+query T
+SELECT LOWER('WORLD');
+----
+world
+
+query I
+SELECT LENGTH('hello');
+----
+5
+
+query T
+SELECT CONCAT('hello', ' ', 'world');
+----
+hello world
+
+query T
+SELECT 'hello' || ' ' || 'world';
+----
+hello world
+
+# Trim functions
+query T
+SELECT TRIM('  hello  ');
+----
+hello
+
+query T
+SELECT LTRIM('  hello');
+----
+hello
+
+query T
+SELECT RTRIM('hello  ');
+----
+hello
+
+# Substring
+query T
+SELECT SUBSTRING('hello world', 1, 5);
+----
+hello
+
+query T
+SELECT SUBSTR('hello world', 7);
+----
+world
+
+# Replace
+query T
+SELECT REPLACE('hello world', 'world', 'there');
+----
+hello there
+
+# Left and Right
+query T
+SELECT LEFT('hello', 3);
+----
+hel
+
+query T
+SELECT RIGHT('hello', 3);
+----
+llo
+
+# Reverse
+query T
+SELECT REVERSE('hello');
+----
+olleh
+
+# Repeat
+query T
+SELECT REPEAT('ab', 3);
+----
+ababab
+
+# Position/Instr
+query I
+SELECT POSITION('world' IN 'hello world');
+----
+7
+
+query I
+SELECT INSTR('hello world', 'world');
+----
+7
+
+# Starts/Ends with
+query I
+SELECT STARTS_WITH('hello world', 'hello');
+----
+1
+
+query I
+SELECT ENDS_WITH('hello world', 'world');
+----
+1
+
+query I
+SELECT CONTAINS('hello world', 'lo wo');
+----
+1
+
+# Initcap
+query T
+SELECT INITCAP('hello world');
+----
+Hello World
+
+# ASCII and CHR
+query I
+SELECT ASCII('A');
+----
+65
+
+query T
+SELECT CHR(65);
+----
+A
+
+# Concat with separator
+query T
+SELECT CONCAT_WS('-', 'a', 'b', 'c');
+----
+a-b-c
+
+# LPAD and RPAD
+query T
+SELECT LPAD('hello', 10, '*');
+----
+*****hello
+
+query T
+SELECT RPAD('hello', 10, '*');
+----
+hello*****
+
+# Split part
+query T
+SELECT SPLIT_PART('a-b-c', '-', 2);
+----
+b

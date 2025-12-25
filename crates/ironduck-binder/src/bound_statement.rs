@@ -14,19 +14,52 @@ pub enum BoundStatement {
     CreateTable(BoundCreateTable),
     CreateSchema(BoundCreateSchema),
     CreateView(BoundCreateView),
+    CreateSequence(BoundCreateSequence),
+    CreateIndex(BoundCreateIndex),
     Drop(BoundDrop),
+    AlterTable(BoundAlterTable),
+    Copy(BoundCopy),
+    /// Transaction control
+    Transaction(TransactionStatement),
     Explain(Box<BoundStatement>),
     /// No-op statement (PRAGMA, SET, etc.)
     NoOp,
 }
 
+/// Operand of a set operation (can be a select or another set operation)
+#[derive(Debug, Clone)]
+pub enum SetOperand {
+    /// A simple SELECT query
+    Select(BoundSelect),
+    /// A nested set operation
+    SetOperation(Box<BoundSetOperation>),
+}
+
+impl SetOperand {
+    /// Get output column types
+    pub fn output_types(&self) -> Vec<LogicalType> {
+        match self {
+            SetOperand::Select(sel) => sel.output_types(),
+            SetOperand::SetOperation(op) => op.left.output_types(),
+        }
+    }
+
+    /// Get output column names
+    pub fn output_names(&self) -> Vec<String> {
+        match self {
+            SetOperand::Select(sel) => sel.output_names(),
+            SetOperand::SetOperation(op) => op.left.output_names(),
+        }
+    }
+}
+
 /// Bound set operation (UNION, INTERSECT, EXCEPT)
 #[derive(Debug, Clone)]
 pub struct BoundSetOperation {
-    /// Left query
-    pub left: Box<BoundSelect>,
-    /// Right query
-    pub right: Box<BoundSelect>,
+    /// Left operand (query or nested set operation)
+    pub left: Box<SetOperand>,
+    /// Right operand (query or nested set operation)
+    pub right: Box<SetOperand>,
     /// Type of set operation
     pub set_op: SetOperationType,
     /// Whether to eliminate duplicates (true for UNION, false for UNION ALL)
@@ -56,10 +89,15 @@ pub struct BoundSelect {
     pub from: Vec<BoundTableRef>,
     /// WHERE clause
     pub where_clause: Option<BoundExpression>,
-    /// GROUP BY expressions
+    /// GROUP BY expressions (simple group by)
     pub group_by: Vec<BoundExpression>,
+    /// GROUPING SETS (for ROLLUP, CUBE, GROUPING SETS)
+    /// Each inner Vec is one grouping set combination
+    pub grouping_sets: Vec<Vec<BoundExpression>>,
     /// HAVING clause
     pub having: Option<BoundExpression>,
+    /// QUALIFY clause (filters after window functions are evaluated)
+    pub qualify: Option<BoundExpression>,
     /// ORDER BY expressions
     pub order_by: Vec<BoundOrderBy>,
     /// LIMIT
@@ -68,6 +106,11 @@ pub struct BoundSelect {
     pub offset: Option<u64>,
     /// DISTINCT or DISTINCT ON
     pub distinct: DistinctKind,
+    /// CTEs (Common Table Expressions) used in this query
+    /// Includes recursive CTEs with their base and recursive cases
+    pub ctes: Vec<BoundCTE>,
+    /// VALUES rows (for VALUES clause)
+    pub values_rows: Vec<Vec<BoundExpression>>,
 }
 
 /// DISTINCT mode
@@ -88,11 +131,36 @@ impl BoundSelect {
             from: Vec::new(),
             where_clause: None,
             group_by: Vec::new(),
+            grouping_sets: Vec::new(),
             having: None,
+            qualify: None,
             order_by: Vec::new(),
             limit: None,
             offset: None,
             distinct: DistinctKind::None,
+            ctes: Vec::new(),
+            values_rows: Vec::new(),
+        }
+    }
+
+    /// Create a new BoundSelect for VALUES clause
+    pub fn new_values(values_rows: Vec<Vec<BoundExpression>>) -> Self {
+        // Use the first row as the select_list for column types
+        let select_list = values_rows.first().cloned().unwrap_or_default();
+        BoundSelect {
+            select_list,
+            from: Vec::new(),
+            where_clause: None,
+            group_by: Vec::new(),
+            grouping_sets: Vec::new(),
+            having: None,
+            qualify: None,
+            order_by: Vec::new(),
+            limit: None,
+            offset: None,
+            distinct: DistinctKind::None,
+            ctes: Vec::new(),
+            values_rows,
         }
     }
 
@@ -122,6 +190,17 @@ pub enum BoundTableRef {
     Subquery {
         subquery: Box<BoundSelect>,
         alias: String,
+        /// Whether this is a lateral subquery (can reference preceding tables)
+        is_lateral: bool,
+    },
+    /// Set operation subquery (e.g., (SELECT ... UNION SELECT ...) AS alias)
+    SetOperationSubquery {
+        set_operation: Box<BoundSetOperation>,
+        alias: String,
+        /// Column names from the set operation
+        column_names: Vec<String>,
+        /// Column types from the set operation
+        column_types: Vec<LogicalType>,
     },
     /// Join
     Join {
@@ -131,12 +210,61 @@ pub enum BoundTableRef {
         condition: Option<BoundExpression>,
         /// Column names from USING clause that are deduplicated (excluded from right side in wildcards)
         using_columns: Vec<String>,
+        /// ASOF match condition (inequality for time-series matching)
+        asof_condition: Option<BoundExpression>,
     },
     /// Table-valued function (e.g., range(), generate_series())
     TableFunction {
         function: TableFunctionType,
         alias: Option<String>,
         column_alias: Option<String>,
+    },
+    /// File-based table function (read_csv, read_parquet) with schema info
+    FileTableFunction {
+        path: String,
+        file_type: FileTableType,
+        alias: Option<String>,
+        column_names: Vec<String>,
+        column_types: Vec<LogicalType>,
+    },
+    /// Recursive CTE reference (self-reference within a recursive CTE)
+    RecursiveCTERef {
+        /// Name of the CTE being referenced
+        cte_name: String,
+        /// Alias for this reference
+        alias: String,
+        /// Column names from the CTE
+        column_names: Vec<String>,
+        /// Column types from the CTE
+        column_types: Vec<LogicalType>,
+    },
+    /// PIVOT operation - transforms rows to columns
+    Pivot {
+        /// The source table/subquery
+        source: Box<BoundTableRef>,
+        /// Aggregate function (e.g., SUM, COUNT)
+        aggregate_function: String,
+        /// Argument to the aggregate function
+        aggregate_arg: BoundExpression,
+        /// Column to pivot on (the FOR column)
+        value_column: String,
+        /// Values to create columns for (the IN values)
+        pivot_values: Vec<String>,
+        /// Alias for the result
+        alias: Option<String>,
+    },
+    /// UNPIVOT operation - transforms columns to rows
+    Unpivot {
+        /// The source table/subquery
+        source: Box<BoundTableRef>,
+        /// Name for the value column
+        value_column: String,
+        /// Name for the name column
+        name_column: String,
+        /// Columns to unpivot
+        unpivot_columns: Vec<String>,
+        /// Alias for the result
+        alias: Option<String>,
     },
     /// Empty (for SELECT without FROM)
     Empty,
@@ -151,6 +279,39 @@ pub enum TableFunctionType {
         stop: BoundExpression,
         step: BoundExpression,
     },
+    /// unnest(array) - expands an array into rows
+    Unnest {
+        array_expr: BoundExpression,
+    },
+    /// generate_subscripts(array, dim) - generates subscripts for an array dimension
+    GenerateSubscripts {
+        array_expr: BoundExpression,
+        dim: i32,
+    },
+    /// read_csv(path, ...) - reads a CSV file into a table
+    ReadCsv {
+        path: String,
+        has_header: bool,
+        delimiter: char,
+    },
+    /// read_parquet(path) - reads a Parquet file into a table
+    ReadParquet {
+        path: String,
+    },
+}
+
+/// Types of file-based table functions
+#[derive(Debug, Clone)]
+pub enum FileTableType {
+    /// CSV file with options
+    Csv {
+        has_header: bool,
+        delimiter: char,
+    },
+    /// Parquet file
+    Parquet,
+    /// JSON file (newline-delimited JSON or JSON array)
+    Json,
 }
 
 /// Join types
@@ -161,6 +322,13 @@ pub enum BoundJoinType {
     Right,
     Full,
     Cross,
+    /// Semi join - returns rows from left that have a match in right
+    Semi,
+    /// Anti join - returns rows from left that have no match in right
+    Anti,
+    /// ASOF join - matches rows based on the closest preceding value
+    /// Used for time-series data where exact matches aren't available
+    AsOf,
 }
 
 /// ORDER BY expression
@@ -221,6 +389,12 @@ pub struct BoundColumnDef {
     pub data_type: LogicalType,
     pub nullable: bool,
     pub default: Option<BoundExpression>,
+    /// Whether this column is a primary key
+    pub is_primary_key: bool,
+    /// Whether this column has a UNIQUE constraint
+    pub is_unique: bool,
+    /// CHECK constraint expression (if any)
+    pub check: Option<BoundExpression>,
 }
 
 /// Bound CREATE SCHEMA statement
@@ -243,6 +417,19 @@ pub struct BoundCreateView {
     pub or_replace: bool,
 }
 
+/// Bound CREATE SEQUENCE statement
+#[derive(Debug, Clone)]
+pub struct BoundCreateSequence {
+    pub schema: String,
+    pub name: String,
+    pub start: i64,
+    pub increment: i64,
+    pub min_value: i64,
+    pub max_value: i64,
+    pub cycle: bool,
+    pub if_not_exists: bool,
+}
+
 /// Bound DROP statement
 #[derive(Debug, Clone)]
 pub struct BoundDrop {
@@ -257,6 +444,76 @@ pub enum DropObjectType {
     Table,
     Schema,
     View,
+    Index,
+}
+
+/// Bound CREATE INDEX statement
+#[derive(Debug, Clone)]
+pub struct BoundCreateIndex {
+    pub schema: String,
+    pub index_name: String,
+    pub table_name: String,
+    pub columns: Vec<String>,
+    pub column_types: Vec<LogicalType>,
+    pub unique: bool,
+    pub if_not_exists: bool,
+}
+
+/// Transaction control statements
+#[derive(Debug, Clone)]
+pub enum TransactionStatement {
+    Begin,
+    Commit,
+    Rollback,
+    Savepoint(String),
+    ReleaseSavepoint(String),
+    RollbackToSavepoint(String),
+}
+
+/// Bound ALTER TABLE statement
+#[derive(Debug, Clone)]
+pub struct BoundAlterTable {
+    pub schema: String,
+    pub table_name: String,
+    pub operation: AlterTableOperation,
+}
+
+/// ALTER TABLE operations
+#[derive(Debug, Clone)]
+pub enum AlterTableOperation {
+    /// ADD COLUMN
+    AddColumn {
+        column: BoundColumnDef,
+    },
+    /// DROP COLUMN
+    DropColumn {
+        column_name: String,
+        if_exists: bool,
+    },
+    /// RENAME COLUMN
+    RenameColumn {
+        old_name: String,
+        new_name: String,
+    },
+    /// RENAME TABLE
+    RenameTable {
+        new_name: String,
+    },
+    /// ALTER COLUMN TYPE
+    AlterColumnType {
+        column_name: String,
+        new_type: LogicalType,
+    },
+    /// SET/DROP DEFAULT
+    SetColumnDefault {
+        column_name: String,
+        default: Option<BoundExpression>,
+    },
+    /// SET/DROP NOT NULL
+    SetColumnNotNull {
+        column_name: String,
+        not_null: bool,
+    },
 }
 
 /// Bound Common Table Expression (CTE)
@@ -266,6 +523,71 @@ pub struct BoundCTE {
     pub name: String,
     /// Column aliases (optional)
     pub column_aliases: Vec<String>,
-    /// The bound query for this CTE
+    /// The bound query for this CTE (base case for recursive CTEs)
     pub query: BoundSelect,
+    /// Whether this is a recursive CTE
+    pub is_recursive: bool,
+    /// Recursive case query (only set for recursive CTEs)
+    pub recursive_query: Option<BoundSelect>,
+    /// Whether to use UNION ALL (true) or UNION (false) for recursive CTEs
+    pub union_all: bool,
+}
+
+/// Bound Recursive CTE with separate base and recursive parts
+#[derive(Debug, Clone)]
+pub struct BoundRecursiveCTE {
+    /// Name of the CTE
+    pub name: String,
+    /// Column aliases (optional)
+    pub column_aliases: Vec<String>,
+    /// Base case query (non-recursive part)
+    pub base_case: BoundSelect,
+    /// Recursive case query (references the CTE)
+    pub recursive_case: BoundSelect,
+    /// Whether to use UNION ALL (true) or UNION (false) semantics
+    pub union_all: bool,
+}
+
+/// Bound COPY statement for bulk data import/export
+#[derive(Debug, Clone)]
+pub struct BoundCopy {
+    /// Direction: true = COPY TO (export), false = COPY FROM (import)
+    pub to: bool,
+    /// Source for COPY TO: table name or query result
+    pub source: CopySource,
+    /// File path for import/export
+    pub file_path: String,
+    /// File format options
+    pub format: CopyFormat,
+}
+
+/// Source of data for COPY operation
+#[derive(Debug, Clone)]
+pub enum CopySource {
+    /// Copy from/to a table
+    Table {
+        schema: String,
+        name: String,
+        columns: Vec<String>,
+    },
+    /// Copy from a query (COPY TO only)
+    Query(Box<BoundSelect>),
+}
+
+/// File format for COPY operations
+#[derive(Debug, Clone)]
+pub struct CopyFormat {
+    /// Format type (CSV, Parquet, etc.)
+    pub format_type: CopyFormatType,
+    /// Whether file has header row (for CSV)
+    pub header: bool,
+    /// Delimiter character (for CSV)
+    pub delimiter: char,
+}
+
+/// Supported file formats for COPY
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CopyFormatType {
+    Csv,
+    Parquet,
 }

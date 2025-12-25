@@ -1,0 +1,49 @@
+# DATE_TRUNC tests
+
+# Truncate Date to month
+query T
+SELECT DATE_TRUNC('month', DATE '2023-06-15');
+----
+2023-06-01
+
+# Truncate Date to year
+query T
+SELECT DATE_TRUNC('year', DATE '2023-06-15');
+----
+2023-01-01
+
+# Truncate Date to quarter
+query T
+SELECT DATE_TRUNC('quarter', DATE '2023-06-15');
+----
+2023-04-01
+
+query T
+SELECT DATE_TRUNC('quarter', DATE '2023-01-15');
+----
+2023-01-01
+
+# Truncate Timestamp to month
+query T
+SELECT DATE_TRUNC('month', TIMESTAMP '2023-06-15 14:30:00');
+----
+2023-06-01 00:00:00
+
+# Truncate Timestamp to day
+query T
+SELECT DATE_TRUNC('day', TIMESTAMP '2023-06-15 14:30:00');
+----
+2023-06-15 00:00:00
+
+# Truncate Timestamp to hour
+query T
+SELECT DATE_TRUNC('hour', TIMESTAMP '2023-06-15 14:30:45');
+----
+2023-06-15 14:00:00
+
+# Truncate Timestamp to minute
+query T
+SELECT DATE_TRUNC('minute', TIMESTAMP '2023-06-15 14:30:45');
+----
+2023-06-15 14:30:00
+

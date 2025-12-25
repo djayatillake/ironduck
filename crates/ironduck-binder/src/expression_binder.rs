@@ -8,15 +8,27 @@ use sqlparser::ast as sql;
 pub struct ExpressionBinderContext<'a> {
     /// Available tables for column resolution
     pub tables: &'a [BoundTableRef],
+    /// Named window definitions from WINDOW clause
+    pub named_windows: &'a [sql::NamedWindowDefinition],
+    /// Outer query tables for correlated subqueries
+    pub outer_tables: &'a [BoundTableRef],
 }
 
 impl<'a> ExpressionBinderContext<'a> {
     pub fn empty() -> Self {
-        ExpressionBinderContext { tables: &[] }
+        ExpressionBinderContext { tables: &[], named_windows: &[], outer_tables: &[] }
     }
 
     pub fn new(tables: &'a [BoundTableRef]) -> Self {
-        ExpressionBinderContext { tables }
+        ExpressionBinderContext { tables, named_windows: &[], outer_tables: &[] }
+    }
+
+    pub fn with_named_windows(tables: &'a [BoundTableRef], named_windows: &'a [sql::NamedWindowDefinition]) -> Self {
+        ExpressionBinderContext { tables, named_windows, outer_tables: &[] }
+    }
+
+    pub fn with_outer_tables(tables: &'a [BoundTableRef], outer_tables: &'a [BoundTableRef]) -> Self {
+        ExpressionBinderContext { tables, named_windows: &[], outer_tables }
     }
 }
 
@@ -178,18 +190,23 @@ pub fn bind_expression(
             ))
         }
 
-        // Cast
-        sql::Expr::Cast { expr, data_type, .. } => {
+        // Cast (CAST and TRY_CAST)
+        sql::Expr::Cast { expr, data_type, kind, .. } => {
             let bound_expr = bind_expression(_binder, expr, ctx)?;
             let target_type = bind_data_type(data_type)?;
 
-            Ok(BoundExpression::new(
-                BoundExpressionKind::Cast {
+            let kind = match kind {
+                sql::CastKind::TryCast => BoundExpressionKind::TryCast {
                     expr: Box::new(bound_expr),
                     target_type: target_type.clone(),
                 },
-                target_type,
-            ))
+                _ => BoundExpressionKind::Cast {
+                    expr: Box::new(bound_expr),
+                    target_type: target_type.clone(),
+                },
+            };
+
+            Ok(BoundExpression::new(kind, target_type))
         }
 
         // Wildcard
@@ -201,7 +218,12 @@ pub fn bind_expression(
         // IN subquery: expr IN (SELECT ...)
         sql::Expr::InSubquery { expr, subquery, negated } => {
             let bound_expr = bind_expression(_binder, expr, ctx)?;
-            let bound_subquery = super::statement_binder::bind_subquery(_binder, subquery)?;
+            // Pass outer tables for correlated subquery support
+            let bound_subquery = if !ctx.tables.is_empty() {
+                super::statement_binder::bind_subquery_with_outer(_binder, subquery, ctx.tables)?
+            } else {
+                super::statement_binder::bind_subquery(_binder, subquery)?
+            };
 
             Ok(BoundExpression::new(
                 BoundExpressionKind::InSubquery {
@@ -215,7 +237,12 @@ pub fn bind_expression(
 
         // EXISTS subquery
         sql::Expr::Exists { subquery, negated } => {
-            let bound_subquery = super::statement_binder::bind_subquery(_binder, subquery)?;
+            // Pass outer tables for correlated subquery support
+            let bound_subquery = if !ctx.tables.is_empty() {
+                super::statement_binder::bind_subquery_with_outer(_binder, subquery, ctx.tables)?
+            } else {
+                super::statement_binder::bind_subquery(_binder, subquery)?
+            };
 
             Ok(BoundExpression::new(
                 BoundExpressionKind::Exists {
@@ -228,7 +255,12 @@ pub fn bind_expression(
 
         // Scalar subquery
         sql::Expr::Subquery(subquery) => {
-            let bound_subquery = super::statement_binder::bind_subquery(_binder, subquery)?;
+            // Pass outer tables for correlated subquery support
+            let bound_subquery = if !ctx.tables.is_empty() {
+                super::statement_binder::bind_subquery_with_outer(_binder, subquery, ctx.tables)?
+            } else {
+                super::statement_binder::bind_subquery(_binder, subquery)?
+            };
 
             // Return type is the type of the first column
             let return_type = bound_subquery
@@ -312,6 +344,8 @@ pub fn bind_expression(
                     args,
                     is_aggregate: false,
                     distinct: false,
+                    order_by: vec![],
+                    filter: None,
                 },
                 LogicalType::Varchar,
             ))
@@ -335,6 +369,8 @@ pub fn bind_expression(
                     args,
                     is_aggregate: false,
                     distinct: false,
+                    order_by: vec![],
+                    filter: None,
                 },
                 LogicalType::Varchar,
             ))
@@ -351,6 +387,8 @@ pub fn bind_expression(
                     args: vec![string, substr],
                     is_aggregate: false,
                     distinct: false,
+                    order_by: vec![],
+                    filter: None,
                 },
                 LogicalType::Integer,
             ))
@@ -365,6 +403,8 @@ pub fn bind_expression(
                     args: vec![bound_expr],
                     is_aggregate: false,
                     distinct: false,
+                    order_by: vec![],
+                    filter: None,
                 },
                 LogicalType::Double,
             ))
@@ -379,6 +419,8 @@ pub fn bind_expression(
                     args: vec![bound_expr],
                     is_aggregate: false,
                     distinct: false,
+                    order_by: vec![],
+                    filter: None,
                 },
                 LogicalType::Double,
             ))
@@ -400,6 +442,8 @@ pub fn bind_expression(
                     ],
                     is_aggregate: false,
                     distinct: false,
+                    order_by: vec![],
+                    filter: None,
                 },
                 LogicalType::BigInt,
             ))
@@ -467,6 +511,198 @@ pub fn bind_expression(
                 BoundExpressionKind::Constant(Value::Interval(interval)),
                 LogicalType::Interval,
             ))
+        }
+
+        // Array literal: [1, 2, 3] or ARRAY[1, 2, 3]
+        sql::Expr::Array(arr) => {
+            let mut elements = Vec::new();
+            let mut element_type = LogicalType::Null;
+
+            for elem in &arr.elem {
+                let bound = bind_expression(_binder, elem, ctx)?;
+                if element_type == LogicalType::Null {
+                    element_type = bound.return_type.clone();
+                }
+                elements.push(bound);
+            }
+
+            // Create a list type
+            let list_type = LogicalType::List(Box::new(element_type));
+
+            // Convert to a constant List value if all elements are constants
+            let all_constants = elements.iter().all(|e| matches!(e.expr, BoundExpressionKind::Constant(_)));
+            if all_constants {
+                let values: Vec<Value> = elements
+                    .iter()
+                    .filter_map(|e| {
+                        if let BoundExpressionKind::Constant(v) = &e.expr {
+                            Some(v.clone())
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+                Ok(BoundExpression::new(
+                    BoundExpressionKind::Constant(Value::List(values)),
+                    list_type,
+                ))
+            } else {
+                // For non-constant arrays, we need an array expression type
+                // For now, return an error as this is less common
+                Err(Error::NotImplemented("Non-constant array literals".to_string()))
+            }
+        }
+
+        // Array/Struct subscript: arr[index] or struct['field']
+        sql::Expr::Subscript { expr, subscript } => {
+            let base_expr = bind_expression(_binder, expr, ctx)?;
+            match subscript.as_ref() {
+                sql::Subscript::Index { index } => {
+                    let index_expr = bind_expression(_binder, index, ctx)?;
+
+                    // Check if this is a struct access or array access
+                    let is_struct = matches!(&base_expr.return_type, LogicalType::Struct(_));
+                    let is_string_key = matches!(&index_expr.return_type, LogicalType::Varchar);
+
+                    if is_struct || is_string_key {
+                        // Struct field access
+                        Ok(BoundExpression::new(
+                            BoundExpressionKind::Function {
+                                name: "STRUCT_EXTRACT".to_string(),
+                                args: vec![base_expr, index_expr],
+                                is_aggregate: false,
+                                distinct: false,
+                                order_by: vec![],
+                                filter: None,
+                            },
+                            LogicalType::Unknown,
+                        ))
+                    } else {
+                        // Array element access
+                        let element_type = match &base_expr.return_type {
+                            LogicalType::List(inner) => inner.as_ref().clone(),
+                            _ => LogicalType::Unknown,
+                        };
+                        Ok(BoundExpression::new(
+                            BoundExpressionKind::Function {
+                                name: "ARRAY_EXTRACT".to_string(),
+                                args: vec![base_expr, index_expr],
+                                is_aggregate: false,
+                                distinct: false,
+                                order_by: vec![],
+                                filter: None,
+                            },
+                            element_type,
+                        ))
+                    }
+                }
+                sql::Subscript::Slice { lower_bound, upper_bound, stride } => {
+                    let lower = lower_bound.as_ref()
+                        .map(|e| bind_expression(_binder, e, ctx))
+                        .transpose()?;
+                    let upper = upper_bound.as_ref()
+                        .map(|e| bind_expression(_binder, e, ctx))
+                        .transpose()?;
+                    let _stride = stride.as_ref()
+                        .map(|e| bind_expression(_binder, e, ctx))
+                        .transpose()?;
+
+                    let mut args = vec![base_expr.clone()];
+                    if let Some(l) = lower {
+                        args.push(l);
+                    } else {
+                        args.push(BoundExpression::new(
+                            BoundExpressionKind::Constant(Value::BigInt(1)),
+                            LogicalType::BigInt,
+                        ));
+                    }
+                    if let Some(u) = upper {
+                        args.push(u);
+                    }
+
+                    Ok(BoundExpression::new(
+                        BoundExpressionKind::Function {
+                            name: "ARRAY_SLICE".to_string(),
+                            args,
+                            is_aggregate: false,
+                            distinct: false,
+                            order_by: vec![],
+                            filter: None,
+                        },
+                        base_expr.return_type,
+                    ))
+                }
+            }
+        }
+
+        // Dictionary/Struct literal: {'a': 1, 'b': 2}
+        sql::Expr::Dictionary(fields) => {
+            let mut keys = Vec::new();
+            let mut values = Vec::new();
+            for field in fields {
+                keys.push(field.key.value.clone());
+                let bound_value = bind_expression(_binder, &field.value, ctx)?;
+                values.push(bound_value);
+            }
+
+            // Convert to constant Struct if all values are constants
+            let all_constants = values.iter().all(|e| matches!(e.expr, BoundExpressionKind::Constant(_)));
+            if all_constants {
+                let struct_values: Vec<(String, Value)> = keys
+                    .into_iter()
+                    .zip(values.iter())
+                    .filter_map(|(k, v)| {
+                        if let BoundExpressionKind::Constant(val) = &v.expr {
+                            Some((k, val.clone()))
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+                Ok(BoundExpression::new(
+                    BoundExpressionKind::Constant(Value::Struct(struct_values)),
+                    LogicalType::Struct(vec![]),
+                ))
+            } else {
+                Err(Error::NotImplemented("Non-constant struct literals".to_string()))
+            }
+        }
+
+        // MapAccess: map['key'] or struct['field']
+        sql::Expr::MapAccess { column, keys } => {
+            let map_expr = bind_expression(_binder, column, ctx)?;
+            if let Some(key) = keys.first() {
+                let key_expr = match &key.key {
+                    sql::Expr::Value(sql::Value::SingleQuotedString(s)) => {
+                        BoundExpression::new(
+                            BoundExpressionKind::Constant(Value::Varchar(s.clone())),
+                            LogicalType::Varchar,
+                        )
+                    }
+                    sql::Expr::Value(sql::Value::Number(n, _)) => {
+                        let idx: i64 = n.parse().unwrap_or(0);
+                        BoundExpression::new(
+                            BoundExpressionKind::Constant(Value::BigInt(idx)),
+                            LogicalType::BigInt,
+                        )
+                    }
+                    other => bind_expression(_binder, other, ctx)?,
+                };
+
+                Ok(BoundExpression::new(
+                    BoundExpressionKind::Function {
+                        name: "STRUCT_EXTRACT".to_string(),
+                        args: vec![map_expr, key_expr],
+                        is_aggregate: false,
+                        distinct: false,
+                        order_by: vec![],
+                        filter: None,
+                    },
+                    LogicalType::Unknown,
+                ))
+            } else {
+                Err(Error::InvalidArguments("Map access requires a key".to_string()))
+            }
         }
 
         _ => Err(Error::NotImplemented(format!(
@@ -585,49 +821,77 @@ fn bind_column_ref(idents: &[sql::Ident], ctx: &ExpressionBinderContext) -> Resu
         None
     };
 
-    // If no tables, this is an error (unless it's a constant expression context)
-    if ctx.tables.is_empty() {
+    // If no tables and no outer tables, this is an error
+    if ctx.tables.is_empty() && ctx.outer_tables.is_empty() {
         return Err(Error::ColumnNotFound(column_name));
     }
 
-    // Collect all base tables from the context (flatten joins)
-    let base_tables = collect_base_tables(ctx.tables);
+    // First, try to find the column in the inner tables
+    if !ctx.tables.is_empty() {
+        // Collect all base tables from the context (flatten joins)
+        let base_tables = collect_base_tables(ctx.tables);
 
-    // Track column offset for multi-table joins
-    let mut col_offset = 0;
+        // Track column offset for multi-table joins
+        let mut col_offset = 0;
 
-    // Search for the column in available tables
-    for (table_idx, (name, alias, column_names, column_types)) in base_tables.iter().enumerate() {
-        // Check if this table matches the qualifier (if any)
-        let table_matches = match &table_qualifier {
-            Some(qualifier) => {
-                // Match against alias first, then table name
-                alias.as_ref().map(|a| a.eq_ignore_ascii_case(qualifier)).unwrap_or(false)
-                    || name.eq_ignore_ascii_case(qualifier)
+        // Search for the column in available tables
+        for (table_idx, (name, alias, column_names, column_types)) in base_tables.iter().enumerate() {
+            // Check if this table matches the qualifier (if any)
+            let table_matches = match &table_qualifier {
+                Some(qualifier) => {
+                    // Match against alias first, then table name
+                    alias.as_ref().map(|a| a.eq_ignore_ascii_case(qualifier)).unwrap_or(false)
+                        || name.eq_ignore_ascii_case(qualifier)
+                }
+                None => true, // No qualifier means search all tables
+            };
+
+            if table_matches {
+                if let Some(col_idx) = column_names.iter().position(|n| n.eq_ignore_ascii_case(&column_name)) {
+                    return Ok(BoundExpression::new(
+                        BoundExpressionKind::ColumnRef {
+                            table_idx,
+                            column_idx: col_offset + col_idx,
+                            name: column_name,
+                        },
+                        column_types[col_idx].clone(),
+                    ));
+                }
             }
-            None => true, // No qualifier means search all tables
-        };
 
-        if table_matches {
-            if let Some(col_idx) = column_names.iter().position(|n| n.eq_ignore_ascii_case(&column_name)) {
-                return Ok(BoundExpression::new(
-                    BoundExpressionKind::ColumnRef {
-                        table_idx,
-                        column_idx: col_offset + col_idx,
-                        name: column_name,
-                    },
-                    column_types[col_idx].clone(),
-                ));
-            }
+            col_offset += column_names.len();
         }
 
-        col_offset += column_names.len();
+        // Check for rowid pseudo-column
+        if column_name.eq_ignore_ascii_case("rowid") {
+            // Find the matching table for rowid
+            for (table_idx, (name, alias, _column_names, _column_types)) in base_tables.iter().enumerate() {
+                let table_matches = match &table_qualifier {
+                    Some(qualifier) => {
+                        alias.as_ref().map(|a| a.eq_ignore_ascii_case(qualifier)).unwrap_or(false)
+                            || name.eq_ignore_ascii_case(qualifier)
+                    }
+                    None => true,
+                };
+
+                if table_matches {
+                    return Ok(BoundExpression::new(
+                        BoundExpressionKind::RowId { table_idx },
+                        LogicalType::BigInt,
+                    ));
+                }
+            }
+        }
     }
 
-    // Check for rowid pseudo-column
-    if column_name.eq_ignore_ascii_case("rowid") {
-        // Find the matching table for rowid
-        for (table_idx, (name, alias, _column_names, _column_types)) in base_tables.iter().enumerate() {
+    // If not found in inner tables, try outer tables (for correlated subqueries)
+    if !ctx.outer_tables.is_empty() {
+        let outer_base_tables = collect_base_tables(ctx.outer_tables);
+
+        // Track column offset for multi-table joins
+        let mut col_offset = 0;
+
+        for (_table_idx, (name, alias, column_names, column_types)) in outer_base_tables.iter().enumerate() {
             let table_matches = match &table_qualifier {
                 Some(qualifier) => {
                     alias.as_ref().map(|a| a.eq_ignore_ascii_case(qualifier)).unwrap_or(false)
@@ -637,11 +901,19 @@ fn bind_column_ref(idents: &[sql::Ident], ctx: &ExpressionBinderContext) -> Resu
             };
 
             if table_matches {
-                return Ok(BoundExpression::new(
-                    BoundExpressionKind::RowId { table_idx },
-                    LogicalType::BigInt,
-                ));
+                if let Some(col_idx) = column_names.iter().position(|n| n.eq_ignore_ascii_case(&column_name)) {
+                    return Ok(BoundExpression::new(
+                        BoundExpressionKind::OuterColumnRef {
+                            depth: 0, // Immediate parent scope
+                            column_idx: col_offset + col_idx,
+                            name: column_name,
+                        },
+                        column_types[col_idx].clone(),
+                    ));
+                }
             }
+
+            col_offset += column_names.len();
         }
     }
 
@@ -666,7 +938,7 @@ fn collect_base_tables_rec(table_ref: &BoundTableRef, result: &mut Vec<(String, 
             collect_base_tables_rec(left, result);
             collect_base_tables_rec(right, result);
         }
-        BoundTableRef::Subquery { subquery, alias } => {
+        BoundTableRef::Subquery { subquery, alias, .. } => {
             // Extract column names from the subquery's select list
             let column_names: Vec<String> = subquery.select_list.iter().map(|e| e.name()).collect();
             let column_types: Vec<LogicalType> = subquery.select_list.iter().map(|e| e.return_type.clone()).collect();
@@ -677,6 +949,22 @@ fn collect_base_tables_rec(table_ref: &BoundTableRef, result: &mut Vec<(String, 
             let col_name = column_alias.clone().unwrap_or_else(|| "range".to_string());
             let table_name = alias.clone().unwrap_or_else(|| "range".to_string());
             result.push((table_name.clone(), alias.clone(), vec![col_name], vec![LogicalType::BigInt]));
+        }
+        BoundTableRef::RecursiveCTERef { cte_name, alias, column_names, column_types } => {
+            result.push((cte_name.clone(), Some(alias.clone()), column_names.clone(), column_types.clone()));
+        }
+        BoundTableRef::SetOperationSubquery { alias, column_names, column_types, .. } => {
+            result.push((alias.clone(), Some(alias.clone()), column_names.clone(), column_types.clone()));
+        }
+        BoundTableRef::Pivot { source, .. } => {
+            collect_base_tables_rec(source, result);
+        }
+        BoundTableRef::Unpivot { source, .. } => {
+            collect_base_tables_rec(source, result);
+        }
+        BoundTableRef::FileTableFunction { path, alias, column_names, column_types, .. } => {
+            let table_name = alias.clone().unwrap_or_else(|| path.clone());
+            result.push((table_name.clone(), alias.clone(), column_names.clone(), column_types.clone()));
         }
         BoundTableRef::Empty => {}
     }
@@ -699,6 +987,13 @@ fn bind_binary_op(op: &sql::BinaryOperator) -> Result<BoundBinaryOperator> {
         sql::BinaryOperator::And => Ok(BoundBinaryOperator::And),
         sql::BinaryOperator::Or => Ok(BoundBinaryOperator::Or),
         sql::BinaryOperator::StringConcat => Ok(BoundBinaryOperator::Concat),
+        sql::BinaryOperator::BitwiseAnd => Ok(BoundBinaryOperator::BitwiseAnd),
+        sql::BinaryOperator::BitwiseOr => Ok(BoundBinaryOperator::BitwiseOr),
+        sql::BinaryOperator::BitwiseXor => Ok(BoundBinaryOperator::BitwiseXor),
+        sql::BinaryOperator::Xor => Ok(BoundBinaryOperator::BitwiseXor),
+        sql::BinaryOperator::PGBitwiseXor => Ok(BoundBinaryOperator::BitwiseXor),
+        sql::BinaryOperator::PGBitwiseShiftLeft => Ok(BoundBinaryOperator::ShiftLeft),
+        sql::BinaryOperator::PGBitwiseShiftRight => Ok(BoundBinaryOperator::ShiftRight),
         _ => Err(Error::NotImplemented(format!("Binary operator {:?}", op))),
     }
 }
@@ -747,12 +1042,48 @@ fn bind_function(
         _ => false,
     };
 
+    // Extract ORDER BY clause for ordered aggregates (e.g., SUM(x ORDER BY y))
+    let mut order_by: Vec<(BoundExpression, bool, bool)> = match &func.args {
+        sql::FunctionArguments::List(arg_list) => {
+            let mut order_by_exprs = Vec::new();
+            for clause in &arg_list.clauses {
+                if let sql::FunctionArgumentClause::OrderBy(order_by_list) = clause {
+                    for order_expr in order_by_list {
+                        let bound_expr = bind_expression(binder, &order_expr.expr, ctx)?;
+                        let ascending = order_expr.asc.unwrap_or(true);
+                        let nulls_first = order_expr.nulls_first.unwrap_or(!ascending);
+                        order_by_exprs.push((bound_expr, ascending, nulls_first));
+                    }
+                }
+            }
+            order_by_exprs
+        }
+        _ => vec![],
+    };
+
+    // Handle WITHIN GROUP (ORDER BY ...) syntax for ordered-set aggregates
+    // e.g., PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY x)
+    if !func.within_group.is_empty() {
+        for order_expr in &func.within_group {
+            let bound_expr = bind_expression(binder, &order_expr.expr, ctx)?;
+            let ascending = order_expr.asc.unwrap_or(true);
+            let nulls_first = order_expr.nulls_first.unwrap_or(!ascending);
+            order_by.push((bound_expr, ascending, nulls_first));
+        }
+    }
+
+    // Extract FILTER clause for aggregates (e.g., SUM(x) FILTER (WHERE y > 0))
+    let filter: Option<Box<BoundExpression>> = match &func.filter {
+        Some(filter_expr) => Some(Box::new(bind_expression(binder, filter_expr, ctx)?)),
+        None => None,
+    };
+
     // Validate argument count for functions that require specific numbers
     match name.as_str() {
         // Single-argument aggregate functions
         "AVG" | "SUM" | "MIN" | "MAX" | "FIRST" | "LAST" | "STDDEV" | "STDDEV_SAMP"
         | "STDDEV_POP" | "VARIANCE" | "VAR_SAMP" | "VAR_POP" | "BIT_AND" | "BIT_OR"
-        | "BIT_XOR" | "PRODUCT" | "MEDIAN" | "MODE" | "ARRAY_AGG" | "BOOL_AND"
+        | "BIT_XOR" | "PRODUCT" | "MEDIAN" | "MODE" | "ARRAY_AGG" | "LIST_AGG" | "LIST" | "BOOL_AND"
         | "BOOL_OR" | "EVERY" | "ANY" => {
             // These functions need exactly 1 argument (excluding COUNT which can be 0 with *)
             if args.is_empty() {
@@ -802,7 +1133,7 @@ fn bind_function(
         // String aggregate
         "STRING_AGG" | "GROUP_CONCAT" | "LISTAGG" => (true, LogicalType::Varchar),
         // Array aggregate
-        "ARRAY_AGG" => {
+        "ARRAY_AGG" | "LIST_AGG" | "LIST" => {
             let arg_type = args.first().map(|a| a.return_type.clone()).unwrap_or(LogicalType::Null);
             (true, LogicalType::List(Box::new(arg_type)))
         }
@@ -829,6 +1160,51 @@ fn bind_function(
         }
         // Covariance and correlation
         "COVAR_POP" | "COVAR_SAMP" | "CORR" => (true, LogicalType::Double),
+        // ArgMax/ArgMin - returns value of first arg when second arg is max/min
+        "ARG_MAX" | "ARGMAX" | "MAX_BY" => {
+            let arg_type = args.first().map(|a| a.return_type.clone()).unwrap_or(LogicalType::Unknown);
+            (true, arg_type)
+        }
+        "ARG_MIN" | "ARGMIN" | "MIN_BY" => {
+            let arg_type = args.first().map(|a| a.return_type.clone()).unwrap_or(LogicalType::Unknown);
+            (true, arg_type)
+        }
+        // Statistical aggregates
+        "ENTROPY" => (true, LogicalType::Double),
+        "KURTOSIS" | "KURTOSIS_POP" => (true, LogicalType::Double),
+        "SKEWNESS" | "SKEW" => (true, LogicalType::Double),
+        // Approximate count distinct
+        "APPROX_COUNT_DISTINCT" | "APPROX_DISTINCT" => (true, LogicalType::BigInt),
+        // Histogram
+        "HISTOGRAM" => (true, LogicalType::Unknown), // Returns MAP
+        // Regression functions
+        "REGR_SLOPE" => (true, LogicalType::Double),
+        "REGR_INTERCEPT" => (true, LogicalType::Double),
+        "REGR_COUNT" => (true, LogicalType::BigInt),
+        "REGR_R2" => (true, LogicalType::Double),
+        "REGR_AVGX" => (true, LogicalType::Double),
+        "REGR_AVGY" => (true, LogicalType::Double),
+        "REGR_SXX" => (true, LogicalType::Double),
+        "REGR_SYY" => (true, LogicalType::Double),
+        "REGR_SXY" => (true, LogicalType::Double),
+        // Additional aggregate functions
+        "ANY_VALUE" | "ARBITRARY" => {
+            let arg_type = args.first().map(|a| a.return_type.clone()).unwrap_or(LogicalType::Unknown);
+            (true, arg_type)
+        }
+        "FSUM" | "KAHAN_SUM" => (true, LogicalType::Double),
+        "QUANTILE" | "APPROX_QUANTILE" => (true, LogicalType::Double),
+        "COUNT_IF" | "COUNTIF" => (true, LogicalType::BigInt),
+        "SUM_IF" | "SUMIF" => (true, LogicalType::BigInt),
+        "AVG_IF" | "AVGIF" => (true, LogicalType::Double),
+        "MIN_IF" | "MINIF" => {
+            let arg_type = args.first().map(|a| a.return_type.clone()).unwrap_or(LogicalType::Unknown);
+            (true, arg_type)
+        }
+        "MAX_IF" | "MAXIF" => {
+            let arg_type = args.first().map(|a| a.return_type.clone()).unwrap_or(LogicalType::Unknown);
+            (true, arg_type)
+        }
 
         // Scalar functions
         "LOWER" | "UPPER" | "TRIM" | "LTRIM" | "RTRIM" => (false, LogicalType::Varchar),
@@ -871,6 +1247,8 @@ fn bind_function(
             args,
             is_aggregate,
             distinct,
+            order_by,
+            filter,
         },
         return_type,
     ))
@@ -899,6 +1277,9 @@ pub fn bind_data_type(data_type: &sql::DataType) -> Result<LogicalType> {
         }
         sql::DataType::Blob(_) | sql::DataType::Bytea => Ok(LogicalType::Blob),
         sql::DataType::Date => Ok(LogicalType::Date),
+        // TimeTz (time with timezone) - must come before generic Time
+        sql::DataType::Time(_, sql::TimezoneInfo::Tz)
+        | sql::DataType::Time(_, sql::TimezoneInfo::WithTimeZone) => Ok(LogicalType::TimeTz),
         sql::DataType::Time(_, _) => Ok(LogicalType::Time),
         // TimestampTz (timestamp with timezone) - must come before generic Timestamp
         sql::DataType::Timestamp(_, sql::TimezoneInfo::Tz)
@@ -932,7 +1313,7 @@ pub fn bind_data_type(data_type: &sql::DataType) -> Result<LogicalType> {
                 "UINTEGER" => Ok(LogicalType::UInteger),
                 "UBIGINT" => Ok(LogicalType::UBigInt),
                 "TIMESTAMPTZ" => Ok(LogicalType::TimestampTz),
-                "TIMETZ" => Ok(LogicalType::Time), // We don't have TimeTz yet, fallback to Time
+                "TIMETZ" => Ok(LogicalType::TimeTz),
                 _ => Err(Error::NotImplemented(format!("Data type: {}", type_name))),
             }
         }
@@ -949,33 +1330,37 @@ fn bind_window_function(
     ctx: &ExpressionBinderContext,
 ) -> Result<BoundExpression> {
     // Extract window specification
-    let (partition_by, order_by) = match over {
+    let (partition_by, order_by, frame) = match over {
         sql::WindowType::WindowSpec(spec) => {
-            // Bind PARTITION BY
-            let partition_by: Result<Vec<_>> = spec
-                .partition_by
-                .iter()
-                .map(|e| bind_expression(binder, e, ctx))
-                .collect();
-            let partition_by = partition_by?;
-
-            // Bind ORDER BY
-            let order_by: Result<Vec<_>> = spec
-                .order_by
-                .iter()
-                .map(|o| {
-                    let expr = bind_expression(binder, &o.expr, ctx)?;
-                    let ascending = o.asc.unwrap_or(true);
-                    let nulls_first = o.nulls_first.unwrap_or(false);
-                    Ok((expr, ascending, nulls_first))
-                })
-                .collect();
-            let order_by = order_by?;
-
-            (partition_by, order_by)
+            bind_window_spec(binder, spec, ctx)?
         }
-        sql::WindowType::NamedWindow(_) => {
-            return Err(Error::NotImplemented("Named window references".to_string()));
+        sql::WindowType::NamedWindow(name) => {
+            // Look up the named window definition
+            let window_name = name.value.to_uppercase();
+            let named_def = ctx.named_windows.iter().find(|def| {
+                def.0.value.to_uppercase() == window_name
+            }).ok_or_else(|| Error::InvalidArguments(format!("Unknown window: {}", name.value)))?;
+
+            // Resolve the window spec from the definition
+            match &named_def.1 {
+                sql::NamedWindowExpr::WindowSpec(spec) => {
+                    bind_window_spec(binder, spec, ctx)?
+                }
+                sql::NamedWindowExpr::NamedWindow(ref_name) => {
+                    // Recursive reference to another named window
+                    let ref_window_name = ref_name.value.to_uppercase();
+                    let ref_def = ctx.named_windows.iter().find(|def| {
+                        def.0.value.to_uppercase() == ref_window_name
+                    }).ok_or_else(|| Error::InvalidArguments(format!("Unknown window: {}", ref_name.value)))?;
+
+                    match &ref_def.1 {
+                        sql::NamedWindowExpr::WindowSpec(spec) => {
+                            bind_window_spec(binder, spec, ctx)?
+                        }
+                        _ => return Err(Error::NotImplemented("Nested named window references".to_string())),
+                    }
+                }
+            }
         }
     };
 
@@ -1007,7 +1392,96 @@ fn bind_window_function(
             args,
             partition_by,
             order_by,
+            frame,
         },
         return_type,
     ))
+}
+
+/// Bind a window specification (shared between inline and named windows)
+fn bind_window_spec(
+    binder: &Binder,
+    spec: &sql::WindowSpec,
+    ctx: &ExpressionBinderContext,
+) -> Result<(Vec<BoundExpression>, Vec<(BoundExpression, bool, bool)>, Option<super::WindowFrame>)> {
+    // Bind PARTITION BY
+    let partition_by: Result<Vec<_>> = spec
+        .partition_by
+        .iter()
+        .map(|e| bind_expression(binder, e, ctx))
+        .collect();
+    let partition_by = partition_by?;
+
+    // Bind ORDER BY
+    let order_by: Result<Vec<_>> = spec
+        .order_by
+        .iter()
+        .map(|o| {
+            let expr = bind_expression(binder, &o.expr, ctx)?;
+            let ascending = o.asc.unwrap_or(true);
+            let nulls_first = o.nulls_first.unwrap_or(false);
+            Ok((expr, ascending, nulls_first))
+        })
+        .collect();
+    let order_by = order_by?;
+
+    // Bind window frame if present
+    let frame = if let Some(window_frame) = &spec.window_frame {
+        Some(bind_window_frame(binder, window_frame, ctx)?)
+    } else {
+        None
+    };
+
+    Ok((partition_by, order_by, frame))
+}
+
+/// Bind a window frame specification
+fn bind_window_frame(
+    binder: &Binder,
+    frame: &sql::WindowFrame,
+    ctx: &ExpressionBinderContext,
+) -> Result<super::WindowFrame> {
+    use super::{WindowFrame, WindowFrameBound, WindowFrameType};
+
+    let frame_type = match frame.units {
+        sql::WindowFrameUnits::Rows => WindowFrameType::Rows,
+        sql::WindowFrameUnits::Range => WindowFrameType::Range,
+        sql::WindowFrameUnits::Groups => WindowFrameType::Groups,
+    };
+
+    let start = bind_window_frame_bound(binder, &frame.start_bound, ctx)?;
+
+    let end = match &frame.end_bound {
+        Some(end) => bind_window_frame_bound(binder, end, ctx)?,
+        None => WindowFrameBound::CurrentRow,
+    };
+
+    Ok(WindowFrame {
+        frame_type,
+        start,
+        end,
+    })
+}
+
+/// Bind a window frame bound
+fn bind_window_frame_bound(
+    binder: &Binder,
+    bound: &sql::WindowFrameBound,
+    ctx: &ExpressionBinderContext,
+) -> Result<super::WindowFrameBound> {
+    use super::WindowFrameBound;
+
+    match bound {
+        sql::WindowFrameBound::CurrentRow => Ok(WindowFrameBound::CurrentRow),
+        sql::WindowFrameBound::Preceding(None) => Ok(WindowFrameBound::UnboundedPreceding),
+        sql::WindowFrameBound::Preceding(Some(expr)) => {
+            let bound_expr = bind_expression(binder, expr, ctx)?;
+            Ok(WindowFrameBound::Preceding(Box::new(bound_expr)))
+        }
+        sql::WindowFrameBound::Following(None) => Ok(WindowFrameBound::UnboundedFollowing),
+        sql::WindowFrameBound::Following(Some(expr)) => {
+            let bound_expr = bind_expression(binder, expr, ctx)?;
+            Ok(WindowFrameBound::Following(Box::new(bound_expr)))
+        }
+    }
 }

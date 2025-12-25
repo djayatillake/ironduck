@@ -2,12 +2,14 @@
 
 use super::expression_binder::{bind_data_type, bind_expression, ExpressionBinderContext};
 use super::{
-    BoundCTE, BoundColumnDef, BoundCreateSchema, BoundCreateTable, BoundCreateView, BoundDelete,
-    BoundDrop, BoundExpression, BoundInsert, BoundJoinType, BoundOrderBy, BoundSelect,
-    BoundSetOperation, BoundStatement, BoundTableRef, BoundUpdate, Binder, DistinctKind,
-    DropObjectType, SetOperationType, TableFunctionType,
+    AlterTableOperation, BoundAlterTable, BoundCTE, BoundColumnDef, BoundCopy, BoundCreateIndex,
+    BoundCreateSchema, BoundCreateSequence, BoundCreateTable, BoundCreateView, BoundDelete,
+    BoundDrop, BoundExpression, BoundInsert, BoundJoinType, BoundOrderBy, BoundRecursiveCTE,
+    BoundSelect, BoundSetOperation, BoundStatement, BoundTableRef, BoundUpdate, Binder,
+    CopyFormat, CopyFormatType, CopySource, DistinctKind, DropObjectType, FileTableType,
+    SetOperand, SetOperationType, TableFunctionType, TransactionStatement,
 };
-use ironduck_common::{Error, Result};
+use ironduck_common::{Error, LogicalType, Result};
 use sqlparser::ast as sql;
 
 /// Bind a statement
@@ -37,6 +39,7 @@ pub fn bind_statement(binder: &Binder, stmt: &sql::Statement) -> Result<BoundSta
                 sql::ObjectType::Table => DropObjectType::Table,
                 sql::ObjectType::Schema => DropObjectType::Schema,
                 sql::ObjectType::View => DropObjectType::View,
+                sql::ObjectType::Index => DropObjectType::Index,
                 _ => return Err(Error::NotImplemented(format!("DROP {:?}", object_type))),
             };
 
@@ -85,8 +88,357 @@ pub fn bind_statement(binder: &Binder, stmt: &sql::Statement) -> Result<BoundSta
             bind_create_view(binder, name, query, *or_replace)
         }
 
+        sql::Statement::CreateSequence {
+            name,
+            if_not_exists,
+            sequence_options,
+            ..
+        } => {
+            bind_create_sequence(binder, name, *if_not_exists, sequence_options)
+        }
+
+        // Transaction statements
+        sql::Statement::StartTransaction { .. } => {
+            Ok(BoundStatement::Transaction(TransactionStatement::Begin))
+        }
+        sql::Statement::Commit { .. } => {
+            Ok(BoundStatement::Transaction(TransactionStatement::Commit))
+        }
+        sql::Statement::Rollback { savepoint, .. } => {
+            if let Some(sp) = savepoint {
+                Ok(BoundStatement::Transaction(TransactionStatement::RollbackToSavepoint(
+                    sp.value.clone()
+                )))
+            } else {
+                Ok(BoundStatement::Transaction(TransactionStatement::Rollback))
+            }
+        }
+        sql::Statement::Savepoint { name } => {
+            Ok(BoundStatement::Transaction(TransactionStatement::Savepoint(name.value.clone())))
+        }
+        sql::Statement::ReleaseSavepoint { name } => {
+            Ok(BoundStatement::Transaction(TransactionStatement::ReleaseSavepoint(name.value.clone())))
+        }
+
+        // ALTER TABLE
+        sql::Statement::AlterTable { name, if_exists: _, operations, .. } => {
+            bind_alter_table(binder, name, operations)
+        }
+
+        // COPY statement
+        sql::Statement::Copy { source, to, target, options, .. } => {
+            bind_copy(binder, source, *to, target, options)
+        }
+
+        // CREATE INDEX
+        sql::Statement::CreateIndex(create_index) => {
+            bind_create_index(binder, create_index)
+        }
+
         _ => Err(Error::NotImplemented(format!("Statement: {:?}", stmt))),
     }
+}
+
+/// Bind ALTER TABLE statement
+fn bind_alter_table(
+    binder: &Binder,
+    name: &sql::ObjectName,
+    operations: &[sql::AlterTableOperation],
+) -> Result<BoundStatement> {
+    let parts: Vec<_> = name.0.iter().map(|i| i.value.clone()).collect();
+    let (schema, table_name) = if parts.len() == 2 {
+        (parts[0].clone(), parts[1].clone())
+    } else {
+        (binder.current_schema().to_string(), parts[0].clone())
+    };
+
+    // Verify table exists
+    let _table = binder.catalog().get_table(&schema, &table_name)
+        .ok_or_else(|| Error::TableNotFound(format!("{}.{}", schema, table_name)))?;
+
+    // We only support one operation at a time for now
+    if operations.is_empty() {
+        return Err(Error::InvalidArguments("ALTER TABLE requires at least one operation".to_string()));
+    }
+
+    let operation = &operations[0];
+    let bound_op = match operation {
+        sql::AlterTableOperation::AddColumn { column_def, .. } => {
+            // Bind the column definition inline (similar to CREATE TABLE logic)
+            let data_type = bind_data_type(&column_def.data_type)?;
+            let nullable = !column_def.options.iter().any(|opt| {
+                matches!(opt.option, sql::ColumnOption::NotNull)
+            });
+
+            let mut is_primary_key = false;
+            let mut is_unique = false;
+            let mut default_expr = None;
+            let mut check_expr = None;
+
+            for opt in &column_def.options {
+                match &opt.option {
+                    sql::ColumnOption::Unique { is_primary, .. } => {
+                        if *is_primary {
+                            is_primary_key = true;
+                        } else {
+                            is_unique = true;
+                        }
+                    }
+                    sql::ColumnOption::Default(expr) => {
+                        let ctx = ExpressionBinderContext::empty();
+                        default_expr = Some(bind_expression(binder, expr, &ctx)?);
+                    }
+                    sql::ColumnOption::Check(expr) => {
+                        let col_ref = BoundTableRef::BaseTable {
+                            schema: "".to_string(),
+                            name: "".to_string(),
+                            alias: None,
+                            column_names: vec![column_def.name.value.clone()],
+                            column_types: vec![data_type.clone()],
+                        };
+                        let refs = vec![col_ref];
+                        let ctx = ExpressionBinderContext::new(&refs);
+                        check_expr = Some(bind_expression(binder, expr, &ctx)?);
+                    }
+                    _ => {}
+                }
+            }
+
+            let col = BoundColumnDef {
+                name: column_def.name.value.clone(),
+                data_type,
+                nullable,
+                default: default_expr,
+                is_primary_key,
+                is_unique,
+                check: check_expr,
+            };
+            AlterTableOperation::AddColumn { column: col }
+        }
+        sql::AlterTableOperation::DropColumn { column_name, if_exists, .. } => {
+            AlterTableOperation::DropColumn {
+                column_name: column_name.value.clone(),
+                if_exists: *if_exists,
+            }
+        }
+        sql::AlterTableOperation::RenameColumn { old_column_name, new_column_name } => {
+            AlterTableOperation::RenameColumn {
+                old_name: old_column_name.value.clone(),
+                new_name: new_column_name.value.clone(),
+            }
+        }
+        sql::AlterTableOperation::RenameTable { table_name: new_name } => {
+            AlterTableOperation::RenameTable {
+                new_name: new_name.0.iter().map(|i| i.value.clone()).collect::<Vec<_>>().join("."),
+            }
+        }
+        sql::AlterTableOperation::AlterColumn { column_name, op } => {
+            match op {
+                sql::AlterColumnOperation::SetDataType { data_type, .. } => {
+                    let logical_type = bind_data_type(data_type)?;
+                    AlterTableOperation::AlterColumnType {
+                        column_name: column_name.value.clone(),
+                        new_type: logical_type,
+                    }
+                }
+                sql::AlterColumnOperation::SetDefault { value } => {
+                    let ctx = ExpressionBinderContext::empty();
+                    let default_expr = bind_expression(binder, value, &ctx)?;
+                    AlterTableOperation::SetColumnDefault {
+                        column_name: column_name.value.clone(),
+                        default: Some(default_expr),
+                    }
+                }
+                sql::AlterColumnOperation::DropDefault => {
+                    AlterTableOperation::SetColumnDefault {
+                        column_name: column_name.value.clone(),
+                        default: None,
+                    }
+                }
+                sql::AlterColumnOperation::SetNotNull => {
+                    AlterTableOperation::SetColumnNotNull {
+                        column_name: column_name.value.clone(),
+                        not_null: true,
+                    }
+                }
+                sql::AlterColumnOperation::DropNotNull => {
+                    AlterTableOperation::SetColumnNotNull {
+                        column_name: column_name.value.clone(),
+                        not_null: false,
+                    }
+                }
+                _ => return Err(Error::NotImplemented(format!("ALTER COLUMN operation: {:?}", op))),
+            }
+        }
+        _ => return Err(Error::NotImplemented(format!("ALTER TABLE operation: {:?}", operation))),
+    };
+
+    Ok(BoundStatement::AlterTable(BoundAlterTable {
+        schema,
+        table_name,
+        operation: bound_op,
+    }))
+}
+
+/// Bind CREATE INDEX statement
+fn bind_create_index(binder: &Binder, create: &sql::CreateIndex) -> Result<BoundStatement> {
+    // Get index name
+    let index_name = create.name.as_ref()
+        .map(|n| n.0.last().map(|i| i.value.clone()).unwrap_or_default())
+        .unwrap_or_else(|| "unnamed_index".to_string());
+
+    // Get table name
+    let table_parts: Vec<_> = create.table_name.0.iter().map(|i| i.value.clone()).collect();
+    let (schema, table_name) = if table_parts.len() == 2 {
+        (table_parts[0].clone(), table_parts[1].clone())
+    } else {
+        (binder.current_schema().to_string(), table_parts[0].clone())
+    };
+
+    // Get the table to verify columns and get types
+    let table = binder.catalog().get_table(&schema, &table_name)
+        .ok_or_else(|| Error::TableNotFound(format!("{}.{}", schema, table_name)))?;
+
+    // Get column names from the index
+    let mut columns = Vec::new();
+    let mut column_types = Vec::new();
+
+    for col in &create.columns {
+        let col_name = match &col.expr {
+            sql::Expr::Identifier(ident) => ident.value.clone(),
+            _ => return Err(Error::InvalidArguments("Index column must be a column name".to_string())),
+        };
+
+        // Find the column in the table
+        let col_info = table.columns.iter()
+            .find(|c| c.name.eq_ignore_ascii_case(&col_name))
+            .ok_or_else(|| Error::ColumnNotFound(col_name.clone()))?;
+
+        columns.push(col_name);
+        column_types.push(col_info.logical_type.clone());
+    }
+
+    // Check if unique
+    let unique = create.unique;
+
+    // Check if_not_exists
+    let if_not_exists = create.if_not_exists;
+
+    Ok(BoundStatement::CreateIndex(BoundCreateIndex {
+        schema,
+        index_name,
+        table_name,
+        columns,
+        column_types,
+        unique,
+        if_not_exists,
+    }))
+}
+
+/// Bind COPY statement
+fn bind_copy(
+    binder: &Binder,
+    source: &sql::CopySource,
+    to: bool,
+    target: &sql::CopyTarget,
+    options: &[sql::CopyOption],
+) -> Result<BoundStatement> {
+    // Parse file path from target
+    let file_path = match target {
+        sql::CopyTarget::File { filename } => filename.clone(),
+        sql::CopyTarget::Stdout => {
+            return Err(Error::NotImplemented("COPY TO STDOUT".to_string()));
+        }
+        sql::CopyTarget::Stdin => {
+            return Err(Error::NotImplemented("COPY FROM STDIN".to_string()));
+        }
+        _ => {
+            return Err(Error::NotImplemented(format!("COPY target: {:?}", target)));
+        }
+    };
+
+    // Parse options
+    let mut format_type = CopyFormatType::Csv; // Default to CSV
+    let mut header = true; // Default to header
+    let mut delimiter = ','; // Default delimiter
+
+    for opt in options {
+        match opt {
+            sql::CopyOption::Format(fmt) => {
+                match fmt.value.to_uppercase().as_str() {
+                    "CSV" => format_type = CopyFormatType::Csv,
+                    "PARQUET" => format_type = CopyFormatType::Parquet,
+                    _ => return Err(Error::NotImplemented(format!("COPY format: {}", fmt))),
+                }
+            }
+            sql::CopyOption::Header(h) => {
+                header = *h;
+            }
+            sql::CopyOption::Delimiter(d) => {
+                delimiter = *d;
+            }
+            _ => {} // Ignore other options for now
+        }
+    }
+
+    // Bind the source
+    let copy_source = match source {
+        sql::CopySource::Table { table_name, columns } => {
+            let parts: Vec<_> = table_name.0.iter().map(|i| i.value.clone()).collect();
+            let (schema, name) = if parts.len() == 2 {
+                (parts[0].clone(), parts[1].clone())
+            } else {
+                (binder.current_schema().to_string(), parts[0].clone())
+            };
+
+            // Verify table exists
+            let _table = binder.catalog().get_table(&schema, &name)
+                .ok_or_else(|| Error::TableNotFound(format!("{}.{}", schema, name)))?;
+
+            let col_names: Vec<String> = columns.iter().map(|c| c.value.clone()).collect();
+
+            CopySource::Table {
+                schema,
+                name,
+                columns: col_names,
+            }
+        }
+        sql::CopySource::Query(query) => {
+            if !to {
+                return Err(Error::InvalidArguments("COPY FROM with query source".to_string()));
+            }
+            // Bind the query
+            let bound = bind_query(binder, query)?;
+            match bound {
+                BoundStatement::Select(sel) => CopySource::Query(Box::new(sel)),
+                BoundStatement::SetOperation(set_op) => {
+                    // For set operations, wrap in a select-like structure
+                    // Convert first operand to get schema
+                    let select = match *set_op.left {
+                        SetOperand::Select(sel) => sel,
+                        SetOperand::SetOperation(_) => {
+                            return Err(Error::NotImplemented(
+                                "COPY from nested set operation".to_string()
+                            ));
+                        }
+                    };
+                    CopySource::Query(Box::new(select))
+                }
+                _ => return Err(Error::InvalidArguments("Invalid COPY source".to_string())),
+            }
+        }
+    };
+
+    Ok(BoundStatement::Copy(BoundCopy {
+        to,
+        source: copy_source,
+        file_path,
+        format: CopyFormat {
+            format_type,
+            header,
+            delimiter,
+        },
+    }))
 }
 
 /// Bind a query - returns either a Select or SetOperation
@@ -97,9 +449,9 @@ fn bind_query(binder: &Binder, query: &sql::Query) -> Result<BoundStatement> {
     // Handle the body - check for set operations first
     match query.body.as_ref() {
         sql::SetExpr::SetOperation { op, set_quantifier, left, right } => {
-            // Recursively bind left and right sides
-            let left_select = bind_set_expr_with_ctes(binder, left, &ctes)?;
-            let right_select = bind_set_expr_with_ctes(binder, right, &ctes)?;
+            // Recursively bind left and right sides as operands (supports nesting)
+            let left_operand = bind_set_expr_to_operand(binder, left, &ctes)?;
+            let right_operand = bind_set_expr_to_operand(binder, right, &ctes)?;
 
             let set_op = match op {
                 sql::SetOperator::Union => SetOperationType::Union,
@@ -110,9 +462,14 @@ fn bind_query(binder: &Binder, query: &sql::Query) -> Result<BoundStatement> {
             let all = matches!(set_quantifier, sql::SetQuantifier::All);
 
             // Build order by, limit, offset
+            // For ORDER BY context, extract FROM clause from left operand
             let mut order_by = Vec::new();
             if let Some(ob) = &query.order_by {
-                let ctx = ExpressionBinderContext::new(&left_select.from);
+                let from_clause = match &left_operand {
+                    SetOperand::Select(sel) => &sel.from,
+                    SetOperand::SetOperation(_) => &Vec::new(),
+                };
+                let ctx = ExpressionBinderContext::new(from_clause);
                 for order in &ob.exprs {
                     let expr = bind_expression(binder, &order.expr, &ctx)?;
                     order_by.push(BoundOrderBy {
@@ -144,8 +501,8 @@ fn bind_query(binder: &Binder, query: &sql::Query) -> Result<BoundStatement> {
             };
 
             Ok(BoundStatement::SetOperation(BoundSetOperation {
-                left: Box::new(left_select),
-                right: Box::new(right_select),
+                left: Box::new(left_operand),
+                right: Box::new(right_operand),
                 set_op,
                 all,
                 order_by,
@@ -155,8 +512,33 @@ fn bind_query(binder: &Binder, query: &sql::Query) -> Result<BoundStatement> {
         }
         _ => {
             // Regular SELECT
-            let select = bind_query_select_with_ctes(binder, query, &ctes)?;
+            let mut select = bind_query_select_with_ctes(binder, query, &ctes)?;
+            // Store CTEs on the select so planner can create RecursiveCTE operators
+            select.ctes = ctes;
             Ok(BoundStatement::Select(select))
+        }
+    }
+}
+
+/// Bind a query with outer tables for LATERAL support
+/// Outer tables are passed to the SELECT binding as additional context
+fn bind_query_with_outer(
+    binder: &Binder,
+    query: &sql::Query,
+    outer_tables: &[BoundTableRef],
+) -> Result<BoundStatement> {
+    // First, bind any CTEs
+    let ctes = bind_ctes(binder, &query.with)?;
+
+    // For LATERAL, we only support simple SELECT (not set operations for now)
+    match query.body.as_ref() {
+        sql::SetExpr::Select(select) => {
+            let bound = bind_select_with_outer(binder, select, &ctes, outer_tables)?;
+            Ok(BoundStatement::Select(bound))
+        }
+        _ => {
+            // Fall back to regular binding for complex cases
+            bind_query(binder, query)
         }
     }
 }
@@ -167,10 +549,6 @@ fn bind_ctes(binder: &Binder, with: &Option<sql::With>) -> Result<Vec<BoundCTE>>
         return Ok(Vec::new());
     };
 
-    if with_clause.recursive {
-        return Err(Error::NotImplemented("Recursive CTEs".to_string()));
-    }
-
     let mut ctes = Vec::new();
 
     for cte in &with_clause.cte_tables {
@@ -180,17 +558,211 @@ fn bind_ctes(binder: &Binder, with: &Option<sql::With>) -> Result<Vec<BoundCTE>>
         // Get column aliases if any
         let column_aliases: Vec<String> = cte.alias.columns.iter().map(|c| c.name.value.clone()).collect();
 
-        // Bind the CTE query - CTEs can reference earlier CTEs in the same WITH clause
-        let query = bind_query_select_with_ctes(binder, &cte.query, &ctes)?;
+        if with_clause.recursive {
+            // For recursive CTEs, the body should be a UNION/UNION ALL
+            // with a base case and a recursive case
+            let bound_cte = bind_recursive_cte(binder, &name, &column_aliases, &cte.query, &ctes)?;
+            ctes.push(bound_cte);
+        } else {
+            // Bind the CTE query - CTEs can reference earlier CTEs in the same WITH clause
+            let query = bind_query_select_with_ctes(binder, &cte.query, &ctes)?;
 
-        ctes.push(BoundCTE {
-            name,
-            column_aliases,
-            query,
-        });
+            ctes.push(BoundCTE {
+                name,
+                column_aliases,
+                query,
+                is_recursive: false,
+                recursive_query: None,
+                union_all: false,
+            });
+        }
     }
 
     Ok(ctes)
+}
+
+/// Bind a recursive CTE
+fn bind_recursive_cte(
+    binder: &Binder,
+    name: &str,
+    column_aliases: &[String],
+    query: &sql::Query,
+    prior_ctes: &[BoundCTE],
+) -> Result<BoundCTE> {
+    // For recursive CTEs, the body should be a UNION/UNION ALL
+    let (left, right, all) = match query.body.as_ref() {
+        sql::SetExpr::SetOperation {
+            op: sql::SetOperator::Union,
+            set_quantifier,
+            left,
+            right,
+        } => {
+            let is_all = matches!(set_quantifier, sql::SetQuantifier::All);
+            (left, right, is_all)
+        }
+        _ => {
+            // Not a UNION, might be a simple recursive (self-referential) CTE
+            // Try to bind it with the CTE already visible (for simple recursion)
+            // For now, just treat as non-recursive
+            let query = bind_query_select_with_ctes(binder, query, prior_ctes)?;
+            return Ok(BoundCTE {
+                name: name.to_string(),
+                column_aliases: column_aliases.to_vec(),
+                query,
+                is_recursive: false,
+                recursive_query: None,
+                union_all: false,
+            });
+        }
+    };
+
+    // Determine which side is the base case (doesn't reference the CTE)
+    // and which is the recursive case (references the CTE)
+    let left_references_cte = set_expr_references_cte(left, name);
+    let right_references_cte = set_expr_references_cte(right, name);
+
+    let (base_expr, recursive_expr, union_all) = match (left_references_cte, right_references_cte) {
+        (false, true) => (left, right, all),
+        (true, false) => (right, left, all),
+        (false, false) => {
+            // Neither side references the CTE - not actually recursive
+            // Just bind as a regular UNION
+            let left_select = bind_set_expr_with_ctes(binder, left, prior_ctes)?;
+            let right_select = bind_set_expr_with_ctes(binder, right, prior_ctes)?;
+
+            // Combine as a set operation
+            let combined = BoundSelect {
+                select_list: left_select.select_list.clone(),
+                from: vec![BoundTableRef::Subquery {
+                    subquery: Box::new(left_select),
+                    alias: "union_left".to_string(),
+                    is_lateral: false,
+                }],
+                where_clause: None,
+                group_by: Vec::new(),
+                grouping_sets: Vec::new(),
+                having: None,
+                qualify: None,
+                order_by: Vec::new(),
+                limit: None,
+                offset: None,
+                distinct: if all { DistinctKind::None } else { DistinctKind::All },
+                ctes: Vec::new(),
+                values_rows: Vec::new(),
+            };
+
+            return Ok(BoundCTE {
+                name: name.to_string(),
+                column_aliases: column_aliases.to_vec(),
+                query: combined,
+                is_recursive: false,
+                recursive_query: None,
+                union_all: false,
+            });
+        }
+        (true, true) => {
+            return Err(Error::InvalidArguments(
+                "Both sides of recursive CTE UNION reference the CTE".to_string(),
+            ));
+        }
+    };
+
+    // First, bind the base case without the CTE in scope
+    let base_case = bind_set_expr_with_ctes(binder, base_expr, prior_ctes)?;
+
+    // Determine the output column types from the base case
+    let column_types: Vec<_> = base_case.select_list.iter()
+        .map(|e| e.return_type.clone())
+        .collect();
+
+    // Get column names (either from aliases or from base case)
+    let column_names: Vec<String> = if column_aliases.is_empty() {
+        base_case.select_list.iter().map(|e| e.name()).collect()
+    } else {
+        column_aliases.to_vec()
+    };
+
+    // Create a temporary BoundCTE to allow the recursive case to reference it
+    let temp_cte = BoundCTE {
+        name: name.to_string(),
+        column_aliases: column_names.clone(),
+        query: base_case.clone(),
+        is_recursive: true,
+        recursive_query: None,
+        union_all: all,
+    };
+
+    // Create extended CTE list including this recursive CTE
+    let mut extended_ctes = prior_ctes.to_vec();
+    extended_ctes.push(temp_cte);
+
+    // Now bind the recursive case with the CTE in scope
+    let recursive_case = bind_set_expr_with_ctes(binder, recursive_expr, &extended_ctes)?;
+
+    // Return the recursive CTE with both base and recursive parts
+    Ok(BoundCTE {
+        name: name.to_string(),
+        column_aliases: column_names,
+        query: base_case,
+        is_recursive: true,
+        recursive_query: Some(recursive_case),
+        union_all: all,
+    })
+}
+
+/// Check if a set expression references a CTE by name
+fn set_expr_references_cte(set_expr: &sql::SetExpr, cte_name: &str) -> bool {
+    match set_expr {
+        sql::SetExpr::Select(select) => {
+            // Check FROM clause for references to the CTE
+            for table_with_joins in &select.from {
+                if table_factor_references_cte(&table_with_joins.relation, cte_name) {
+                    return true;
+                }
+                for join in &table_with_joins.joins {
+                    if table_factor_references_cte(&join.relation, cte_name) {
+                        return true;
+                    }
+                }
+            }
+            false
+        }
+        sql::SetExpr::Query(query) => set_expr_references_cte(&query.body, cte_name),
+        sql::SetExpr::SetOperation { left, right, .. } => {
+            set_expr_references_cte(left, cte_name) || set_expr_references_cte(right, cte_name)
+        }
+        _ => false,
+    }
+}
+
+/// Check if a table factor references a CTE by name
+fn table_factor_references_cte(factor: &sql::TableFactor, cte_name: &str) -> bool {
+    match factor {
+        sql::TableFactor::Table { name, .. } => {
+            // Check if this table name matches the CTE name
+            if name.0.len() == 1 {
+                let table_name = &name.0[0].value;
+                table_name.eq_ignore_ascii_case(cte_name)
+            } else {
+                false
+            }
+        }
+        sql::TableFactor::Derived { subquery, .. } => {
+            set_expr_references_cte(&subquery.body, cte_name)
+        }
+        sql::TableFactor::NestedJoin { table_with_joins, .. } => {
+            if table_factor_references_cte(&table_with_joins.relation, cte_name) {
+                return true;
+            }
+            for join in &table_with_joins.joins {
+                if table_factor_references_cte(&join.relation, cte_name) {
+                    return true;
+                }
+            }
+            false
+        }
+        _ => false,
+    }
 }
 
 /// Bind a set expression to a BoundSelect
@@ -199,6 +771,7 @@ fn bind_set_expr(binder: &Binder, set_expr: &sql::SetExpr) -> Result<BoundSelect
 }
 
 /// Bind a set expression to a BoundSelect (with CTE support)
+/// Note: For nested set operations, use bind_set_expr_to_operand instead
 fn bind_set_expr_with_ctes(
     binder: &Binder,
     set_expr: &sql::SetExpr,
@@ -209,8 +782,62 @@ fn bind_set_expr_with_ctes(
         sql::SetExpr::Values(values) => bind_values(binder, values),
         sql::SetExpr::Query(query) => bind_query_select_with_ctes(binder, query, ctes),
         sql::SetExpr::SetOperation { .. } => {
-            // Nested set operations - for now, wrap in a query
-            Err(Error::NotImplemented("Nested set operations".to_string()))
+            // For nested set operations in contexts requiring BoundSelect,
+            // the caller should use bind_set_expr_to_operand instead
+            Err(Error::NotImplemented(
+                "Nested set operations in this context (use bind_set_expr_to_operand)".to_string(),
+            ))
+        }
+        _ => Err(Error::NotImplemented(format!("Set expression: {:?}", set_expr))),
+    }
+}
+
+/// Bind a set expression to a SetOperand (supports nested set operations)
+fn bind_set_expr_to_operand(
+    binder: &Binder,
+    set_expr: &sql::SetExpr,
+    ctes: &[BoundCTE],
+) -> Result<SetOperand> {
+    match set_expr {
+        sql::SetExpr::Select(select) => {
+            let bound = bind_select_with_ctes(binder, select, ctes)?;
+            Ok(SetOperand::Select(bound))
+        }
+        sql::SetExpr::Values(values) => {
+            let bound = bind_values(binder, values)?;
+            Ok(SetOperand::Select(bound))
+        }
+        sql::SetExpr::Query(query) => {
+            // If the query body is a set operation, handle it recursively
+            if let sql::SetExpr::SetOperation { .. } = query.body.as_ref() {
+                bind_set_expr_to_operand(binder, query.body.as_ref(), ctes)
+            } else {
+                let bound = bind_query_select_with_ctes(binder, query, ctes)?;
+                Ok(SetOperand::Select(bound))
+            }
+        }
+        sql::SetExpr::SetOperation { op, set_quantifier, left, right } => {
+            // Recursively bind left and right sides as operands
+            let left_operand = bind_set_expr_to_operand(binder, left, ctes)?;
+            let right_operand = bind_set_expr_to_operand(binder, right, ctes)?;
+
+            let set_op = match op {
+                sql::SetOperator::Union => SetOperationType::Union,
+                sql::SetOperator::Intersect => SetOperationType::Intersect,
+                sql::SetOperator::Except => SetOperationType::Except,
+            };
+
+            let all = matches!(set_quantifier, sql::SetQuantifier::All);
+
+            Ok(SetOperand::SetOperation(Box::new(BoundSetOperation {
+                left: Box::new(left_operand),
+                right: Box::new(right_operand),
+                set_op,
+                all,
+                order_by: Vec::new(),
+                limit: None,
+                offset: None,
+            })))
         }
         _ => Err(Error::NotImplemented(format!("Set expression: {:?}", set_expr))),
     }
@@ -219,6 +846,15 @@ fn bind_set_expr_with_ctes(
 /// Bind a subquery (exposed for expression binder to use)
 pub fn bind_subquery(binder: &Binder, query: &sql::Query) -> Result<BoundSelect> {
     bind_query_select(binder, query)
+}
+
+/// Bind a subquery with outer context (for correlated subqueries)
+pub fn bind_subquery_with_outer(
+    binder: &Binder,
+    query: &sql::Query,
+    outer_tables: &[BoundTableRef],
+) -> Result<BoundSelect> {
+    bind_query_select_with_outer(binder, query, outer_tables)
 }
 
 /// Bind a query to a BoundSelect (for non-set-operation queries)
@@ -269,6 +905,49 @@ fn bind_query_select_with_ctes(
     Ok(result)
 }
 
+/// Bind a query to a BoundSelect with outer context (for correlated subqueries)
+fn bind_query_select_with_outer(
+    binder: &Binder,
+    query: &sql::Query,
+    outer_tables: &[BoundTableRef],
+) -> Result<BoundSelect> {
+    // Handle the body
+    let select = match query.body.as_ref() {
+        sql::SetExpr::Select(select) => bind_select_with_outer(binder, select, &[], outer_tables)?,
+        sql::SetExpr::Values(values) => bind_values(binder, values)?,
+        _ => return Err(Error::NotImplemented("Complex query body".to_string())),
+    };
+
+    // Apply ORDER BY, LIMIT, OFFSET from the query
+    let mut result = select;
+
+    if let Some(order_by) = &query.order_by {
+        let ctx = ExpressionBinderContext::with_outer_tables(&result.from, outer_tables);
+        for order in &order_by.exprs {
+            let expr = bind_expression(binder, &order.expr, &ctx)?;
+            result.order_by.push(BoundOrderBy {
+                expr,
+                ascending: order.asc.unwrap_or(true),
+                nulls_first: order.nulls_first.unwrap_or(false),
+            });
+        }
+    }
+
+    if let Some(limit) = &query.limit {
+        if let sql::Expr::Value(sql::Value::Number(n, _)) = limit {
+            result.limit = Some(n.parse().map_err(|_| Error::Parse("Invalid LIMIT".to_string()))?);
+        }
+    }
+
+    if let Some(offset) = &query.offset {
+        if let sql::Expr::Value(sql::Value::Number(n, _)) = &offset.value {
+            result.offset = Some(n.parse().map_err(|_| Error::Parse("Invalid OFFSET".to_string()))?);
+        }
+    }
+
+    Ok(result)
+}
+
 /// Bind a SELECT clause
 fn bind_select(binder: &Binder, select: &sql::Select) -> Result<BoundSelect> {
     bind_select_with_ctes(binder, select, &[])
@@ -283,10 +962,10 @@ fn bind_select_with_ctes(
     // First, bind FROM clause to know available columns
     let from = bind_from_with_ctes(binder, &select.from, ctes)?;
 
-    // Bind SELECT list
+    // Bind SELECT list (with named windows from WINDOW clause)
     let mut select_list = Vec::new();
     {
-        let ctx = ExpressionBinderContext::new(&from);
+        let ctx = ExpressionBinderContext::with_named_windows(&from, &select.named_window);
         for item in &select.projection {
             match item {
                 sql::SelectItem::UnnamedExpr(expr) => {
@@ -298,24 +977,68 @@ fn bind_select_with_ctes(
                     bound.alias = Some(alias.value.clone());
                     select_list.push(bound);
                 }
-                sql::SelectItem::Wildcard(_) => {
+                sql::SelectItem::Wildcard(options) => {
                     // Expand * to all columns from all tables
+                    // Handle EXCLUDE clause if present
+                    let exclude_cols: Vec<String> = match &options.opt_exclude {
+                        Some(sql::ExcludeSelectItem::Single(ident)) => vec![ident.value.clone()],
+                        Some(sql::ExcludeSelectItem::Multiple(idents)) => {
+                            idents.iter().map(|i| i.value.clone()).collect()
+                        }
+                        None => vec![],
+                    };
+
+                    // Handle REPLACE clause if present
+                    let replace_map: std::collections::HashMap<String, BoundExpression> = match &options.opt_replace {
+                        Some(replace_item) => {
+                            let mut map = std::collections::HashMap::new();
+                            for elem in &replace_item.items {
+                                let bound_expr = bind_expression(binder, &elem.expr, &ctx)?;
+                                map.insert(elem.column_name.value.to_uppercase(), bound_expr);
+                            }
+                            map
+                        }
+                        None => std::collections::HashMap::new(),
+                    };
+
                     // Track global column offset across all tables in FROM
                     let mut global_col_offset = 0;
                     for (table_idx, table_ref) in from.iter().enumerate() {
-                        expand_wildcard_with_offset(table_ref, table_idx, &mut global_col_offset, &mut select_list);
+                        expand_wildcard_with_options(table_ref, table_idx, &mut global_col_offset, &mut select_list, &exclude_cols, &replace_map);
                     }
                 }
-                sql::SelectItem::QualifiedWildcard(name, _) => {
+                sql::SelectItem::QualifiedWildcard(name, options) => {
                     // Expand table.* to all columns from the specified table
                     let table_name = name.0.last()
                         .map(|i| i.value.clone())
                         .unwrap_or_default();
 
+                    // Handle EXCLUDE clause if present
+                    let exclude_cols: Vec<String> = match &options.opt_exclude {
+                        Some(sql::ExcludeSelectItem::Single(ident)) => vec![ident.value.clone()],
+                        Some(sql::ExcludeSelectItem::Multiple(idents)) => {
+                            idents.iter().map(|i| i.value.clone()).collect()
+                        }
+                        None => vec![],
+                    };
+
+                    // Handle REPLACE clause if present
+                    let replace_map: std::collections::HashMap<String, BoundExpression> = match &options.opt_replace {
+                        Some(replace_item) => {
+                            let mut map = std::collections::HashMap::new();
+                            for elem in &replace_item.items {
+                                let bound_expr = bind_expression(binder, &elem.expr, &ctx)?;
+                                map.insert(elem.column_name.value.to_uppercase(), bound_expr);
+                            }
+                            map
+                        }
+                        None => std::collections::HashMap::new(),
+                    };
+
                     let mut found = false;
                     let mut global_col_offset = 0;
                     for (table_idx, table_ref) in from.iter().enumerate() {
-                        if expand_qualified_wildcard(table_ref, &table_name, table_idx, &mut global_col_offset, &mut select_list) {
+                        if expand_qualified_wildcard_with_options(table_ref, &table_name, table_idx, &mut global_col_offset, &mut select_list, &exclude_cols, &replace_map) {
                             found = true;
                             // Don't break - we need to continue counting columns for proper offset
                         }
@@ -357,11 +1080,66 @@ fn bind_select_with_ctes(
         // Bind GROUP BY
         match &select.group_by {
             sql::GroupByExpr::All(_) => {
-                return Err(Error::NotImplemented("GROUP BY ALL".to_string()));
+                // GROUP BY ALL - automatically group by all non-aggregate expressions
+                // in the SELECT list
+                for select_expr in &result.select_list {
+                    if !expression_contains_aggregate(select_expr) {
+                        result.group_by.push(select_expr.clone());
+                    }
+                }
             }
             sql::GroupByExpr::Expressions(exprs, _) => {
                 for expr in exprs {
-                    result.group_by.push(bind_expression(binder, expr, &ctx)?);
+                    // Check for ROLLUP, CUBE, GROUPING SETS
+                    match expr {
+                        sql::Expr::Rollup(groups) => {
+                            // ROLLUP(a, b) = GROUPING SETS((a, b), (a), ())
+                            let bound_groups: Vec<Vec<BoundExpression>> = groups
+                                .iter()
+                                .map(|g| g.iter().map(|e| bind_expression(binder, e, &ctx)).collect::<Result<Vec<_>>>())
+                                .collect::<Result<Vec<_>>>()?;
+
+                            // Generate all prefix combinations
+                            let flat_groups: Vec<BoundExpression> = bound_groups.into_iter().flatten().collect();
+                            for i in (0..=flat_groups.len()).rev() {
+                                result.grouping_sets.push(flat_groups[..i].to_vec());
+                            }
+                        }
+                        sql::Expr::Cube(groups) => {
+                            // CUBE(a, b) = all combinations: (a, b), (a), (b), ()
+                            let bound_groups: Vec<Vec<BoundExpression>> = groups
+                                .iter()
+                                .map(|g| g.iter().map(|e| bind_expression(binder, e, &ctx)).collect::<Result<Vec<_>>>())
+                                .collect::<Result<Vec<_>>>()?;
+
+                            let flat_groups: Vec<BoundExpression> = bound_groups.into_iter().flatten().collect();
+                            let n = flat_groups.len();
+                            // Generate all 2^n combinations
+                            for mask in 0..(1 << n) {
+                                let mut combo = Vec::new();
+                                for i in 0..n {
+                                    if (mask & (1 << i)) != 0 {
+                                        combo.push(flat_groups[i].clone());
+                                    }
+                                }
+                                result.grouping_sets.push(combo);
+                            }
+                        }
+                        sql::Expr::GroupingSets(sets) => {
+                            // Direct GROUPING SETS
+                            for set in sets {
+                                let bound_set: Vec<BoundExpression> = set
+                                    .iter()
+                                    .map(|e| bind_expression(binder, e, &ctx))
+                                    .collect::<Result<Vec<_>>>()?;
+                                result.grouping_sets.push(bound_set);
+                            }
+                        }
+                        _ => {
+                            // Regular GROUP BY expression
+                            result.group_by.push(bind_expression(binder, expr, &ctx)?);
+                        }
+                    }
                 }
             }
         }
@@ -370,9 +1148,210 @@ fn bind_select_with_ctes(
         if let Some(having) = &select.having {
             result.having = Some(bind_expression(binder, having, &ctx)?);
         }
+
+        // Bind QUALIFY clause (filters after window functions are evaluated)
+        if let Some(qualify) = &select.qualify {
+            result.qualify = Some(bind_expression(binder, qualify, &ctx)?);
+        }
     }
 
     // Now we can move from into result
+    result.from = from;
+
+    Ok(result)
+}
+
+/// Bind a SELECT clause with outer context (for correlated subqueries and LATERAL joins)
+fn bind_select_with_outer(
+    binder: &Binder,
+    select: &sql::Select,
+    ctes: &[BoundCTE],
+    outer_tables: &[BoundTableRef],
+) -> Result<BoundSelect> {
+    // First, bind FROM clause to know available columns
+    let from = bind_from_with_ctes(binder, &select.from, ctes)?;
+
+    // Bind SELECT list with outer context
+    let mut select_list = Vec::new();
+    {
+        // Use outer tables context for expression binding
+        let ctx = ExpressionBinderContext {
+            tables: &from,
+            named_windows: &select.named_window,
+            outer_tables,
+        };
+        for item in &select.projection {
+            match item {
+                sql::SelectItem::UnnamedExpr(expr) => {
+                    let bound = bind_expression(binder, expr, &ctx)?;
+                    select_list.push(bound);
+                }
+                sql::SelectItem::ExprWithAlias { expr, alias } => {
+                    let mut bound = bind_expression(binder, expr, &ctx)?;
+                    bound.alias = Some(alias.value.clone());
+                    select_list.push(bound);
+                }
+                sql::SelectItem::Wildcard(options) => {
+                    // Expand * to all columns from all tables (only inner tables)
+                    let exclude_cols: Vec<String> = match &options.opt_exclude {
+                        Some(sql::ExcludeSelectItem::Single(ident)) => vec![ident.value.clone()],
+                        Some(sql::ExcludeSelectItem::Multiple(idents)) => {
+                            idents.iter().map(|i| i.value.clone()).collect()
+                        }
+                        None => vec![],
+                    };
+
+                    let replace_map: std::collections::HashMap<String, BoundExpression> = match &options.opt_replace {
+                        Some(replace_item) => {
+                            let mut map = std::collections::HashMap::new();
+                            for elem in &replace_item.items {
+                                let bound_expr = bind_expression(binder, &elem.expr, &ctx)?;
+                                map.insert(elem.column_name.value.to_uppercase(), bound_expr);
+                            }
+                            map
+                        }
+                        None => std::collections::HashMap::new(),
+                    };
+
+                    let mut global_col_offset = 0;
+                    for (table_idx, table_ref) in from.iter().enumerate() {
+                        expand_wildcard_with_options(table_ref, table_idx, &mut global_col_offset, &mut select_list, &exclude_cols, &replace_map);
+                    }
+                }
+                sql::SelectItem::QualifiedWildcard(name, options) => {
+                    let table_name = name.0.last()
+                        .map(|i| i.value.clone())
+                        .unwrap_or_default();
+
+                    let exclude_cols: Vec<String> = match &options.opt_exclude {
+                        Some(sql::ExcludeSelectItem::Single(ident)) => vec![ident.value.clone()],
+                        Some(sql::ExcludeSelectItem::Multiple(idents)) => {
+                            idents.iter().map(|i| i.value.clone()).collect()
+                        }
+                        None => vec![],
+                    };
+
+                    let replace_map: std::collections::HashMap<String, BoundExpression> = match &options.opt_replace {
+                        Some(replace_item) => {
+                            let mut map = std::collections::HashMap::new();
+                            for elem in &replace_item.items {
+                                let bound_expr = bind_expression(binder, &elem.expr, &ctx)?;
+                                map.insert(elem.column_name.value.to_uppercase(), bound_expr);
+                            }
+                            map
+                        }
+                        None => std::collections::HashMap::new(),
+                    };
+
+                    let mut found = false;
+                    let mut global_col_offset = 0;
+                    for (table_idx, table_ref) in from.iter().enumerate() {
+                        if expand_qualified_wildcard_with_options(table_ref, &table_name, table_idx, &mut global_col_offset, &mut select_list, &exclude_cols, &replace_map) {
+                            found = true;
+                        }
+                    }
+
+                    if !found {
+                        return Err(Error::TableNotFound(table_name));
+                    }
+                }
+            }
+        }
+    }
+
+    let mut result = BoundSelect::new(select_list);
+
+    // Bind DISTINCT or DISTINCT ON
+    result.distinct = match &select.distinct {
+        None => DistinctKind::None,
+        Some(sql::Distinct::Distinct) => DistinctKind::All,
+        Some(sql::Distinct::On(exprs)) => {
+            let ctx = ExpressionBinderContext::with_outer_tables(&from, outer_tables);
+            let mut bound_exprs = Vec::new();
+            for expr in exprs {
+                bound_exprs.push(bind_expression(binder, expr, &ctx)?);
+            }
+            DistinctKind::On(bound_exprs)
+        }
+    };
+
+    // Bind WHERE, GROUP BY, HAVING with outer context
+    {
+        let ctx = ExpressionBinderContext::with_outer_tables(&from, outer_tables);
+
+        // Bind WHERE clause
+        if let Some(selection) = &select.selection {
+            result.where_clause = Some(bind_expression(binder, selection, &ctx)?);
+        }
+
+        // Bind GROUP BY
+        match &select.group_by {
+            sql::GroupByExpr::All(_) => {
+                for select_expr in &result.select_list {
+                    if !expression_contains_aggregate(select_expr) {
+                        result.group_by.push(select_expr.clone());
+                    }
+                }
+            }
+            sql::GroupByExpr::Expressions(exprs, _) => {
+                for expr in exprs {
+                    // Check for ROLLUP, CUBE, GROUPING SETS
+                    match expr {
+                        sql::Expr::Rollup(groups) => {
+                            let bound_groups: Vec<Vec<BoundExpression>> = groups
+                                .iter()
+                                .map(|g| g.iter().map(|e| bind_expression(binder, e, &ctx)).collect::<Result<Vec<_>>>())
+                                .collect::<Result<Vec<_>>>()?;
+                            let flat_groups: Vec<BoundExpression> = bound_groups.into_iter().flatten().collect();
+                            for i in (0..=flat_groups.len()).rev() {
+                                result.grouping_sets.push(flat_groups[..i].to_vec());
+                            }
+                        }
+                        sql::Expr::Cube(groups) => {
+                            let bound_groups: Vec<Vec<BoundExpression>> = groups
+                                .iter()
+                                .map(|g| g.iter().map(|e| bind_expression(binder, e, &ctx)).collect::<Result<Vec<_>>>())
+                                .collect::<Result<Vec<_>>>()?;
+                            let flat_groups: Vec<BoundExpression> = bound_groups.into_iter().flatten().collect();
+                            let n = flat_groups.len();
+                            for mask in 0..(1 << n) {
+                                let mut combo = Vec::new();
+                                for i in 0..n {
+                                    if (mask & (1 << i)) != 0 {
+                                        combo.push(flat_groups[i].clone());
+                                    }
+                                }
+                                result.grouping_sets.push(combo);
+                            }
+                        }
+                        sql::Expr::GroupingSets(sets) => {
+                            for set in sets {
+                                let bound_set: Vec<BoundExpression> = set
+                                    .iter()
+                                    .map(|e| bind_expression(binder, e, &ctx))
+                                    .collect::<Result<Vec<_>>>()?;
+                                result.grouping_sets.push(bound_set);
+                            }
+                        }
+                        _ => {
+                            result.group_by.push(bind_expression(binder, expr, &ctx)?);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Bind HAVING
+        if let Some(having) = &select.having {
+            result.having = Some(bind_expression(binder, having, &ctx)?);
+        }
+
+        // Bind QUALIFY clause
+        if let Some(qualify) = &select.qualify {
+            result.qualify = Some(bind_expression(binder, qualify, &ctx)?);
+        }
+    }
+
     result.from = from;
 
     Ok(result)
@@ -391,10 +1370,8 @@ fn bind_values(_binder: &Binder, values: &sql::Values) -> Result<BoundSelect> {
         all_rows.push(bound_row);
     }
 
-    // For VALUES, create a select with constant expressions
-    // The first row determines the column types
-    let select_list = all_rows.into_iter().next().unwrap_or_default();
-    Ok(BoundSelect::new(select_list))
+    // For VALUES, create a select with all rows
+    Ok(BoundSelect::new_values(all_rows))
 }
 
 /// Collect all base tables from a table reference (for building expression context)
@@ -407,7 +1384,12 @@ fn collect_tables_from_ref(table_ref: &BoundTableRef) -> Vec<BoundTableRef> {
             tables
         }
         BoundTableRef::Subquery { .. } => vec![table_ref.clone()],
+        BoundTableRef::SetOperationSubquery { .. } => vec![table_ref.clone()],
         BoundTableRef::TableFunction { .. } => vec![table_ref.clone()],
+        BoundTableRef::RecursiveCTERef { .. } => vec![table_ref.clone()],
+        BoundTableRef::Pivot { source, .. } => collect_tables_from_ref(source),
+        BoundTableRef::Unpivot { source, .. } => collect_tables_from_ref(source),
+        BoundTableRef::FileTableFunction { .. } => vec![table_ref.clone()],
         BoundTableRef::Empty => vec![],
     }
 }
@@ -430,18 +1412,27 @@ fn bind_from_with_ctes(
 
     let mut result = Vec::new();
     for table_with_joins in from {
-        let base = bind_table_factor_with_ctes(binder, &table_with_joins.relation, ctes)?;
+        // Collect preceding tables for LATERAL support
+        let preceding_tables: Vec<BoundTableRef> = result.clone();
+        let base = bind_table_factor_with_ctes_and_outer(binder, &table_with_joins.relation, ctes, &preceding_tables)?;
 
         // Handle joins
         let mut current = base;
         for join in &table_with_joins.joins {
-            let right = bind_table_factor_with_ctes(binder, &join.relation, ctes)?;
+            // For LATERAL in joins, the left side becomes the preceding context
+            let left_tables = collect_tables_from_ref(&current);
+            let mut all_preceding: Vec<BoundTableRef> = preceding_tables.clone();
+            all_preceding.extend(left_tables);
+            let right = bind_table_factor_with_ctes_and_outer(binder, &join.relation, ctes, &all_preceding)?;
             let join_type = match &join.join_operator {
                 sql::JoinOperator::Inner(_) => BoundJoinType::Inner,
                 sql::JoinOperator::LeftOuter(_) => BoundJoinType::Left,
                 sql::JoinOperator::RightOuter(_) => BoundJoinType::Right,
                 sql::JoinOperator::FullOuter(_) => BoundJoinType::Full,
                 sql::JoinOperator::CrossJoin => BoundJoinType::Cross,
+                sql::JoinOperator::LeftSemi(_) => BoundJoinType::Semi,
+                sql::JoinOperator::LeftAnti(_) => BoundJoinType::Anti,
+                sql::JoinOperator::AsOf { .. } => BoundJoinType::AsOf,
                 _ => return Err(Error::NotImplemented("Join type".to_string())),
             };
 
@@ -449,7 +1440,9 @@ fn bind_from_with_ctes(
                 sql::JoinOperator::Inner(constraint)
                 | sql::JoinOperator::LeftOuter(constraint)
                 | sql::JoinOperator::RightOuter(constraint)
-                | sql::JoinOperator::FullOuter(constraint) => {
+                | sql::JoinOperator::FullOuter(constraint)
+                | sql::JoinOperator::LeftSemi(constraint)
+                | sql::JoinOperator::LeftAnti(constraint) => {
                     match constraint {
                         sql::JoinConstraint::On(expr) => {
                             // Build context with both left and right tables
@@ -508,11 +1501,134 @@ fn bind_from_with_ctes(
                         }
                         sql::JoinConstraint::None => (None, Vec::new()),
                         sql::JoinConstraint::Natural => {
-                            return Err(Error::NotImplemented("NATURAL join".to_string()))
+                            // NATURAL JOIN - join on all columns with the same name
+                            let left_columns = get_table_ref_columns(&current);
+                            let right_columns = get_table_ref_columns(&right);
+
+                            // Find common column names (case-insensitive)
+                            let common_cols: Vec<String> = left_columns
+                                .iter()
+                                .filter(|lc| {
+                                    right_columns.iter().any(|rc| lc.eq_ignore_ascii_case(rc))
+                                })
+                                .cloned()
+                                .collect();
+
+                            if common_cols.is_empty() {
+                                // No common columns - treat as cross join
+                                (None, Vec::new())
+                            } else {
+                                let join_tables = collect_tables_from_ref(&current);
+                                let right_tables = collect_tables_from_ref(&right);
+                                let mut all_tables = join_tables;
+                                all_tables.extend(right_tables);
+                                let ctx = ExpressionBinderContext::new(&all_tables);
+
+                                // Build equality conditions for each common column
+                                let mut conditions: Vec<BoundExpression> = Vec::new();
+                                for col_name in &common_cols {
+                                    let col_ident = sql::Ident::new(col_name.clone());
+                                    let left_ref = sql::Expr::Identifier(col_ident.clone());
+                                    let right_ref = sql::Expr::Identifier(col_ident);
+                                    let eq_expr = sql::Expr::BinaryOp {
+                                        left: Box::new(left_ref),
+                                        op: sql::BinaryOperator::Eq,
+                                        right: Box::new(right_ref),
+                                    };
+                                    conditions.push(bind_expression(binder, &eq_expr, &ctx)?);
+                                }
+
+                                // Combine with AND
+                                let cond = if conditions.is_empty() {
+                                    None
+                                } else {
+                                    let mut result = conditions.remove(0);
+                                    for cond in conditions {
+                                        result = BoundExpression {
+                                            expr: super::BoundExpressionKind::BinaryOp {
+                                                left: Box::new(result),
+                                                op: super::BoundBinaryOperator::And,
+                                                right: Box::new(cond),
+                                            },
+                                            return_type: ironduck_common::LogicalType::Boolean,
+                                            alias: None,
+                                        };
+                                    }
+                                    Some(result)
+                                };
+                                (cond, common_cols)
+                            }
                         }
                     }
                 }
                 _ => (None, Vec::new()),
+            };
+
+            // Handle ASOF join's match condition separately
+            let asof_condition = match &join.join_operator {
+                sql::JoinOperator::AsOf { match_condition, .. } => {
+                    let join_tables = collect_tables_from_ref(&current);
+                    let right_tables = collect_tables_from_ref(&right);
+                    let mut all_tables = join_tables;
+                    all_tables.extend(right_tables);
+                    let ctx = ExpressionBinderContext::new(&all_tables);
+                    Some(bind_expression(binder, match_condition, &ctx)?)
+                }
+                _ => None,
+            };
+
+            // For ASOF joins, also extract the constraint condition
+            let (condition, using_columns) = if let sql::JoinOperator::AsOf { constraint, .. } = &join.join_operator {
+                match constraint {
+                    sql::JoinConstraint::On(expr) => {
+                        let join_tables = collect_tables_from_ref(&current);
+                        let right_tables = collect_tables_from_ref(&right);
+                        let mut all_tables = join_tables;
+                        all_tables.extend(right_tables);
+                        let ctx = ExpressionBinderContext::new(&all_tables);
+                        (Some(bind_expression(binder, expr, &ctx)?), Vec::new())
+                    }
+                    sql::JoinConstraint::Using(columns) => {
+                        let join_tables = collect_tables_from_ref(&current);
+                        let right_tables = collect_tables_from_ref(&right);
+                        let mut all_tables = join_tables;
+                        all_tables.extend(right_tables);
+                        let ctx = ExpressionBinderContext::new(&all_tables);
+                        let using_cols: Vec<String> = columns.iter().map(|c| c.value.clone()).collect();
+                        let mut conditions: Vec<BoundExpression> = Vec::new();
+                        for col in columns {
+                            let left_ref = sql::Expr::Identifier(col.clone());
+                            let right_ref = sql::Expr::Identifier(col.clone());
+                            let eq_expr = sql::Expr::BinaryOp {
+                                left: Box::new(left_ref),
+                                op: sql::BinaryOperator::Eq,
+                                right: Box::new(right_ref),
+                            };
+                            conditions.push(bind_expression(binder, &eq_expr, &ctx)?);
+                        }
+                        let cond = if conditions.is_empty() {
+                            None
+                        } else {
+                            let mut result = conditions.remove(0);
+                            for cond in conditions {
+                                result = BoundExpression {
+                                    expr: super::BoundExpressionKind::BinaryOp {
+                                        left: Box::new(result),
+                                        op: super::BoundBinaryOperator::And,
+                                        right: Box::new(cond),
+                                    },
+                                    return_type: ironduck_common::LogicalType::Boolean,
+                                    alias: None,
+                                };
+                            }
+                            Some(result)
+                        };
+                        (cond, using_cols)
+                    }
+                    _ => (None, Vec::new()),
+                }
+            } else {
+                (condition, using_columns)
             };
 
             current = BoundTableRef::Join {
@@ -521,6 +1637,7 @@ fn bind_from_with_ctes(
                 join_type,
                 condition,
                 using_columns,
+                asof_condition,
             };
         }
 
@@ -541,6 +1658,16 @@ fn bind_table_factor_with_ctes(
     factor: &sql::TableFactor,
     ctes: &[BoundCTE],
 ) -> Result<BoundTableRef> {
+    bind_table_factor_with_ctes_and_outer(binder, factor, ctes, &[])
+}
+
+/// Bind a table factor with optional outer tables for LATERAL support
+fn bind_table_factor_with_ctes_and_outer(
+    binder: &Binder,
+    factor: &sql::TableFactor,
+    ctes: &[BoundCTE],
+    outer_tables: &[BoundTableRef],
+) -> Result<BoundTableRef> {
     match factor {
         sql::TableFactor::Table { name, alias, args, .. } => {
             let parts: Vec<_> = name.0.iter().map(|i| i.value.clone()).collect();
@@ -549,7 +1676,10 @@ fn bind_table_factor_with_ctes(
             if let Some(table_args) = args {
                 if parts.len() == 1 {
                     let func_name = parts[0].to_uppercase();
-                    if matches!(func_name.as_str(), "RANGE" | "GENERATE_SERIES") {
+                    if matches!(func_name.as_str(),
+                        "RANGE" | "GENERATE_SERIES" | "UNNEST" | "GENERATE_SUBSCRIPTS" |
+                        "READ_CSV" | "READ_CSV_AUTO" | "READ_PARQUET"
+                    ) {
                         // TableFunctionArgs.args is already Vec<FunctionArg>
                         return bind_table_function(binder, name, &table_args.args, alias);
                     }
@@ -566,10 +1696,28 @@ fn bind_table_factor_with_ctes(
                         .map(|a| a.name.value.clone())
                         .unwrap_or_else(|| cte.name.clone());
 
+                    // For recursive CTEs, return a special reference marker
+                    if cte.is_recursive {
+                        // Use column aliases if provided, otherwise use output names from base case
+                        let column_names = if !cte.column_aliases.is_empty() {
+                            cte.column_aliases.clone()
+                        } else {
+                            cte.query.output_names()
+                        };
+                        let column_types = cte.query.output_types();
+                        return Ok(BoundTableRef::RecursiveCTERef {
+                            cte_name: cte.name.clone(),
+                            alias: alias_name,
+                            column_names,
+                            column_types,
+                        });
+                    }
+
                     // Return the CTE as a subquery reference
                     return Ok(BoundTableRef::Subquery {
                         subquery: Box::new(cte.query.clone()),
                         alias: alias_name,
+                        is_lateral: false,
                     });
                 }
             }
@@ -621,6 +1769,7 @@ fn bind_table_factor_with_ctes(
                     return Ok(BoundTableRef::Subquery {
                         subquery: Box::new(bound_select),
                         alias: alias_name,
+                        is_lateral: false,
                     });
                 } else {
                     return Err(Error::Internal("View query is not a SELECT".to_string()));
@@ -631,31 +1780,223 @@ fn bind_table_factor_with_ctes(
             Err(Error::TableNotFound(table_name.clone()))
         }
 
-        sql::TableFactor::Derived { subquery, alias, .. } => {
-            let bound_stmt = bind_query(binder, subquery)?;
-            let bound_select = match bound_stmt {
-                BoundStatement::Select(sel) => sel,
-                BoundStatement::SetOperation(_) => {
-                    return Err(Error::NotImplemented("Set operation in subquery".to_string()))
-                }
-                _ => return Err(Error::NotImplemented("Unsupported subquery type".to_string())),
-            };
+        sql::TableFactor::Derived { lateral, subquery, alias, .. } => {
             let alias_name = alias
                 .as_ref()
                 .map(|a| a.name.value.clone())
                 .unwrap_or_else(|| "subquery".to_string());
 
-            Ok(BoundTableRef::Subquery {
-                subquery: Box::new(bound_select),
-                alias: alias_name,
-            })
+            // Get column aliases if provided (e.g., AS t(id, name))
+            let column_aliases: Vec<String> = alias
+                .as_ref()
+                .map(|a| a.columns.iter().map(|c| c.name.value.clone()).collect())
+                .unwrap_or_default();
+
+            // For LATERAL subqueries, we need to bind with outer tables in context
+            let bound_stmt = if *lateral && !outer_tables.is_empty() {
+                bind_query_with_outer(binder, subquery, outer_tables)?
+            } else {
+                bind_query(binder, subquery)?
+            };
+
+            match bound_stmt {
+                BoundStatement::Select(mut sel) => {
+                    // Apply column aliases to select_list if provided
+                    if !column_aliases.is_empty() {
+                        for (i, col_alias) in column_aliases.iter().enumerate() {
+                            if i < sel.select_list.len() {
+                                sel.select_list[i].alias = Some(col_alias.clone());
+                            }
+                        }
+                    }
+                    Ok(BoundTableRef::Subquery {
+                        subquery: Box::new(sel),
+                        alias: alias_name,
+                        is_lateral: *lateral,
+                    })
+                }
+                BoundStatement::SetOperation(set_op) => {
+                    // Get column info from the left operand
+                    let mut column_names = set_op.left.output_names();
+                    let column_types = set_op.left.output_types();
+
+                    // Apply column aliases if provided
+                    if !column_aliases.is_empty() {
+                        for (i, col_alias) in column_aliases.iter().enumerate() {
+                            if i < column_names.len() {
+                                column_names[i] = col_alias.clone();
+                            }
+                        }
+                    }
+
+                    Ok(BoundTableRef::SetOperationSubquery {
+                        set_operation: Box::new(set_op),
+                        alias: alias_name,
+                        column_names,
+                        column_types,
+                    })
+                }
+                _ => Err(Error::NotImplemented("Unsupported subquery type".to_string())),
+            }
         }
 
         sql::TableFactor::Function { name, args, alias, .. } => {
             bind_table_function(binder, name, args, alias)
         }
 
+        sql::TableFactor::UNNEST { array_exprs, alias, with_offset, with_offset_alias, .. } => {
+            // Handle UNNEST([1,2,3]) table factor
+            use super::bound_expression::BoundExpressionKind;
+
+            let ctx = ExpressionBinderContext::new(&[]);
+
+            if array_exprs.is_empty() {
+                return Err(Error::InvalidArguments("UNNEST requires at least one array argument".to_string()));
+            }
+
+            let array_expr = bind_expression(binder, &array_exprs[0], &ctx)?;
+
+            // Extract column alias from table alias if provided
+            let (table_alias, column_alias) = if let Some(a) = alias {
+                let col_alias = a.columns.first().map(|c| c.name.value.clone());
+                (Some(a.name.value.clone()), col_alias)
+            } else {
+                (None, None)
+            };
+
+            Ok(BoundTableRef::TableFunction {
+                function: TableFunctionType::Unnest { array_expr },
+                alias: table_alias,
+                column_alias,
+            })
+        }
+
+        sql::TableFactor::Pivot {
+            table,
+            aggregate_functions,
+            value_column,
+            value_source,
+            alias,
+            ..
+        } => {
+            // Recursively bind the source table
+            let source = bind_table_factor_with_ctes_and_outer(binder, table, ctes, outer_tables)?;
+
+            // Get the aggregate function and its argument
+            if aggregate_functions.is_empty() {
+                return Err(Error::InvalidArguments("PIVOT requires at least one aggregate function".to_string()));
+            }
+
+            let agg_expr = &aggregate_functions[0].expr;
+            let (agg_name, agg_arg) = match agg_expr {
+                sql::Expr::Function(func) => {
+                    let name = func.name.to_string().to_uppercase();
+                    let arg = match &func.args {
+                        sql::FunctionArguments::None => {
+                            // COUNT(*) case
+                            BoundExpression::new(
+                                super::bound_expression::BoundExpressionKind::Constant(ironduck_common::Value::BigInt(1)),
+                                ironduck_common::LogicalType::BigInt,
+                            )
+                        }
+                        sql::FunctionArguments::Subquery(_) => {
+                            return Err(Error::NotImplemented("Subquery in PIVOT aggregate".to_string()));
+                        }
+                        sql::FunctionArguments::List(list) => {
+                            if list.args.is_empty() {
+                                BoundExpression::new(
+                                    super::bound_expression::BoundExpressionKind::Constant(ironduck_common::Value::BigInt(1)),
+                                    ironduck_common::LogicalType::BigInt,
+                                )
+                            } else {
+                                let arg_expr = match &list.args[0] {
+                                    sql::FunctionArg::Unnamed(sql::FunctionArgExpr::Expr(e)) => e,
+                                    sql::FunctionArg::Named { arg: sql::FunctionArgExpr::Expr(e), .. } => e,
+                                    sql::FunctionArg::Unnamed(sql::FunctionArgExpr::Wildcard) |
+                                    sql::FunctionArg::Named { arg: sql::FunctionArgExpr::Wildcard, .. } => {
+                                        // COUNT(*) case
+                                        return Ok(BoundTableRef::Pivot {
+                                            source: Box::new(source),
+                                            aggregate_function: name,
+                                            aggregate_arg: BoundExpression::new(
+                                                super::bound_expression::BoundExpressionKind::Constant(ironduck_common::Value::BigInt(1)),
+                                                ironduck_common::LogicalType::BigInt,
+                                            ),
+                                            value_column: value_column.iter().map(|i| i.value.clone()).collect::<Vec<_>>().join("."),
+                                            pivot_values: extract_pivot_values(value_source)?,
+                                            alias: alias.as_ref().map(|a| a.name.value.clone()),
+                                        });
+                                    }
+                                    _ => return Err(Error::NotImplemented("Unsupported PIVOT aggregate argument".to_string())),
+                                };
+                                // Create a simple context for binding
+                                let refs = vec![source.clone()];
+                                let ctx = ExpressionBinderContext::new(&refs);
+                                bind_expression(binder, arg_expr, &ctx)?
+                            }
+                        }
+                    };
+                    (name, arg)
+                }
+                _ => return Err(Error::InvalidArguments("PIVOT requires aggregate function".to_string())),
+            };
+
+            let pivot_column = value_column.iter().map(|i| i.value.clone()).collect::<Vec<_>>().join(".");
+            let pivot_vals = extract_pivot_values(value_source)?;
+
+            Ok(BoundTableRef::Pivot {
+                source: Box::new(source),
+                aggregate_function: agg_name,
+                aggregate_arg: agg_arg,
+                value_column: pivot_column,
+                pivot_values: pivot_vals,
+                alias: alias.as_ref().map(|a| a.name.value.clone()),
+            })
+        }
+
+        sql::TableFactor::Unpivot {
+            table,
+            value,
+            name,
+            columns,
+            alias,
+        } => {
+            // Recursively bind the source table
+            let source = bind_table_factor_with_ctes_and_outer(binder, table, ctes, outer_tables)?;
+
+            Ok(BoundTableRef::Unpivot {
+                source: Box::new(source),
+                value_column: value.value.clone(),
+                name_column: name.value.clone(),
+                unpivot_columns: columns.iter().map(|c| c.value.clone()).collect(),
+                alias: alias.as_ref().map(|a| a.name.value.clone()),
+            })
+        }
+
         _ => Err(Error::NotImplemented(format!("Table factor: {:?}", factor))),
+    }
+}
+
+/// Extract pivot values from PivotValueSource
+fn extract_pivot_values(value_source: &sql::PivotValueSource) -> Result<Vec<String>> {
+    match value_source {
+        sql::PivotValueSource::List(exprs) => {
+            exprs.iter().map(|expr_with_alias| {
+                match &expr_with_alias.expr {
+                    sql::Expr::Value(sql::Value::SingleQuotedString(s)) => Ok(s.clone()),
+                    sql::Expr::Value(sql::Value::DoubleQuotedString(s)) => Ok(s.clone()),
+                    sql::Expr::Value(sql::Value::Number(n, _)) => Ok(n.clone()),
+                    sql::Expr::Identifier(ident) => Ok(ident.value.clone()),
+                    _ => Err(Error::NotImplemented(format!("Unsupported PIVOT value: {:?}", expr_with_alias.expr))),
+                }
+            }).collect()
+        }
+        sql::PivotValueSource::Any(_) => {
+            Err(Error::NotImplemented("PIVOT with ANY not supported".to_string()))
+        }
+        sql::PivotValueSource::Subquery(_) => {
+            Err(Error::NotImplemented("PIVOT with subquery not supported".to_string()))
+        }
     }
 }
 
@@ -747,7 +2088,331 @@ fn bind_table_function(
                 column_alias,
             })
         }
+        "UNNEST" => {
+            // unnest(array) - expands an array into rows
+            let ctx = ExpressionBinderContext::new(&[]);
+
+            let bound_args: Vec<BoundExpression> = args
+                .iter()
+                .filter_map(|arg| {
+                    let expr_arg = match arg {
+                        sql::FunctionArg::Unnamed(expr) => Some(expr),
+                        sql::FunctionArg::Named { arg, .. } => Some(arg),
+                        _ => None,
+                    };
+                    expr_arg.and_then(|expr| match expr {
+                        sql::FunctionArgExpr::Expr(e) => bind_expression(binder, e, &ctx).ok(),
+                        _ => None,
+                    })
+                })
+                .collect();
+
+            if bound_args.is_empty() {
+                return Err(Error::InvalidArguments("unnest() requires an array argument".to_string()));
+            }
+
+            let array_expr = bound_args.into_iter().next().unwrap();
+
+            // Extract column alias from table alias if provided
+            let (table_alias, column_alias) = if let Some(a) = alias {
+                let col_alias = a.columns.first().map(|c| c.name.value.clone());
+                (Some(a.name.value.clone()), col_alias)
+            } else {
+                (None, None)
+            };
+
+            Ok(BoundTableRef::TableFunction {
+                function: TableFunctionType::Unnest { array_expr },
+                alias: table_alias,
+                column_alias,
+            })
+        }
+        "GENERATE_SUBSCRIPTS" => {
+            // generate_subscripts(array, dim) - generates subscripts for an array dimension
+            let ctx = ExpressionBinderContext::new(&[]);
+
+            let bound_args: Vec<BoundExpression> = args
+                .iter()
+                .filter_map(|arg| {
+                    let expr_arg = match arg {
+                        sql::FunctionArg::Unnamed(expr) => Some(expr),
+                        sql::FunctionArg::Named { arg, .. } => Some(arg),
+                        _ => None,
+                    };
+                    expr_arg.and_then(|expr| match expr {
+                        sql::FunctionArgExpr::Expr(e) => bind_expression(binder, e, &ctx).ok(),
+                        _ => None,
+                    })
+                })
+                .collect();
+
+            if bound_args.is_empty() {
+                return Err(Error::InvalidArguments("generate_subscripts() requires an array argument".to_string()));
+            }
+
+            let array_expr = bound_args.into_iter().next().unwrap();
+            let dim = 1; // Default dimension
+
+            // Extract column alias from table alias if provided
+            let (table_alias, column_alias) = if let Some(a) = alias {
+                let col_alias = a.columns.first().map(|c| c.name.value.clone());
+                (Some(a.name.value.clone()), col_alias)
+            } else {
+                (None, None)
+            };
+
+            Ok(BoundTableRef::TableFunction {
+                function: TableFunctionType::GenerateSubscripts { array_expr, dim },
+                alias: table_alias,
+                column_alias,
+            })
+        }
+        "READ_CSV" | "READ_CSV_AUTO" => {
+            // read_csv(path) or read_csv(path, header=true, delimiter=',', ...)
+            // Extract the file path from the first argument
+            let path = args.first()
+                .and_then(|arg| match arg {
+                    sql::FunctionArg::Unnamed(sql::FunctionArgExpr::Expr(sql::Expr::Value(v))) => {
+                        match v {
+                            sql::Value::SingleQuotedString(s) |
+                            sql::Value::DoubleQuotedString(s) => Some(s.clone()),
+                            _ => None,
+                        }
+                    }
+                    _ => None,
+                })
+                .ok_or_else(|| Error::InvalidArguments("read_csv() requires a file path as first argument".to_string()))?;
+
+            // Parse optional arguments (header, delimiter, etc.)
+            let mut has_header = true;  // Default: has header
+            let mut delimiter = ',';    // Default: comma
+
+            for arg in args.iter().skip(1) {
+                if let sql::FunctionArg::Named { name, arg, .. } = arg {
+                    let name_str = name.value.to_lowercase();
+                    match name_str.as_str() {
+                        "header" | "has_header" => {
+                            if let sql::FunctionArgExpr::Expr(sql::Expr::Value(v)) = arg {
+                                has_header = match v {
+                                    sql::Value::Boolean(b) => *b,
+                                    sql::Value::SingleQuotedString(s) => s.to_lowercase() == "true",
+                                    _ => true,
+                                };
+                            }
+                        }
+                        "delimiter" | "delim" | "sep" => {
+                            if let sql::FunctionArgExpr::Expr(sql::Expr::Value(v)) = arg {
+                                if let sql::Value::SingleQuotedString(s) = v {
+                                    if let Some(c) = s.chars().next() {
+                                        delimiter = c;
+                                    }
+                                }
+                            }
+                        }
+                        _ => {} // Ignore unknown arguments
+                    }
+                }
+            }
+
+            // Read CSV header to get column names
+            let (column_names, column_types) = read_csv_schema(&path, has_header, delimiter)?;
+
+            let table_alias = alias.as_ref().map(|a| a.name.value.clone());
+
+            Ok(BoundTableRef::FileTableFunction {
+                path,
+                file_type: FileTableType::Csv { has_header, delimiter },
+                alias: table_alias,
+                column_names,
+                column_types,
+            })
+        }
+        "READ_PARQUET" => {
+            // read_parquet(path)
+            let path = args.first()
+                .and_then(|arg| match arg {
+                    sql::FunctionArg::Unnamed(sql::FunctionArgExpr::Expr(sql::Expr::Value(v))) => {
+                        match v {
+                            sql::Value::SingleQuotedString(s) |
+                            sql::Value::DoubleQuotedString(s) => Some(s.clone()),
+                            _ => None,
+                        }
+                    }
+                    _ => None,
+                })
+                .ok_or_else(|| Error::InvalidArguments("read_parquet() requires a file path as first argument".to_string()))?;
+
+            // Read Parquet schema to get column names
+            let (column_names, column_types) = read_parquet_schema(&path)?;
+
+            let table_alias = alias.as_ref().map(|a| a.name.value.clone());
+
+            Ok(BoundTableRef::FileTableFunction {
+                path,
+                file_type: FileTableType::Parquet,
+                alias: table_alias,
+                column_names,
+                column_types,
+            })
+        }
+        "READ_JSON" | "READ_JSON_AUTO" | "READ_NDJSON" | "READ_NDJSON_AUTO" => {
+            // read_json(path)
+            let path = args.first()
+                .and_then(|arg| match arg {
+                    sql::FunctionArg::Unnamed(sql::FunctionArgExpr::Expr(sql::Expr::Value(v))) => {
+                        match v {
+                            sql::Value::SingleQuotedString(s) |
+                            sql::Value::DoubleQuotedString(s) => Some(s.clone()),
+                            _ => None,
+                        }
+                    }
+                    _ => None,
+                })
+                .ok_or_else(|| Error::InvalidArguments("read_json() requires a file path as first argument".to_string()))?;
+
+            // Read JSON schema to get column names
+            let (column_names, column_types) = read_json_schema(&path)?;
+
+            let table_alias = alias.as_ref().map(|a| a.name.value.clone());
+
+            Ok(BoundTableRef::FileTableFunction {
+                path,
+                file_type: FileTableType::Json,
+                alias: table_alias,
+                column_names,
+                column_types,
+            })
+        }
         _ => Err(Error::NotImplemented(format!("Table function: {}", func_name))),
+    }
+}
+
+/// Read JSON file schema (column names and types)
+fn read_json_schema(path: &str) -> Result<(Vec<String>, Vec<LogicalType>)> {
+    use std::fs::File;
+    use std::io::{BufRead, BufReader};
+
+    let file = File::open(path)
+        .map_err(|e| Error::Parse(format!("Failed to open JSON file '{}': {}", path, e)))?;
+
+    let reader = BufReader::new(file);
+
+    // Read the first line to infer schema
+    for line in reader.lines() {
+        let line = line.map_err(|e| Error::Parse(format!("Failed to read JSON file: {}", e)))?;
+        let line = line.trim();
+
+        if line.is_empty() {
+            continue;
+        }
+
+        // Parse as JSON object
+        let json: serde_json::Value = serde_json::from_str(line)
+            .map_err(|e| Error::Parse(format!("Failed to parse JSON: {}", e)))?;
+
+        if let serde_json::Value::Object(obj) = json {
+            let column_names: Vec<String> = obj.keys().cloned().collect();
+            let column_types: Vec<LogicalType> = obj.values()
+                .map(|v| json_value_to_logical_type(v))
+                .collect();
+            return Ok((column_names, column_types));
+        } else {
+            return Err(Error::Parse("JSON file must contain objects".to_string()));
+        }
+    }
+
+    Err(Error::Parse("Empty JSON file".to_string()))
+}
+
+/// Infer LogicalType from a JSON value
+fn json_value_to_logical_type(v: &serde_json::Value) -> LogicalType {
+    match v {
+        serde_json::Value::Null => LogicalType::Varchar,
+        serde_json::Value::Bool(_) => LogicalType::Boolean,
+        serde_json::Value::Number(n) => {
+            if n.is_i64() {
+                LogicalType::BigInt
+            } else {
+                LogicalType::Double
+            }
+        }
+        serde_json::Value::String(_) => LogicalType::Varchar,
+        serde_json::Value::Array(_) => LogicalType::List(Box::new(LogicalType::Varchar)),
+        serde_json::Value::Object(_) => LogicalType::Varchar, // Serialize nested objects as JSON strings
+    }
+}
+
+/// Read CSV file schema (column names and types)
+fn read_csv_schema(path: &str, has_header: bool, delimiter: char) -> Result<(Vec<String>, Vec<LogicalType>)> {
+    use std::fs::File;
+    use std::io::{BufRead, BufReader};
+
+    let file = File::open(path)
+        .map_err(|e| Error::Parse(format!("Failed to open CSV file '{}': {}", path, e)))?;
+
+    let mut reader = BufReader::new(file);
+    let mut first_line = String::new();
+    reader.read_line(&mut first_line)
+        .map_err(|e| Error::Parse(format!("Failed to read CSV header: {}", e)))?;
+
+    // Parse the first line as column names (if has_header) or generate default names
+    let first_line = first_line.trim_end_matches(|c| c == '\n' || c == '\r');
+    let parts: Vec<&str> = first_line.split(delimiter).collect();
+
+    if has_header {
+        let column_names: Vec<String> = parts.iter()
+            .map(|s| s.trim_matches('"').trim().to_string())
+            .collect();
+        // Default all columns to VARCHAR since we don't know types yet
+        let column_types: Vec<LogicalType> = column_names.iter()
+            .map(|_| LogicalType::Varchar)
+            .collect();
+        Ok((column_names, column_types))
+    } else {
+        // Generate column names like column0, column1, etc.
+        let column_names: Vec<String> = (0..parts.len())
+            .map(|i| format!("column{}", i))
+            .collect();
+        let column_types: Vec<LogicalType> = column_names.iter()
+            .map(|_| LogicalType::Varchar)
+            .collect();
+        Ok((column_names, column_types))
+    }
+}
+
+/// Read Parquet file schema (column names and types)
+fn read_parquet_schema(path: &str) -> Result<(Vec<String>, Vec<LogicalType>)> {
+    use std::fs::File;
+
+    let file = File::open(path)
+        .map_err(|e| Error::Parse(format!("Failed to open Parquet file '{}': {}", path, e)))?;
+
+    let reader = parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(file)
+        .map_err(|e| Error::Parse(format!("Failed to read Parquet schema: {}", e)))?;
+
+    let schema = reader.schema();
+    let column_names: Vec<String> = schema.fields().iter()
+        .map(|f| f.name().clone())
+        .collect();
+    let column_types: Vec<LogicalType> = schema.fields().iter()
+        .map(|f| arrow_type_to_logical_type(f.data_type()))
+        .collect();
+
+    Ok((column_names, column_types))
+}
+
+/// Convert Arrow DataType to LogicalType
+fn arrow_type_to_logical_type(dt: &arrow::datatypes::DataType) -> LogicalType {
+    use arrow::datatypes::DataType;
+    match dt {
+        DataType::Boolean => LogicalType::Boolean,
+        DataType::Int8 | DataType::Int16 | DataType::Int32 => LogicalType::Integer,
+        DataType::Int64 | DataType::UInt8 | DataType::UInt16 | DataType::UInt32 | DataType::UInt64 => LogicalType::BigInt,
+        DataType::Float32 | DataType::Float64 => LogicalType::Double,
+        DataType::Utf8 | DataType::LargeUtf8 => LogicalType::Varchar,
+        DataType::Date32 | DataType::Date64 => LogicalType::Date,
+        DataType::Timestamp(_, _) => LogicalType::Timestamp,
+        _ => LogicalType::Varchar, // Default to VARCHAR for unknown types
     }
 }
 
@@ -775,6 +2440,9 @@ fn bind_create_table(binder: &Binder, create: &sql::CreateTable) -> Result<Bound
                 data_type: expr.return_type.clone(),
                 nullable: true,
                 default: None,
+                is_primary_key: false,
+                is_unique: false,
+                check: None,
             }
         }).collect();
 
@@ -795,11 +2463,52 @@ fn bind_create_table(binder: &Binder, create: &sql::CreateTable) -> Result<Bound
             matches!(opt.option, sql::ColumnOption::NotNull)
         });
 
+        // Check for PRIMARY KEY and UNIQUE constraints
+        let mut is_primary_key = false;
+        let mut is_unique = false;
+        let mut default_expr = None;
+        let mut check_expr = None;
+
+        for opt in &col.options {
+            match &opt.option {
+                sql::ColumnOption::Unique { is_primary, .. } => {
+                    if *is_primary {
+                        is_primary_key = true;
+                    } else {
+                        is_unique = true;
+                    }
+                }
+                sql::ColumnOption::Default(expr) => {
+                    // Bind the default expression (in empty context since it can't reference other columns)
+                    let ctx = ExpressionBinderContext::empty();
+                    default_expr = Some(bind_expression(binder, expr, &ctx)?);
+                }
+                sql::ColumnOption::Check(expr) => {
+                    // Bind the CHECK expression with column context
+                    // Create a context with just this column for self-references
+                    let col_ref = BoundTableRef::BaseTable {
+                        schema: "".to_string(),
+                        name: "".to_string(),
+                        alias: None,
+                        column_names: vec![col.name.value.clone()],
+                        column_types: vec![data_type.clone()],
+                    };
+                    let refs = vec![col_ref];
+                    let ctx = ExpressionBinderContext::new(&refs);
+                    check_expr = Some(bind_expression(binder, expr, &ctx)?);
+                }
+                _ => {}
+            }
+        }
+
         columns.push(BoundColumnDef {
             name: col.name.value.clone(),
             data_type,
             nullable,
-            default: None, // TODO: Handle defaults
+            default: default_expr,
+            is_primary_key,
+            is_unique,
+            check: check_expr,
         });
     }
 
@@ -830,7 +2539,7 @@ fn bind_create_view(
     let bound_stmt = bind_query(binder, query)?;
     let column_names = match &bound_stmt {
         BoundStatement::Select(sel) => sel.select_list.iter().map(|e| e.name()).collect(),
-        BoundStatement::SetOperation(op) => op.left.select_list.iter().map(|e| e.name()).collect(),
+        BoundStatement::SetOperation(op) => op.left.output_names(),
         _ => return Err(Error::NotImplemented("View query must be SELECT".to_string())),
     };
 
@@ -1070,7 +2779,7 @@ fn expand_qualified_wildcard(
             *col_offset += column_names.len();
             matches
         }
-        BoundTableRef::Subquery { subquery, alias } => {
+        BoundTableRef::Subquery { subquery, alias, .. } => {
             let matches = alias.eq_ignore_ascii_case(target_name);
 
             if matches {
@@ -1108,6 +2817,67 @@ fn expand_qualified_wildcard(
                 ));
             }
             *col_offset += 1;
+            matches
+        }
+        BoundTableRef::RecursiveCTERef { cte_name, alias, column_names, column_types } => {
+            let matches = alias.eq_ignore_ascii_case(target_name)
+                || cte_name.eq_ignore_ascii_case(target_name);
+
+            if matches {
+                for (idx, (col_name, typ)) in column_names.iter().zip(column_types.iter()).enumerate() {
+                    select_list.push(BoundExpression::new(
+                        super::BoundExpressionKind::ColumnRef {
+                            table_idx,
+                            column_idx: *col_offset + idx,
+                            name: col_name.clone(),
+                        },
+                        typ.clone(),
+                    ));
+                }
+            }
+            *col_offset += column_names.len();
+            matches
+        }
+        BoundTableRef::SetOperationSubquery { alias, column_names, column_types, .. } => {
+            let matches = alias.eq_ignore_ascii_case(target_name);
+
+            if matches {
+                for (idx, (col_name, typ)) in column_names.iter().zip(column_types.iter()).enumerate() {
+                    select_list.push(BoundExpression::new(
+                        super::BoundExpressionKind::ColumnRef {
+                            table_idx,
+                            column_idx: *col_offset + idx,
+                            name: col_name.clone(),
+                        },
+                        typ.clone(),
+                    ));
+                }
+            }
+            *col_offset += column_names.len();
+            matches
+        }
+        BoundTableRef::Pivot { source, .. } => {
+            expand_qualified_wildcard(source, target_name, table_idx, col_offset, select_list)
+        }
+        BoundTableRef::Unpivot { source, .. } => {
+            expand_qualified_wildcard(source, target_name, table_idx, col_offset, select_list)
+        }
+        BoundTableRef::FileTableFunction { path, alias, column_names, column_types, .. } => {
+            let table_name = alias.as_ref().unwrap_or(path);
+            let matches = table_name.eq_ignore_ascii_case(target_name);
+            if matches {
+                for (idx, (col_name, typ)) in column_names.iter().zip(column_types.iter()).enumerate() {
+                    select_list.push(BoundExpression::new(
+                        super::BoundExpressionKind::ColumnRef {
+                            table_idx,
+                            column_idx: *col_offset + idx,
+                            name: col_name.clone(),
+                        },
+                        typ.clone(),
+                    ));
+                }
+            }
+            *col_offset += column_names.len();
             matches
         }
         BoundTableRef::Empty => false,
@@ -1159,7 +2929,7 @@ fn expand_qualified_wildcard_with_skip(
             *col_offset += local_col_idx;
             matches
         }
-        BoundTableRef::Subquery { subquery, alias } => {
+        BoundTableRef::Subquery { subquery, alias, .. } => {
             let matches = alias.eq_ignore_ascii_case(target_name);
 
             let mut local_col_idx = 0;
@@ -1215,6 +2985,263 @@ fn expand_qualified_wildcard_with_skip(
             }
             matches
         }
+        BoundTableRef::RecursiveCTERef { cte_name, alias, column_names, column_types } => {
+            let matches = alias.eq_ignore_ascii_case(target_name)
+                || cte_name.eq_ignore_ascii_case(target_name);
+
+            for (idx, (col_name, typ)) in column_names.iter().zip(column_types.iter()).enumerate() {
+                let should_skip = skip_columns.iter().any(|sc| sc.eq_ignore_ascii_case(col_name));
+                if matches && !should_skip {
+                    select_list.push(BoundExpression::new(
+                        super::BoundExpressionKind::ColumnRef {
+                            table_idx,
+                            column_idx: *col_offset + idx,
+                            name: col_name.clone(),
+                        },
+                        typ.clone(),
+                    ));
+                }
+            }
+            *col_offset += column_names.len();
+            matches
+        }
+        BoundTableRef::SetOperationSubquery { alias, column_names, column_types, .. } => {
+            let matches = alias.eq_ignore_ascii_case(target_name);
+
+            for (idx, (col_name, typ)) in column_names.iter().zip(column_types.iter()).enumerate() {
+                let should_skip = skip_columns.iter().any(|sc| sc.eq_ignore_ascii_case(col_name));
+                if matches && !should_skip {
+                    select_list.push(BoundExpression::new(
+                        super::BoundExpressionKind::ColumnRef {
+                            table_idx,
+                            column_idx: *col_offset + idx,
+                            name: col_name.clone(),
+                        },
+                        typ.clone(),
+                    ));
+                }
+            }
+            *col_offset += column_names.len();
+            matches
+        }
+        BoundTableRef::Pivot { source, .. } => {
+            expand_qualified_wildcard_with_skip(source, target_name, table_idx, col_offset, select_list, skip_columns)
+        }
+        BoundTableRef::Unpivot { source, .. } => {
+            expand_qualified_wildcard_with_skip(source, target_name, table_idx, col_offset, select_list, skip_columns)
+        }
+        BoundTableRef::FileTableFunction { path, alias, column_names, column_types, .. } => {
+            let table_name = alias.as_ref().unwrap_or(path);
+            let matches = table_name.eq_ignore_ascii_case(target_name);
+            let mut local_col_idx = 0;
+            for (col_name, typ) in column_names.iter().zip(column_types.iter()) {
+                let should_skip = skip_columns.iter().any(|sc| sc.eq_ignore_ascii_case(col_name));
+                if matches && !should_skip {
+                    select_list.push(BoundExpression::new(
+                        super::BoundExpressionKind::ColumnRef {
+                            table_idx,
+                            column_idx: *col_offset + local_col_idx,
+                            name: col_name.clone(),
+                        },
+                        typ.clone(),
+                    ));
+                }
+                local_col_idx += 1;
+            }
+            *col_offset += column_names.len();
+            matches
+        }
+        BoundTableRef::Empty => false,
+    }
+}
+
+/// Expand qualified wildcard with EXCLUDE and REPLACE support
+fn expand_qualified_wildcard_with_options(
+    table_ref: &BoundTableRef,
+    target_name: &str,
+    table_idx: usize,
+    col_offset: &mut usize,
+    select_list: &mut Vec<BoundExpression>,
+    exclude_columns: &[String],
+    replace_map: &std::collections::HashMap<String, BoundExpression>,
+) -> bool {
+    match table_ref {
+        BoundTableRef::BaseTable {
+            name,
+            alias,
+            column_names,
+            column_types,
+            ..
+        } => {
+            let matches = alias.as_ref().map(|a| a.eq_ignore_ascii_case(target_name)).unwrap_or(false)
+                || name.eq_ignore_ascii_case(target_name);
+
+            if matches {
+                for (idx, (col_name, typ)) in column_names.iter().zip(column_types.iter()).enumerate() {
+                    let should_exclude = exclude_columns.iter().any(|ec| ec.eq_ignore_ascii_case(col_name));
+                    if !should_exclude {
+                        if let Some(replacement) = replace_map.get(&col_name.to_uppercase()) {
+                            let mut replaced = replacement.clone();
+                            replaced.alias = Some(col_name.clone());
+                            select_list.push(replaced);
+                        } else {
+                            select_list.push(BoundExpression::new(
+                                super::BoundExpressionKind::ColumnRef {
+                                    table_idx,
+                                    column_idx: *col_offset + idx,
+                                    name: col_name.clone(),
+                                },
+                                typ.clone(),
+                            ));
+                        }
+                    }
+                }
+            }
+            *col_offset += column_names.len();
+            matches
+        }
+        BoundTableRef::Subquery { subquery, alias, .. } => {
+            let matches = alias.eq_ignore_ascii_case(target_name);
+
+            if matches {
+                for (idx, expr) in subquery.select_list.iter().enumerate() {
+                    let col_name = expr.name();
+                    let should_exclude = exclude_columns.iter().any(|ec| ec.eq_ignore_ascii_case(&col_name));
+                    if !should_exclude {
+                        if let Some(replacement) = replace_map.get(&col_name.to_uppercase()) {
+                            let mut replaced = replacement.clone();
+                            replaced.alias = Some(col_name);
+                            select_list.push(replaced);
+                        } else {
+                            select_list.push(BoundExpression::new(
+                                super::BoundExpressionKind::ColumnRef {
+                                    table_idx,
+                                    column_idx: *col_offset + idx,
+                                    name: col_name,
+                                },
+                                expr.return_type.clone(),
+                            ));
+                        }
+                    }
+                }
+            }
+            *col_offset += subquery.select_list.len();
+            matches
+        }
+        BoundTableRef::Join { left, right, .. } => {
+            let left_matched = expand_qualified_wildcard_with_options(left, target_name, table_idx, col_offset, select_list, exclude_columns, replace_map);
+            let right_matched = expand_qualified_wildcard_with_options(right, target_name, table_idx, col_offset, select_list, exclude_columns, replace_map);
+            left_matched || right_matched
+        }
+        BoundTableRef::TableFunction { alias, column_alias, .. } => {
+            let matches = alias.as_ref().map(|a| a.eq_ignore_ascii_case(target_name)).unwrap_or(false);
+            let col_name = column_alias.clone().unwrap_or_else(|| "range".to_string());
+            let should_exclude = exclude_columns.iter().any(|ec| ec.eq_ignore_ascii_case(&col_name));
+            if matches && !should_exclude {
+                if let Some(replacement) = replace_map.get(&col_name.to_uppercase()) {
+                    let mut replaced = replacement.clone();
+                    replaced.alias = Some(col_name);
+                    select_list.push(replaced);
+                } else {
+                    select_list.push(BoundExpression::new(
+                        super::BoundExpressionKind::ColumnRef {
+                            table_idx,
+                            column_idx: *col_offset,
+                            name: col_name,
+                        },
+                        ironduck_common::LogicalType::BigInt,
+                    ));
+                }
+            }
+            *col_offset += 1;
+            matches
+        }
+        BoundTableRef::RecursiveCTERef { cte_name, alias, column_names, column_types } => {
+            let matches = alias.eq_ignore_ascii_case(target_name)
+                || cte_name.eq_ignore_ascii_case(target_name);
+
+            for (idx, (col_name, typ)) in column_names.iter().zip(column_types.iter()).enumerate() {
+                let should_exclude = exclude_columns.iter().any(|ec| ec.eq_ignore_ascii_case(col_name));
+                if matches && !should_exclude {
+                    if let Some(replacement) = replace_map.get(&col_name.to_uppercase()) {
+                        let mut replaced = replacement.clone();
+                        replaced.alias = Some(col_name.clone());
+                        select_list.push(replaced);
+                    } else {
+                        select_list.push(BoundExpression::new(
+                            super::BoundExpressionKind::ColumnRef {
+                                table_idx,
+                                column_idx: *col_offset + idx,
+                                name: col_name.clone(),
+                            },
+                            typ.clone(),
+                        ));
+                    }
+                }
+            }
+            *col_offset += column_names.len();
+            matches
+        }
+        BoundTableRef::SetOperationSubquery { alias, column_names, column_types, .. } => {
+            let matches = alias.eq_ignore_ascii_case(target_name);
+
+            if matches {
+                for (idx, (col_name, typ)) in column_names.iter().zip(column_types.iter()).enumerate() {
+                    let should_exclude = exclude_columns.iter().any(|ec| ec.eq_ignore_ascii_case(col_name));
+                    if !should_exclude {
+                        if let Some(replacement) = replace_map.get(&col_name.to_uppercase()) {
+                            let mut replaced = replacement.clone();
+                            replaced.alias = Some(col_name.clone());
+                            select_list.push(replaced);
+                        } else {
+                            select_list.push(BoundExpression::new(
+                                super::BoundExpressionKind::ColumnRef {
+                                    table_idx,
+                                    column_idx: *col_offset + idx,
+                                    name: col_name.clone(),
+                                },
+                                typ.clone(),
+                            ));
+                        }
+                    }
+                }
+            }
+            *col_offset += column_names.len();
+            matches
+        }
+        BoundTableRef::Pivot { source, .. } => {
+            expand_qualified_wildcard_with_options(source, target_name, table_idx, col_offset, select_list, exclude_columns, replace_map)
+        }
+        BoundTableRef::Unpivot { source, .. } => {
+            expand_qualified_wildcard_with_options(source, target_name, table_idx, col_offset, select_list, exclude_columns, replace_map)
+        }
+        BoundTableRef::FileTableFunction { path, alias, column_names, column_types, .. } => {
+            let table_name = alias.as_ref().unwrap_or(path);
+            let matches = table_name.eq_ignore_ascii_case(target_name);
+            if matches {
+                for (idx, (col_name, typ)) in column_names.iter().zip(column_types.iter()).enumerate() {
+                    let should_exclude = exclude_columns.iter().any(|ec| ec.eq_ignore_ascii_case(col_name));
+                    if !should_exclude {
+                        if let Some(replacement) = replace_map.get(&col_name.to_uppercase()) {
+                            let mut replaced = replacement.clone();
+                            replaced.alias = Some(col_name.clone());
+                            select_list.push(replaced);
+                        } else {
+                            select_list.push(BoundExpression::new(
+                                super::BoundExpressionKind::ColumnRef {
+                                    table_idx,
+                                    column_idx: *col_offset + idx,
+                                    name: col_name.clone(),
+                                },
+                                typ.clone(),
+                            ));
+                        }
+                    }
+                }
+            }
+            *col_offset += column_names.len();
+            matches
+        }
         BoundTableRef::Empty => false,
     }
 }
@@ -1229,11 +3256,27 @@ fn matches_table_name(table_ref: &BoundTableRef, name: &str) -> bool {
         BoundTableRef::Subquery { alias, .. } => {
             alias.eq_ignore_ascii_case(name)
         }
+        BoundTableRef::SetOperationSubquery { alias, .. } => {
+            alias.eq_ignore_ascii_case(name)
+        }
         BoundTableRef::Join { left, right, .. } => {
             matches_table_name(left, name) || matches_table_name(right, name)
         }
         BoundTableRef::TableFunction { alias, .. } => {
             alias.as_ref().map(|a| a.eq_ignore_ascii_case(name)).unwrap_or(false)
+        }
+        BoundTableRef::RecursiveCTERef { cte_name, alias, .. } => {
+            alias.eq_ignore_ascii_case(name) || cte_name.eq_ignore_ascii_case(name)
+        }
+        BoundTableRef::Pivot { alias, .. } => {
+            alias.as_ref().map(|a| a.eq_ignore_ascii_case(name)).unwrap_or(false)
+        }
+        BoundTableRef::Unpivot { alias, .. } => {
+            alias.as_ref().map(|a| a.eq_ignore_ascii_case(name)).unwrap_or(false)
+        }
+        BoundTableRef::FileTableFunction { path, alias, .. } => {
+            let table_name = alias.as_ref().unwrap_or(path);
+            table_name.eq_ignore_ascii_case(name)
         }
         BoundTableRef::Empty => false,
     }
@@ -1266,6 +3309,294 @@ fn expand_wildcard_rec(
     select_list: &mut Vec<BoundExpression>,
 ) {
     expand_wildcard_rec_with_skip(table_ref, table_idx, col_offset, select_list, &[]);
+}
+
+/// Expand wildcard with EXCLUDE and REPLACE support
+fn expand_wildcard_with_options(
+    table_ref: &BoundTableRef,
+    table_idx: usize,
+    col_offset: &mut usize,
+    select_list: &mut Vec<BoundExpression>,
+    exclude_columns: &[String],
+    replace_map: &std::collections::HashMap<String, BoundExpression>,
+) {
+    match table_ref {
+        BoundTableRef::BaseTable {
+            column_names,
+            column_types,
+            ..
+        } => {
+            for (idx, (name, typ)) in column_names.iter().zip(column_types.iter()).enumerate() {
+                let should_exclude = exclude_columns.iter().any(|ec| ec.eq_ignore_ascii_case(name));
+                if !should_exclude {
+                    // Check if this column should be replaced
+                    if let Some(replacement) = replace_map.get(&name.to_uppercase()) {
+                        let mut replaced = replacement.clone();
+                        replaced.alias = Some(name.clone());
+                        select_list.push(replaced);
+                    } else {
+                        select_list.push(BoundExpression::new(
+                            super::BoundExpressionKind::ColumnRef {
+                                table_idx,
+                                column_idx: *col_offset + idx,
+                                name: name.clone(),
+                            },
+                            typ.clone(),
+                        ));
+                    }
+                }
+            }
+            *col_offset += column_names.len();
+        }
+        BoundTableRef::Subquery { subquery, .. } => {
+            for (idx, expr) in subquery.select_list.iter().enumerate() {
+                let col_name = expr.name();
+                let should_exclude = exclude_columns.iter().any(|ec| ec.eq_ignore_ascii_case(&col_name));
+                if !should_exclude {
+                    if let Some(replacement) = replace_map.get(&col_name.to_uppercase()) {
+                        let mut replaced = replacement.clone();
+                        replaced.alias = Some(col_name);
+                        select_list.push(replaced);
+                    } else {
+                        select_list.push(BoundExpression::new(
+                            super::BoundExpressionKind::ColumnRef {
+                                table_idx,
+                                column_idx: *col_offset + idx,
+                                name: col_name,
+                            },
+                            expr.return_type.clone(),
+                        ));
+                    }
+                }
+            }
+            *col_offset += subquery.select_list.len();
+        }
+        BoundTableRef::Join { left, right, .. } => {
+            expand_wildcard_with_options(left, table_idx, col_offset, select_list, exclude_columns, replace_map);
+            expand_wildcard_with_options(right, table_idx, col_offset, select_list, exclude_columns, replace_map);
+        }
+        BoundTableRef::TableFunction { column_alias, .. } => {
+            let col_name = column_alias.clone().unwrap_or_else(|| "range".to_string());
+            let should_exclude = exclude_columns.iter().any(|ec| ec.eq_ignore_ascii_case(&col_name));
+            if !should_exclude {
+                if let Some(replacement) = replace_map.get(&col_name.to_uppercase()) {
+                    let mut replaced = replacement.clone();
+                    replaced.alias = Some(col_name);
+                    select_list.push(replaced);
+                } else {
+                    select_list.push(BoundExpression::new(
+                        super::BoundExpressionKind::ColumnRef {
+                            table_idx,
+                            column_idx: *col_offset,
+                            name: col_name,
+                        },
+                        ironduck_common::LogicalType::BigInt,
+                    ));
+                }
+            }
+            *col_offset += 1;
+        }
+        BoundTableRef::RecursiveCTERef { column_names, column_types, .. } => {
+            for (idx, (name, typ)) in column_names.iter().zip(column_types.iter()).enumerate() {
+                let should_exclude = exclude_columns.iter().any(|ec| ec.eq_ignore_ascii_case(name));
+                if !should_exclude {
+                    if let Some(replacement) = replace_map.get(&name.to_uppercase()) {
+                        let mut replaced = replacement.clone();
+                        replaced.alias = Some(name.clone());
+                        select_list.push(replaced);
+                    } else {
+                        select_list.push(BoundExpression::new(
+                            super::BoundExpressionKind::ColumnRef {
+                                table_idx,
+                                column_idx: *col_offset + idx,
+                                name: name.clone(),
+                            },
+                            typ.clone(),
+                        ));
+                    }
+                }
+            }
+            *col_offset += column_names.len();
+        }
+        BoundTableRef::SetOperationSubquery { column_names, column_types, .. } => {
+            for (idx, (name, typ)) in column_names.iter().zip(column_types.iter()).enumerate() {
+                let should_exclude = exclude_columns.iter().any(|ec| ec.eq_ignore_ascii_case(name));
+                if !should_exclude {
+                    if let Some(replacement) = replace_map.get(&name.to_uppercase()) {
+                        let mut replaced = replacement.clone();
+                        replaced.alias = Some(name.clone());
+                        select_list.push(replaced);
+                    } else {
+                        select_list.push(BoundExpression::new(
+                            super::BoundExpressionKind::ColumnRef {
+                                table_idx,
+                                column_idx: *col_offset + idx,
+                                name: name.clone(),
+                            },
+                            typ.clone(),
+                        ));
+                    }
+                }
+            }
+            *col_offset += column_names.len();
+        }
+        BoundTableRef::Pivot { source, aggregate_arg, value_column, pivot_values, .. } => {
+            // For PIVOT, we need to produce: group columns + pivot value columns
+            let source_cols = get_table_ref_columns(source);
+            let source_types = get_table_ref_types(source);
+            let value_column_lower = value_column.to_lowercase();
+
+            // Find the aggregate arg column name if it's a column ref
+            let agg_arg_name = match &aggregate_arg.expr {
+                super::BoundExpressionKind::ColumnRef { name, .. } => Some(name.to_lowercase()),
+                _ => None,
+            };
+
+            let mut local_col_idx = 0;
+            // Add group columns (source columns except value_column and aggregate_arg)
+            for (idx, (name, typ)) in source_cols.iter().zip(source_types.iter()).enumerate() {
+                let c_lower = name.to_lowercase();
+                if c_lower != value_column_lower && agg_arg_name.as_ref().map_or(true, |an| c_lower != *an) {
+                    let should_exclude = exclude_columns.iter().any(|ec| ec.eq_ignore_ascii_case(name));
+                    if !should_exclude {
+                        if let Some(replacement) = replace_map.get(&name.to_uppercase()) {
+                            let mut replaced = replacement.clone();
+                            replaced.alias = Some(name.clone());
+                            select_list.push(replaced);
+                        } else {
+                            select_list.push(BoundExpression::new(
+                                super::BoundExpressionKind::ColumnRef {
+                                    table_idx,
+                                    column_idx: *col_offset + local_col_idx,
+                                    name: name.clone(),
+                                },
+                                typ.clone(),
+                            ));
+                        }
+                    }
+                    local_col_idx += 1;
+                }
+            }
+
+            // Add pivot value columns
+            for pivot_val in pivot_values {
+                let should_exclude = exclude_columns.iter().any(|ec| ec.eq_ignore_ascii_case(pivot_val));
+                if !should_exclude {
+                    if let Some(replacement) = replace_map.get(&pivot_val.to_uppercase()) {
+                        let mut replaced = replacement.clone();
+                        replaced.alias = Some(pivot_val.clone());
+                        select_list.push(replaced);
+                    } else {
+                        select_list.push(BoundExpression::new(
+                            super::BoundExpressionKind::ColumnRef {
+                                table_idx,
+                                column_idx: *col_offset + local_col_idx,
+                                name: pivot_val.clone(),
+                            },
+                            ironduck_common::LogicalType::Unknown,
+                        ));
+                    }
+                }
+                local_col_idx += 1;
+            }
+            *col_offset += local_col_idx;
+        }
+        BoundTableRef::Unpivot { source, value_column, name_column, unpivot_columns, .. } => {
+            // For UNPIVOT, we need to produce: keep columns + name column + value column
+            let source_cols = get_table_ref_columns(source);
+            let source_types = get_table_ref_types(source);
+            let unpivot_lower: Vec<String> = unpivot_columns.iter().map(|c| c.to_lowercase()).collect();
+
+            let mut local_col_idx = 0;
+            // Add keep columns (source columns not being unpivoted)
+            for (name, typ) in source_cols.iter().zip(source_types.iter()) {
+                if !unpivot_lower.contains(&name.to_lowercase()) {
+                    let should_exclude = exclude_columns.iter().any(|ec| ec.eq_ignore_ascii_case(name));
+                    if !should_exclude {
+                        if let Some(replacement) = replace_map.get(&name.to_uppercase()) {
+                            let mut replaced = replacement.clone();
+                            replaced.alias = Some(name.clone());
+                            select_list.push(replaced);
+                        } else {
+                            select_list.push(BoundExpression::new(
+                                super::BoundExpressionKind::ColumnRef {
+                                    table_idx,
+                                    column_idx: *col_offset + local_col_idx,
+                                    name: name.clone(),
+                                },
+                                typ.clone(),
+                            ));
+                        }
+                    }
+                    local_col_idx += 1;
+                }
+            }
+
+            // Add name column first (contains column names)
+            let should_exclude_name = exclude_columns.iter().any(|ec| ec.eq_ignore_ascii_case(name_column));
+            if !should_exclude_name {
+                if let Some(replacement) = replace_map.get(&name_column.to_uppercase()) {
+                    let mut replaced = replacement.clone();
+                    replaced.alias = Some(name_column.clone());
+                    select_list.push(replaced);
+                } else {
+                    select_list.push(BoundExpression::new(
+                        super::BoundExpressionKind::ColumnRef {
+                            table_idx,
+                            column_idx: *col_offset + local_col_idx,
+                            name: name_column.clone(),
+                        },
+                        ironduck_common::LogicalType::Varchar,
+                    ));
+                }
+            }
+            local_col_idx += 1;
+
+            // Add value column second (contains values)
+            let should_exclude_value = exclude_columns.iter().any(|ec| ec.eq_ignore_ascii_case(value_column));
+            if !should_exclude_value {
+                if let Some(replacement) = replace_map.get(&value_column.to_uppercase()) {
+                    let mut replaced = replacement.clone();
+                    replaced.alias = Some(value_column.clone());
+                    select_list.push(replaced);
+                } else {
+                    select_list.push(BoundExpression::new(
+                        super::BoundExpressionKind::ColumnRef {
+                            table_idx,
+                            column_idx: *col_offset + local_col_idx,
+                            name: value_column.clone(),
+                        },
+                        ironduck_common::LogicalType::Unknown,
+                    ));
+                }
+            }
+            local_col_idx += 1;
+            *col_offset += local_col_idx;
+        }
+        BoundTableRef::FileTableFunction { column_names, column_types, .. } => {
+            for (idx, (name, typ)) in column_names.iter().zip(column_types.iter()).enumerate() {
+                let should_exclude = exclude_columns.iter().any(|ec| ec.eq_ignore_ascii_case(name));
+                if !should_exclude {
+                    if let Some(replacement) = replace_map.get(&name.to_uppercase()) {
+                        let mut replaced = replacement.clone();
+                        replaced.alias = Some(name.clone());
+                        select_list.push(replaced);
+                    } else {
+                        select_list.push(BoundExpression::new(
+                            super::BoundExpressionKind::ColumnRef {
+                                table_idx,
+                                column_idx: *col_offset + idx,
+                                name: name.clone(),
+                            },
+                            typ.clone(),
+                        ));
+                    }
+                }
+            }
+            *col_offset += column_names.len();
+        }
+        BoundTableRef::Empty => {}
+    }
 }
 
 fn expand_wildcard_rec_with_skip(
@@ -1339,6 +3670,277 @@ fn expand_wildcard_rec_with_skip(
                 *col_offset += 1;
             }
         }
+        BoundTableRef::RecursiveCTERef { column_names, column_types, .. } => {
+            let mut local_col_idx = 0;
+            for (name, typ) in column_names.iter().zip(column_types.iter()) {
+                let should_skip = skip_columns.iter().any(|sc| sc.eq_ignore_ascii_case(name));
+                if !should_skip {
+                    select_list.push(BoundExpression::new(
+                        super::BoundExpressionKind::ColumnRef {
+                            table_idx,
+                            column_idx: *col_offset + local_col_idx,
+                            name: name.clone(),
+                        },
+                        typ.clone(),
+                    ));
+                    local_col_idx += 1;
+                }
+            }
+            *col_offset += local_col_idx;
+        }
+        BoundTableRef::SetOperationSubquery { column_names, column_types, .. } => {
+            let mut local_col_idx = 0;
+            for (name, typ) in column_names.iter().zip(column_types.iter()) {
+                let should_skip = skip_columns.iter().any(|sc| sc.eq_ignore_ascii_case(name));
+                if !should_skip {
+                    select_list.push(BoundExpression::new(
+                        super::BoundExpressionKind::ColumnRef {
+                            table_idx,
+                            column_idx: *col_offset + local_col_idx,
+                            name: name.clone(),
+                        },
+                        typ.clone(),
+                    ));
+                    local_col_idx += 1;
+                }
+            }
+            *col_offset += local_col_idx;
+        }
+        BoundTableRef::Pivot { source, .. } => {
+            expand_wildcard_rec_with_skip(source, table_idx, col_offset, select_list, skip_columns);
+        }
+        BoundTableRef::Unpivot { source, .. } => {
+            expand_wildcard_rec_with_skip(source, table_idx, col_offset, select_list, skip_columns);
+        }
+        BoundTableRef::FileTableFunction { column_names, column_types, .. } => {
+            let mut local_col_idx = 0;
+            for (name, typ) in column_names.iter().zip(column_types.iter()) {
+                let should_skip = skip_columns.iter().any(|sc| sc.eq_ignore_ascii_case(name));
+                if !should_skip {
+                    select_list.push(BoundExpression::new(
+                        super::BoundExpressionKind::ColumnRef {
+                            table_idx,
+                            column_idx: *col_offset + local_col_idx,
+                            name: name.clone(),
+                        },
+                        typ.clone(),
+                    ));
+                    local_col_idx += 1;
+                }
+            }
+            *col_offset += local_col_idx;
+        }
         BoundTableRef::Empty => {}
+    }
+}
+
+/// Bind CREATE SEQUENCE
+fn bind_create_sequence(
+    binder: &Binder,
+    name: &sql::ObjectName,
+    if_not_exists: bool,
+    options: &[sql::SequenceOptions],
+) -> Result<BoundStatement> {
+    let parts: Vec<_> = name.0.iter().map(|i| i.value.clone()).collect();
+    let (schema, seq_name) = if parts.len() == 2 {
+        (parts[0].clone(), parts[1].clone())
+    } else {
+        (binder.current_schema().to_string(), parts[0].clone())
+    };
+
+    // Parse sequence options
+    let mut start: i64 = 1;
+    let mut increment: i64 = 1;
+    let mut min_value: i64 = 1;
+    let mut max_value: i64 = i64::MAX;
+    let mut cycle = false;
+
+    for opt in options {
+        match opt {
+            sql::SequenceOptions::StartWith(val, _) => {
+                if let sql::Expr::Value(sql::Value::Number(n, _)) = val {
+                    start = n.parse().unwrap_or(1);
+                }
+            }
+            sql::SequenceOptions::IncrementBy(val, _) => {
+                if let sql::Expr::Value(sql::Value::Number(n, _)) = val {
+                    increment = n.parse().unwrap_or(1);
+                }
+            }
+            sql::SequenceOptions::MinValue(Some(val)) => {
+                if let sql::Expr::Value(sql::Value::Number(n, _)) = val {
+                    min_value = n.parse().unwrap_or(1);
+                }
+            }
+            sql::SequenceOptions::MaxValue(Some(val)) => {
+                if let sql::Expr::Value(sql::Value::Number(n, _)) = val {
+                    max_value = n.parse().unwrap_or(i64::MAX);
+                }
+            }
+            sql::SequenceOptions::Cycle(is_cycle) => {
+                cycle = *is_cycle;
+            }
+            _ => {}
+        }
+    }
+
+    Ok(BoundStatement::CreateSequence(BoundCreateSequence {
+        schema,
+        name: seq_name,
+        start,
+        increment,
+        min_value,
+        max_value,
+        cycle,
+        if_not_exists,
+    }))
+}
+
+/// Get column names from a table reference (for NATURAL joins)
+fn get_table_ref_columns(table_ref: &BoundTableRef) -> Vec<String> {
+    match table_ref {
+        BoundTableRef::BaseTable { column_names, .. } => column_names.clone(),
+        BoundTableRef::Subquery { subquery, .. } => {
+            subquery.select_list.iter().map(|e| e.name()).collect()
+        }
+        BoundTableRef::SetOperationSubquery { column_names, .. } => column_names.clone(),
+        BoundTableRef::Join { left, right, .. } => {
+            let mut cols = get_table_ref_columns(left);
+            cols.extend(get_table_ref_columns(right));
+            cols
+        }
+        BoundTableRef::TableFunction { column_alias, .. } => {
+            vec![column_alias.clone().unwrap_or_else(|| "column".to_string())]
+        }
+        BoundTableRef::RecursiveCTERef { column_names, .. } => column_names.clone(),
+        BoundTableRef::Pivot { source, aggregate_arg, value_column, pivot_values, .. } => {
+            // For pivot, output is: group columns + pivot value columns
+            // Group columns = all source columns EXCEPT value_column and aggregate_arg column
+            let source_cols = get_table_ref_columns(source);
+            let value_column_lower = value_column.to_lowercase();
+
+            // Find the aggregate arg column name if it's a column ref
+            let agg_arg_name = match &aggregate_arg.expr {
+                super::BoundExpressionKind::ColumnRef { name, .. } => Some(name.to_lowercase()),
+                _ => None,
+            };
+
+            // Filter to get only group columns
+            let mut cols: Vec<String> = source_cols.into_iter()
+                .filter(|c| {
+                    let c_lower = c.to_lowercase();
+                    c_lower != value_column_lower && agg_arg_name.as_ref().map_or(true, |an| c_lower != *an)
+                })
+                .collect();
+
+            // Add pivot value columns
+            cols.extend(pivot_values.iter().cloned());
+            cols
+        }
+        BoundTableRef::Unpivot { source, value_column, name_column, unpivot_columns, .. } => {
+            let source_cols = get_table_ref_columns(source);
+            let unpivot_lower: Vec<String> = unpivot_columns.iter().map(|c| c.to_lowercase()).collect();
+            let mut cols: Vec<String> = source_cols.into_iter()
+                .filter(|c| !unpivot_lower.contains(&c.to_lowercase()))
+                .collect();
+            // Order: keep columns, then name column (column names), then value column (values)
+            cols.push(name_column.clone());
+            cols.push(value_column.clone());
+            cols
+        }
+        BoundTableRef::FileTableFunction { column_names, .. } => column_names.clone(),
+        BoundTableRef::Empty => vec![],
+    }
+}
+
+/// Get column types from a bound table reference
+fn get_table_ref_types(table_ref: &BoundTableRef) -> Vec<ironduck_common::LogicalType> {
+    match table_ref {
+        BoundTableRef::BaseTable { column_types, .. } => column_types.clone(),
+        BoundTableRef::Subquery { subquery, .. } => subquery.output_types(),
+        BoundTableRef::SetOperationSubquery { column_types, .. } => column_types.clone(),
+        BoundTableRef::Join { left, right, .. } => {
+            let mut types = get_table_ref_types(left);
+            types.extend(get_table_ref_types(right));
+            types
+        }
+        BoundTableRef::TableFunction { .. } => vec![ironduck_common::LogicalType::Unknown],
+        BoundTableRef::RecursiveCTERef { column_types, .. } => column_types.clone(),
+        BoundTableRef::Pivot { source, aggregate_arg, value_column, pivot_values, .. } => {
+            let source_cols = get_table_ref_columns(source);
+            let source_types = get_table_ref_types(source);
+            let value_column_lower = value_column.to_lowercase();
+
+            let agg_arg_name = match &aggregate_arg.expr {
+                super::BoundExpressionKind::ColumnRef { name, .. } => Some(name.to_lowercase()),
+                _ => None,
+            };
+
+            // Get types for group columns
+            let mut types: Vec<ironduck_common::LogicalType> = source_cols.iter()
+                .enumerate()
+                .filter(|(_, c)| {
+                    let c_lower = c.to_lowercase();
+                    c_lower != value_column_lower && agg_arg_name.as_ref().map_or(true, |an| c_lower != *an)
+                })
+                .map(|(i, _)| source_types.get(i).cloned().unwrap_or(ironduck_common::LogicalType::Unknown))
+                .collect();
+
+            // Add types for pivot value columns
+            for _ in pivot_values {
+                types.push(ironduck_common::LogicalType::Unknown);
+            }
+            types
+        }
+        BoundTableRef::Unpivot { source, unpivot_columns, .. } => {
+            let source_types = get_table_ref_types(source);
+            let source_cols = get_table_ref_columns(source);
+            let unpivot_lower: Vec<String> = unpivot_columns.iter().map(|c| c.to_lowercase()).collect();
+            let mut types: Vec<ironduck_common::LogicalType> = source_cols.iter()
+                .enumerate()
+                .filter(|(_, c)| !unpivot_lower.contains(&c.to_lowercase()))
+                .map(|(i, _)| source_types.get(i).cloned().unwrap_or(ironduck_common::LogicalType::Unknown))
+                .collect();
+            // Order: keep columns, then name column (varchar), then value column (from source)
+            // Name column is always varchar
+            types.push(ironduck_common::LogicalType::Varchar);
+            // Value column type - take from first unpivoted column
+            if let Some(first_unpivot) = source_cols.iter()
+                .enumerate()
+                .find(|(_, c)| unpivot_lower.contains(&c.to_lowercase())) {
+                types.push(source_types.get(first_unpivot.0).cloned().unwrap_or(ironduck_common::LogicalType::Unknown));
+            } else {
+                types.push(ironduck_common::LogicalType::Unknown);
+            }
+            types
+        }
+        BoundTableRef::FileTableFunction { column_types, .. } => column_types.clone(),
+        BoundTableRef::Empty => vec![],
+    }
+}
+
+/// Check if an expression contains an aggregate function
+fn expression_contains_aggregate(expr: &BoundExpression) -> bool {
+    use super::BoundExpressionKind;
+
+    match &expr.expr {
+        BoundExpressionKind::Function { is_aggregate, .. } => *is_aggregate,
+        BoundExpressionKind::BinaryOp { left, right, .. } => {
+            expression_contains_aggregate(left) || expression_contains_aggregate(right)
+        }
+        BoundExpressionKind::UnaryOp { expr, .. } => expression_contains_aggregate(expr),
+        BoundExpressionKind::Cast { expr, .. } | BoundExpressionKind::TryCast { expr, .. } => expression_contains_aggregate(expr),
+        BoundExpressionKind::Case { operand, when_clauses, else_result } => {
+            operand.as_ref().map_or(false, |e| expression_contains_aggregate(e))
+                || when_clauses.iter().any(|(c, r)| {
+                    expression_contains_aggregate(c) || expression_contains_aggregate(r)
+                })
+                || else_result.as_ref().map_or(false, |e| expression_contains_aggregate(e))
+        }
+        BoundExpressionKind::WindowFunction { .. } => {
+            // Window functions are not aggregates in the GROUP BY sense
+            false
+        }
+        _ => false,
     }
 }

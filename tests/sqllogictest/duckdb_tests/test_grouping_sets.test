@@ -1,0 +1,92 @@
+# GROUPING SETS, ROLLUP, CUBE tests
+
+statement ok
+CREATE TABLE sales (region VARCHAR, product VARCHAR, amount INTEGER);
+
+statement ok
+INSERT INTO sales VALUES ('North', 'Widget', 100), ('North', 'Gadget', 150), ('South', 'Widget', 200), ('South', 'Gadget', 250);
+
+# Basic ROLLUP
+query TTI rowsort
+SELECT region, product, SUM(amount) FROM sales GROUP BY ROLLUP(region, product);
+----
+NULL
+NULL
+700
+North
+Gadget
+150
+North
+NULL
+250
+North
+Widget
+100
+South
+Gadget
+250
+South
+NULL
+450
+South
+Widget
+200
+
+# Basic CUBE
+query TTI rowsort
+SELECT region, product, SUM(amount) FROM sales GROUP BY CUBE(region, product);
+----
+NULL
+Gadget
+400
+NULL
+NULL
+700
+NULL
+Widget
+300
+North
+Gadget
+150
+North
+NULL
+250
+North
+Widget
+100
+South
+Gadget
+250
+South
+NULL
+450
+South
+Widget
+200
+
+# Direct GROUPING SETS
+query TTI rowsort
+SELECT region, product, SUM(amount) FROM sales GROUP BY GROUPING SETS ((region, product), (region), ());
+----
+NULL
+NULL
+700
+North
+Gadget
+150
+North
+NULL
+250
+North
+Widget
+100
+South
+Gadget
+250
+South
+NULL
+450
+South
+Widget
+200
+

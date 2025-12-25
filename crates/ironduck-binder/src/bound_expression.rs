@@ -32,10 +32,12 @@ impl BoundExpression {
         match &self.expr {
             BoundExpressionKind::Constant(v) => v.to_string(),
             BoundExpressionKind::ColumnRef { name, .. } => name.clone(),
+            BoundExpressionKind::OuterColumnRef { name, .. } => name.clone(),
             BoundExpressionKind::BinaryOp { op, .. } => format!("{:?}", op),
             BoundExpressionKind::UnaryOp { op, .. } => format!("{:?}", op),
             BoundExpressionKind::Function { name, .. } => name.clone(),
             BoundExpressionKind::Cast { .. } => "CAST".to_string(),
+            BoundExpressionKind::TryCast { .. } => "TRY_CAST".to_string(),
             BoundExpressionKind::Case { .. } => "CASE".to_string(),
             BoundExpressionKind::IsNull { .. } => "IS NULL".to_string(),
             BoundExpressionKind::IsNotNull { .. } => "IS NOT NULL".to_string(),
@@ -64,6 +66,15 @@ pub enum BoundExpressionKind {
         name: String,
     },
 
+    /// Outer column reference (for correlated subqueries)
+    OuterColumnRef {
+        /// Depth level of the outer scope (0 = immediate parent, 1 = grandparent, etc.)
+        depth: usize,
+        /// Column index within the outer row
+        column_idx: usize,
+        name: String,
+    },
+
     /// Binary operation
     BinaryOp {
         left: Box<BoundExpression>,
@@ -84,10 +95,21 @@ pub enum BoundExpressionKind {
         is_aggregate: bool,
         /// DISTINCT modifier for aggregates (e.g., COUNT(DISTINCT x))
         distinct: bool,
+        /// ORDER BY clause for ordered aggregates (e.g., SUM(x ORDER BY y))
+        /// Each tuple is (expression, ascending, nulls_first)
+        order_by: Vec<(BoundExpression, bool, bool)>,
+        /// FILTER clause for aggregates (e.g., SUM(x) FILTER (WHERE y > 0))
+        filter: Option<Box<BoundExpression>>,
     },
 
     /// Type cast
     Cast {
+        expr: Box<BoundExpression>,
+        target_type: LogicalType,
+    },
+
+    /// TRY_CAST (returns NULL on error)
+    TryCast {
         expr: Box<BoundExpression>,
         target_type: LogicalType,
     },
@@ -149,12 +171,51 @@ pub enum BoundExpressionKind {
         partition_by: Vec<BoundExpression>,
         /// ORDER BY expressions (expression, ascending, nulls_first)
         order_by: Vec<(BoundExpression, bool, bool)>,
+        /// Window frame specification
+        frame: Option<WindowFrame>,
     },
 
     /// Row ID pseudo-column
     RowId {
         table_idx: usize,
     },
+}
+
+/// Window frame specification
+#[derive(Debug, Clone)]
+pub struct WindowFrame {
+    /// Frame type: ROWS or RANGE
+    pub frame_type: WindowFrameType,
+    /// Start bound of the frame
+    pub start: WindowFrameBound,
+    /// End bound of the frame (None means CURRENT ROW for single-bound frames)
+    pub end: WindowFrameBound,
+}
+
+/// Window frame type
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WindowFrameType {
+    /// ROWS - physical row offsets
+    Rows,
+    /// RANGE - logical value ranges
+    Range,
+    /// GROUPS - group-based offsets
+    Groups,
+}
+
+/// Window frame bound
+#[derive(Debug, Clone)]
+pub enum WindowFrameBound {
+    /// UNBOUNDED PRECEDING
+    UnboundedPreceding,
+    /// n PRECEDING
+    Preceding(Box<BoundExpression>),
+    /// CURRENT ROW
+    CurrentRow,
+    /// n FOLLOWING
+    Following(Box<BoundExpression>),
+    /// UNBOUNDED FOLLOWING
+    UnboundedFollowing,
 }
 
 /// Binary operators
@@ -183,6 +244,13 @@ pub enum BoundBinaryOperator {
     Concat,
     Like,
     ILike,
+
+    // Bitwise
+    BitwiseAnd,
+    BitwiseOr,
+    BitwiseXor,
+    ShiftLeft,
+    ShiftRight,
 }
 
 /// Unary operators
@@ -222,6 +290,13 @@ impl BoundBinaryOperator {
             | BoundBinaryOperator::Modulo => {
                 left.common_supertype(right).unwrap_or(LogicalType::Double)
             }
+
+            // Bitwise operators return bigint
+            BoundBinaryOperator::BitwiseAnd
+            | BoundBinaryOperator::BitwiseOr
+            | BoundBinaryOperator::BitwiseXor
+            | BoundBinaryOperator::ShiftLeft
+            | BoundBinaryOperator::ShiftRight => LogicalType::BigInt,
         }
     }
 }

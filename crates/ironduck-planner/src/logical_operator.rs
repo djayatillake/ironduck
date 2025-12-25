@@ -46,6 +46,10 @@ pub enum LogicalOperator {
         right: Box<LogicalOperator>,
         join_type: JoinType,
         condition: Option<Expression>,
+        /// Whether this is a LATERAL join (right side can reference left side columns)
+        is_lateral: bool,
+        /// ASOF match condition (inequality for time-series matching, e.g., left.time >= right.time)
+        asof_condition: Option<Expression>,
     },
 
     /// Sort
@@ -79,6 +83,8 @@ pub enum LogicalOperator {
         schema: String,
         name: String,
         columns: Vec<(String, LogicalType)>,
+        /// Default values for each column (None if no default)
+        default_values: Vec<Option<Expression>>,
         if_not_exists: bool,
         /// For CREATE TABLE ... AS SELECT ...
         source: Option<Box<LogicalOperator>>,
@@ -97,6 +103,18 @@ pub enum LogicalOperator {
         sql: String,
         column_names: Vec<String>,
         or_replace: bool,
+    },
+
+    /// CREATE SEQUENCE
+    CreateSequence {
+        schema: String,
+        name: String,
+        start: i64,
+        increment: i64,
+        min_value: i64,
+        max_value: i64,
+        cycle: bool,
+        if_not_exists: bool,
     },
 
     /// INSERT
@@ -136,6 +154,29 @@ pub enum LogicalOperator {
         if_exists: bool,
     },
 
+    /// ALTER TABLE
+    AlterTable {
+        schema: String,
+        table_name: String,
+        operation: AlterTableOp,
+    },
+
+    /// CREATE INDEX
+    CreateIndex {
+        schema: String,
+        index_name: String,
+        table_name: String,
+        columns: Vec<String>,
+        column_types: Vec<LogicalType>,
+        unique: bool,
+        if_not_exists: bool,
+    },
+
+    /// Transaction control
+    Transaction {
+        operation: TransactionOp,
+    },
+
     /// Set operation (UNION, INTERSECT, EXCEPT)
     SetOperation {
         left: Box<LogicalOperator>,
@@ -161,8 +202,34 @@ pub enum LogicalOperator {
         input: Box<LogicalOperator>,
     },
 
+    /// Recursive CTE execution
+    RecursiveCTE {
+        /// Name of the CTE
+        name: String,
+        /// Base case query (anchor)
+        base_case: Box<LogicalOperator>,
+        /// Recursive case query (references the CTE)
+        recursive_case: Box<LogicalOperator>,
+        /// Output column names
+        output_names: Vec<String>,
+        /// Output column types
+        output_types: Vec<LogicalType>,
+        /// Whether to use UNION ALL (true) or UNION (false) semantics
+        union_all: bool,
+    },
+
     /// No-op - for PRAGMA, SET, and other configuration statements
     NoOp,
+
+    /// Scan of recursive CTE working table (used within recursive case)
+    RecursiveCTEScan {
+        /// Name of the CTE being referenced
+        cte_name: String,
+        /// Column names
+        column_names: Vec<String>,
+        /// Column types
+        output_types: Vec<LogicalType>,
+    },
 
     /// Table-valued function (e.g., range(), generate_series())
     TableFunction {
@@ -170,6 +237,75 @@ pub enum LogicalOperator {
         column_name: String,
         output_type: LogicalType,
     },
+
+    /// PIVOT operation - transforms rows to columns based on pivot values
+    Pivot {
+        /// Source operator to pivot
+        input: Box<LogicalOperator>,
+        /// Aggregate function name (e.g., SUM, COUNT)
+        aggregate_function: AggregateFunction,
+        /// Expression to aggregate
+        aggregate_arg: Expression,
+        /// Name of the column to pivot on
+        value_column: String,
+        /// Index of the value column in the input
+        value_column_index: usize,
+        /// Values to create columns for
+        pivot_values: Vec<String>,
+        /// Columns that are not the value column or aggregate arg (GROUP BY columns)
+        group_columns: Vec<(String, LogicalType, usize)>,
+    },
+
+    /// UNPIVOT operation - transforms columns to rows
+    Unpivot {
+        /// Source operator to unpivot
+        input: Box<LogicalOperator>,
+        /// Name for the value column (contains the values from unpivoted columns)
+        value_column: String,
+        /// Name for the name column (contains the column names)
+        name_column: String,
+        /// Columns to unpivot (name, index, type)
+        unpivot_columns: Vec<(String, usize, LogicalType)>,
+        /// Columns to keep (non-unpivoted columns): (name, index, type)
+        keep_columns: Vec<(String, usize, LogicalType)>,
+    },
+
+    /// COPY operation - bulk data import/export
+    Copy {
+        /// True = COPY TO (export), False = COPY FROM (import)
+        to: bool,
+        /// Source: either a table scan or a query plan
+        source: Box<CopySourceKind>,
+        /// Target file path
+        file_path: String,
+        /// File format type
+        format: CopyFormatKind,
+        /// Whether file has header (for CSV)
+        header: bool,
+        /// Delimiter character (for CSV)
+        delimiter: char,
+    },
+}
+
+/// Source for COPY operation
+#[derive(Debug, Clone)]
+pub enum CopySourceKind {
+    /// Copy from/to a table
+    Table {
+        schema: String,
+        name: String,
+        columns: Vec<String>,
+        column_types: Vec<LogicalType>,
+    },
+    /// Copy from a query (COPY TO only)
+    Query(Box<LogicalOperator>),
+}
+
+/// File format for COPY
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CopyFormatKind {
+    Csv,
+    Parquet,
 }
 
 /// Types of table-valued functions
@@ -180,6 +316,41 @@ pub enum TableFunctionKind {
         start: Expression,
         stop: Expression,
         step: Expression,
+    },
+    /// unnest(array) - expands an array into rows
+    Unnest {
+        array_expr: Expression,
+    },
+    /// generate_subscripts(array, dim) - generates subscripts for an array
+    GenerateSubscripts {
+        array_expr: Expression,
+        dim: i32,
+    },
+    /// read_csv(path) - reads a CSV file into a table
+    ReadCsv {
+        path: String,
+        has_header: bool,
+        delimiter: char,
+        /// Column names inferred from CSV (populated during execution)
+        column_names: Vec<String>,
+        /// Column types inferred from CSV (populated during execution)
+        column_types: Vec<LogicalType>,
+    },
+    /// read_parquet(path) - reads a Parquet file into a table
+    ReadParquet {
+        path: String,
+        /// Column names from Parquet schema (populated during execution)
+        column_names: Vec<String>,
+        /// Column types from Parquet schema (populated during execution)
+        column_types: Vec<LogicalType>,
+    },
+    /// read_json(path) - reads a JSON file into a table
+    ReadJson {
+        path: String,
+        /// Column names inferred from JSON (populated during execution)
+        column_names: Vec<String>,
+        /// Column types inferred from JSON (populated during execution)
+        column_types: Vec<LogicalType>,
     },
 }
 
@@ -227,15 +398,47 @@ impl LogicalOperator {
             LogicalOperator::CreateTable { .. } => vec![LogicalType::Varchar],
             LogicalOperator::CreateSchema { .. } => vec![LogicalType::Varchar],
             LogicalOperator::CreateView { .. } => vec![LogicalType::Varchar],
+            LogicalOperator::CreateSequence { .. } => vec![LogicalType::Varchar],
             LogicalOperator::Insert { .. } => vec![LogicalType::BigInt],
             LogicalOperator::Delete { .. } => vec![LogicalType::BigInt],
             LogicalOperator::Update { .. } => vec![LogicalType::BigInt],
             LogicalOperator::Drop { .. } => vec![LogicalType::Varchar],
+            LogicalOperator::AlterTable { .. } => vec![LogicalType::Varchar],
+            LogicalOperator::CreateIndex { .. } => vec![LogicalType::Varchar],
+            LogicalOperator::Transaction { .. } => vec![LogicalType::Varchar],
             LogicalOperator::SetOperation { left, .. } => left.output_types(),
             LogicalOperator::Window { output_types, .. } => output_types.clone(),
             LogicalOperator::Explain { .. } => vec![LogicalType::Varchar],
+            LogicalOperator::RecursiveCTE { output_types, .. } => output_types.clone(),
+            LogicalOperator::RecursiveCTEScan { output_types, .. } => output_types.clone(),
             LogicalOperator::NoOp => vec![LogicalType::Varchar],
             LogicalOperator::TableFunction { output_type, .. } => vec![output_type.clone()],
+            LogicalOperator::Pivot { group_columns, pivot_values, .. } => {
+                // Output types: group columns + one column for each pivot value
+                let mut types: Vec<LogicalType> = group_columns.iter().map(|(_, t, _)| t.clone()).collect();
+                // Each pivot value column has the aggregate's output type (usually numeric)
+                for _ in pivot_values {
+                    types.push(LogicalType::Unknown); // Will be refined during execution
+                }
+                types
+            }
+            LogicalOperator::Unpivot { keep_columns, unpivot_columns, .. } => {
+                // Output types: keep columns + name column + value column
+                let mut types: Vec<LogicalType> = keep_columns.iter().map(|(_, _, t)| t.clone()).collect();
+                // Name column is always varchar
+                types.push(LogicalType::Varchar);
+                // Value column type is the common type of all unpivoted columns
+                if let Some((_, _, first_type)) = unpivot_columns.first() {
+                    types.push(first_type.clone());
+                } else {
+                    types.push(LogicalType::Unknown);
+                }
+                types
+            }
+            LogicalOperator::Copy { .. } => {
+                // Returns count of rows copied
+                vec![LogicalType::BigInt]
+            }
         }
     }
 }
@@ -249,6 +452,60 @@ pub enum JoinType {
     Cross,
     Semi,
     Anti,
+    /// ASOF join - matches rows based on closest preceding value
+    AsOf,
+}
+
+/// ALTER TABLE operation types
+#[derive(Debug, Clone)]
+pub enum AlterTableOp {
+    /// ADD COLUMN
+    AddColumn {
+        name: String,
+        data_type: LogicalType,
+        nullable: bool,
+        default: Option<Expression>,
+    },
+    /// DROP COLUMN
+    DropColumn {
+        column_name: String,
+        if_exists: bool,
+    },
+    /// RENAME COLUMN
+    RenameColumn {
+        old_name: String,
+        new_name: String,
+    },
+    /// RENAME TABLE
+    RenameTable {
+        new_name: String,
+    },
+    /// ALTER COLUMN TYPE
+    AlterColumnType {
+        column_name: String,
+        new_type: LogicalType,
+    },
+    /// SET/DROP DEFAULT
+    SetColumnDefault {
+        column_name: String,
+        default: Option<Expression>,
+    },
+    /// SET/DROP NOT NULL
+    SetColumnNotNull {
+        column_name: String,
+        not_null: bool,
+    },
+}
+
+/// Transaction operation types
+#[derive(Debug, Clone)]
+pub enum TransactionOp {
+    Begin,
+    Commit,
+    Rollback,
+    Savepoint(String),
+    ReleaseSavepoint(String),
+    RollbackToSavepoint(String),
 }
 
 /// An expression in the logical plan
@@ -257,6 +514,12 @@ pub enum Expression {
     /// Column reference
     ColumnRef {
         table_index: TableIndex,
+        column_index: usize,
+        name: String,
+    },
+    /// Outer column reference (for correlated subqueries)
+    OuterColumnRef {
+        depth: usize,
         column_index: usize,
         name: String,
     },
@@ -287,6 +550,11 @@ pub enum Expression {
     },
     /// Cast expression
     Cast {
+        expr: Box<Expression>,
+        target_type: LogicalType,
+    },
+    /// TRY_CAST expression (returns NULL on error)
+    TryCast {
         expr: Box<Expression>,
         target_type: LogicalType,
     },
@@ -366,6 +634,9 @@ pub struct AggregateExpression {
     pub args: Vec<Expression>,
     pub distinct: bool,
     pub filter: Option<Expression>,
+    /// ORDER BY clause for ordered aggregates (e.g., SUM(x ORDER BY y))
+    /// Each tuple is (expression, ascending, nulls_first)
+    pub order_by: Vec<(Expression, bool, bool)>,
 }
 
 impl AggregateExpression {
@@ -387,6 +658,26 @@ impl AggregateExpression {
             AggregateFunction::PercentileDisc => LogicalType::Unknown, // Same as input
             AggregateFunction::Mode => LogicalType::Unknown, // Same as input
             AggregateFunction::CovarPop | AggregateFunction::CovarSamp | AggregateFunction::Corr => LogicalType::Double,
+            // New aggregate functions
+            AggregateFunction::ArgMax | AggregateFunction::ArgMin => LogicalType::Unknown, // Same as first arg
+            AggregateFunction::Histogram => LogicalType::Unknown, // MAP type
+            AggregateFunction::Entropy => LogicalType::Double,
+            AggregateFunction::Kurtosis | AggregateFunction::Skewness => LogicalType::Double,
+            AggregateFunction::ApproxCountDistinct => LogicalType::BigInt,
+            AggregateFunction::RegrSlope | AggregateFunction::RegrIntercept
+                | AggregateFunction::RegrR2 | AggregateFunction::RegrAvgX
+                | AggregateFunction::RegrAvgY | AggregateFunction::RegrSXX
+                | AggregateFunction::RegrSYY | AggregateFunction::RegrSXY => LogicalType::Double,
+            AggregateFunction::RegrCount => LogicalType::BigInt,
+            // Additional aggregate functions
+            AggregateFunction::AnyValue | AggregateFunction::Arbitrary => LogicalType::Unknown,
+            AggregateFunction::ListAgg | AggregateFunction::GroupConcat => LogicalType::Varchar,
+            AggregateFunction::FSum => LogicalType::Double,
+            AggregateFunction::Quantile | AggregateFunction::ApproxQuantile => LogicalType::Double,
+            AggregateFunction::CountIf => LogicalType::BigInt,
+            AggregateFunction::SumIf => LogicalType::BigInt,
+            AggregateFunction::AvgIf => LogicalType::Double,
+            AggregateFunction::MinIf | AggregateFunction::MaxIf => LogicalType::Unknown,
         }
     }
 }
@@ -419,6 +710,36 @@ pub enum AggregateFunction {
     CovarPop,      // Population covariance
     CovarSamp,     // Sample covariance
     Corr,          // Correlation coefficient
+    // New aggregate functions
+    ArgMax,        // Value of arg column when val column is maximum
+    ArgMin,        // Value of arg column when val column is minimum
+    Histogram,     // Returns a MAP of value counts
+    Entropy,       // Information entropy
+    Kurtosis,      // Excess kurtosis (fourth moment)
+    Skewness,      // Skewness (third moment)
+    ApproxCountDistinct, // Approximate count distinct (HyperLogLog)
+    RegrSlope,     // Linear regression slope
+    RegrIntercept, // Linear regression intercept
+    RegrCount,     // Count of non-null pairs for regression
+    RegrR2,        // Coefficient of determination (R²)
+    RegrAvgX,      // Average of X values
+    RegrAvgY,      // Average of Y values
+    RegrSXX,       // Sum of squares of X
+    RegrSYY,       // Sum of squares of Y
+    RegrSXY,       // Sum of products of X and Y
+    // Additional aggregate functions
+    AnyValue,      // Returns any non-null value from the group
+    Arbitrary,     // Alias for AnyValue
+    ListAgg,       // List aggregation with separator
+    FSum,          // Exact sum using Kahan summation
+    Quantile,      // Quantile (alias for percentile)
+    ApproxQuantile, // Approximate quantile
+    GroupConcat,   // MySQL-style group concatenation
+    CountIf,       // Count with condition
+    SumIf,         // Sum with condition
+    AvgIf,         // Avg with condition
+    MinIf,         // Min with condition
+    MaxIf,         // Max with condition
 }
 
 #[derive(Debug, Clone)]
@@ -439,8 +760,39 @@ pub struct WindowExpression {
     pub partition_by: Vec<Expression>,
     /// ORDER BY expressions
     pub order_by: Vec<OrderByExpression>,
+    /// Window frame specification
+    pub frame: Option<WindowFrame>,
     /// Output type
     pub output_type: LogicalType,
+}
+
+/// Window frame specification
+#[derive(Debug, Clone)]
+pub struct WindowFrame {
+    /// Frame type: ROWS or RANGE
+    pub frame_type: WindowFrameType,
+    /// Start bound
+    pub start: WindowFrameBound,
+    /// End bound
+    pub end: WindowFrameBound,
+}
+
+/// Window frame type
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WindowFrameType {
+    Rows,
+    Range,
+    Groups,
+}
+
+/// Window frame bound
+#[derive(Debug, Clone)]
+pub enum WindowFrameBound {
+    UnboundedPreceding,
+    Preceding(Expression),
+    CurrentRow,
+    Following(Expression),
+    UnboundedFollowing,
 }
 
 /// Window function types

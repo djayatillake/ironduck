@@ -3,19 +3,23 @@
 //! The catalog manages database objects: schemas, tables, columns, functions.
 
 use hashbrown::HashMap;
-use ironduck_common::{Error, LogicalType, Result};
+use ironduck_common::{Error, LogicalType, Result, Value};
 use parking_lot::RwLock;
 use std::sync::Arc;
 
 mod column;
 mod function;
+mod index;
 mod schema;
+mod sequence;
 mod table;
 mod view;
 
 pub use column::{Column, ColumnId};
 pub use function::{Function, FunctionId};
+pub use index::{Index, IndexId, IndexType};
 pub use schema::{Schema, SchemaId};
+pub use sequence::{Sequence, SequenceId};
 pub use table::{Table, TableId};
 pub use view::{View, ViewId};
 
@@ -85,6 +89,18 @@ impl Catalog {
         table_name: &str,
         columns: Vec<(String, LogicalType)>,
     ) -> Result<TableId> {
+        let defaults: Vec<Option<Value>> = vec![None; columns.len()];
+        self.create_table_with_defaults(schema_name, table_name, columns, defaults)
+    }
+
+    /// Create a table in the given schema with default values
+    pub fn create_table_with_defaults(
+        &self,
+        schema_name: &str,
+        table_name: &str,
+        columns: Vec<(String, LogicalType)>,
+        default_values: Vec<Option<Value>>,
+    ) -> Result<TableId> {
         let schema = self
             .get_schema(schema_name)
             .ok_or_else(|| Error::SchemaNotFound(schema_name.to_string()))?;
@@ -98,7 +114,7 @@ impl Catalog {
                 name,
                 logical_type,
                 nullable: true,
-                default_value: None,
+                default_value: default_values.get(idx).cloned().flatten(),
             })
             .collect();
 
@@ -145,9 +161,120 @@ impl Catalog {
         schema.get_view(view_name)
     }
 
+    /// Create a sequence in the given schema
+    pub fn create_sequence(
+        &self,
+        schema_name: &str,
+        sequence_name: &str,
+        start: i64,
+        increment: i64,
+        min_value: i64,
+        max_value: i64,
+        cycle: bool,
+    ) -> Result<SequenceId> {
+        let schema = self
+            .get_schema(schema_name)
+            .ok_or_else(|| Error::SchemaNotFound(schema_name.to_string()))?;
+
+        let sequence_id = self.next_id();
+        let sequence = Sequence::new(
+            sequence_id,
+            sequence_name.to_string(),
+            start,
+            increment,
+            min_value,
+            max_value,
+            cycle,
+        );
+        schema.add_sequence(sequence)?;
+
+        Ok(sequence_id)
+    }
+
+    /// Get a sequence by schema and sequence name
+    pub fn get_sequence(&self, schema_name: &str, sequence_name: &str) -> Option<Arc<Sequence>> {
+        let schema = self.get_schema(schema_name)?;
+        schema.get_sequence(sequence_name)
+    }
+
     /// List all schema names
     pub fn list_schemas(&self) -> Vec<String> {
         self.schemas.read().keys().cloned().collect()
+    }
+
+    /// Alter a table by applying a mutation function
+    pub fn alter_table<F>(&self, schema_name: &str, table_name: &str, f: F) -> Result<()>
+    where
+        F: FnOnce(&mut Table),
+    {
+        let schema = self.get_schema(schema_name)
+            .ok_or_else(|| Error::SchemaNotFound(schema_name.to_string()))?;
+        schema.alter_table(table_name, f)
+    }
+
+    /// Rename a table
+    pub fn rename_table(&self, schema_name: &str, old_name: &str, new_name: &str) -> Result<()> {
+        let schema = self.get_schema(schema_name)
+            .ok_or_else(|| Error::SchemaNotFound(schema_name.to_string()))?;
+        schema.rename_table(old_name, new_name)
+    }
+
+    /// Create an index in the given schema
+    pub fn create_index(
+        &self,
+        schema_name: &str,
+        index_name: &str,
+        table_name: &str,
+        columns: Vec<String>,
+        column_types: Vec<LogicalType>,
+        index_type: IndexType,
+        unique: bool,
+    ) -> Result<IndexId> {
+        let schema = self
+            .get_schema(schema_name)
+            .ok_or_else(|| Error::SchemaNotFound(schema_name.to_string()))?;
+
+        // Verify table exists
+        if schema.get_table(table_name).is_none() {
+            return Err(Error::TableNotFound(table_name.to_string()));
+        }
+
+        let index_id = self.next_id();
+        let index = Index::new(
+            index_id,
+            index_name.to_string(),
+            table_name.to_string(),
+            columns,
+            column_types,
+            index_type,
+            unique,
+        );
+        schema.add_index(index)?;
+
+        Ok(index_id)
+    }
+
+    /// Get an index by schema and index name
+    pub fn get_index(&self, schema_name: &str, index_name: &str) -> Option<Arc<Index>> {
+        let schema = self.get_schema(schema_name)?;
+        schema.get_index(index_name)
+    }
+
+    /// Get all indexes for a table
+    pub fn get_indexes_for_table(&self, schema_name: &str, table_name: &str) -> Vec<Arc<Index>> {
+        if let Some(schema) = self.get_schema(schema_name) {
+            schema.get_indexes_for_table(table_name)
+        } else {
+            vec![]
+        }
+    }
+
+    /// Drop an index
+    pub fn drop_index(&self, schema_name: &str, index_name: &str) -> Result<()> {
+        let schema = self
+            .get_schema(schema_name)
+            .ok_or_else(|| Error::SchemaNotFound(schema_name.to_string()))?;
+        schema.drop_index(index_name)
     }
 }
 
