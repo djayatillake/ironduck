@@ -2283,6 +2283,98 @@ fn bind_table_function(
                 column_types,
             })
         }
+        "READ_JSON_OBJECTS" => {
+            // read_json_objects(path) - returns each JSON object as a single column
+            let path = args.first()
+                .and_then(|arg| match arg {
+                    sql::FunctionArg::Unnamed(sql::FunctionArgExpr::Expr(sql::Expr::Value(v))) => {
+                        match v {
+                            sql::Value::SingleQuotedString(s) |
+                            sql::Value::DoubleQuotedString(s) => Some(s.clone()),
+                            _ => None,
+                        }
+                    }
+                    _ => None,
+                })
+                .ok_or_else(|| Error::InvalidArguments("read_json_objects() requires a file path as first argument".to_string()))?;
+
+            let table_alias = alias.as_ref().map(|a| a.name.value.clone());
+
+            // Returns a single column 'json' containing the raw JSON objects
+            Ok(BoundTableRef::FileTableFunction {
+                path,
+                file_type: FileTableType::JsonObjects,
+                alias: table_alias,
+                column_names: vec!["json".to_string()],
+                column_types: vec![LogicalType::Varchar],
+            })
+        }
+        "GLOB" => {
+            // glob(pattern) - returns files matching a glob pattern
+            let pattern = args.first()
+                .and_then(|arg| match arg {
+                    sql::FunctionArg::Unnamed(sql::FunctionArgExpr::Expr(sql::Expr::Value(v))) => {
+                        match v {
+                            sql::Value::SingleQuotedString(s) |
+                            sql::Value::DoubleQuotedString(s) => Some(s.clone()),
+                            _ => None,
+                        }
+                    }
+                    _ => None,
+                })
+                .ok_or_else(|| Error::InvalidArguments("glob() requires a pattern as first argument".to_string()))?;
+
+            let table_alias = alias.as_ref().map(|a| a.name.value.clone());
+
+            Ok(BoundTableRef::FileTableFunction {
+                path: pattern,
+                file_type: FileTableType::Glob,
+                alias: table_alias,
+                column_names: vec!["file".to_string()],
+                column_types: vec![LogicalType::Varchar],
+            })
+        }
+        "PARQUET_METADATA" | "QUERY_PARQUET" | "PARQUET_SCHEMA" => {
+            // parquet_metadata(path) - returns metadata about a parquet file
+            let path = args.first()
+                .and_then(|arg| match arg {
+                    sql::FunctionArg::Unnamed(sql::FunctionArgExpr::Expr(sql::Expr::Value(v))) => {
+                        match v {
+                            sql::Value::SingleQuotedString(s) |
+                            sql::Value::DoubleQuotedString(s) => Some(s.clone()),
+                            _ => None,
+                        }
+                    }
+                    _ => None,
+                })
+                .ok_or_else(|| Error::InvalidArguments("parquet_metadata() requires a file path as first argument".to_string()))?;
+
+            let table_alias = alias.as_ref().map(|a| a.name.value.clone());
+
+            Ok(BoundTableRef::FileTableFunction {
+                path,
+                file_type: FileTableType::ParquetMetadata,
+                alias: table_alias,
+                column_names: vec![
+                    "file_name".to_string(),
+                    "row_group_id".to_string(),
+                    "row_group_num_rows".to_string(),
+                    "row_group_bytes".to_string(),
+                    "column_id".to_string(),
+                    "column_name".to_string(),
+                    "column_type".to_string(),
+                ],
+                column_types: vec![
+                    LogicalType::Varchar,
+                    LogicalType::BigInt,
+                    LogicalType::BigInt,
+                    LogicalType::BigInt,
+                    LogicalType::BigInt,
+                    LogicalType::Varchar,
+                    LogicalType::Varchar,
+                ],
+            })
+        }
         _ => Err(Error::NotImplemented(format!("Table function: {}", func_name))),
     }
 }

@@ -2045,6 +2045,15 @@ impl Executor {
                     TableFunctionKind::ReadJson { path, column_names, .. } => {
                         read_json_file(path, column_names)
                     }
+                    TableFunctionKind::ReadJsonObjects { path } => {
+                        read_json_objects_file(path)
+                    }
+                    TableFunctionKind::Glob { pattern } => {
+                        glob_files(pattern)
+                    }
+                    TableFunctionKind::ParquetMetadata { path } => {
+                        read_parquet_metadata(path)
+                    }
                 }
             }
 
@@ -2418,6 +2427,9 @@ fn format_plan(op: &LogicalOperator, indent: usize) -> String {
                 TableFunctionKind::ReadCsv { path, .. } => return format!("{}TableFunction: read_csv('{}') -> {}", prefix, path, column_name),
                 TableFunctionKind::ReadParquet { path, .. } => return format!("{}TableFunction: read_parquet('{}') -> {}", prefix, path, column_name),
                 TableFunctionKind::ReadJson { path, .. } => return format!("{}TableFunction: read_json('{}') -> {}", prefix, path, column_name),
+                TableFunctionKind::ReadJsonObjects { path } => return format!("{}TableFunction: read_json_objects('{}') -> {}", prefix, path, column_name),
+                TableFunctionKind::Glob { pattern } => return format!("{}TableFunction: glob('{}') -> {}", prefix, pattern, column_name),
+                TableFunctionKind::ParquetMetadata { path } => return format!("{}TableFunction: parquet_metadata('{}') -> {}", prefix, path, column_name),
             };
             format!("{}TableFunction: {}() -> {}", prefix, func_name, column_name)
         }
@@ -4836,6 +4848,109 @@ fn json_value_to_ironduck_value(v: &serde_json::Value) -> Value {
             Value::Varchar(v.to_string())
         }
     }
+}
+
+/// Read JSON file returning each object as a single JSON string
+fn read_json_objects_file(path: &str) -> Result<Vec<Vec<Value>>> {
+    use std::fs::File;
+    use std::io::{BufRead, BufReader};
+
+    let file = File::open(path)
+        .map_err(|e| Error::Execution(format!("Failed to open JSON file '{}': {}", path, e)))?;
+
+    let reader = BufReader::new(file);
+    let mut all_rows = Vec::new();
+
+    for line in reader.lines() {
+        let line = line.map_err(|e| Error::Execution(format!("Failed to read JSON line: {}", e)))?;
+        let line = line.trim();
+
+        if line.is_empty() {
+            continue;
+        }
+
+        // Return the raw JSON string as a single column
+        all_rows.push(vec![Value::Varchar(line.to_string())]);
+    }
+
+    Ok(all_rows)
+}
+
+/// Return files matching a glob pattern
+fn glob_files(pattern: &str) -> Result<Vec<Vec<Value>>> {
+    use std::path::Path;
+
+    let mut all_rows = Vec::new();
+
+    // Simple glob implementation using walkdir
+    // For now, handle basic patterns like *.txt, **/*.rs
+    let base_path = Path::new(pattern);
+
+    if pattern.contains('*') {
+        // Use glob crate pattern matching
+        let entries = glob::glob(pattern)
+            .map_err(|e| Error::Execution(format!("Invalid glob pattern '{}': {}", pattern, e)))?;
+
+        for entry in entries {
+            match entry {
+                Ok(path) => {
+                    all_rows.push(vec![Value::Varchar(path.to_string_lossy().to_string())]);
+                }
+                Err(e) => {
+                    // Skip entries that can't be read
+                    eprintln!("Warning: glob error: {}", e);
+                }
+            }
+        }
+    } else {
+        // No wildcards - just check if file exists
+        if base_path.exists() {
+            all_rows.push(vec![Value::Varchar(pattern.to_string())]);
+        }
+    }
+
+    Ok(all_rows)
+}
+
+/// Read Parquet file metadata
+fn read_parquet_metadata(path: &str) -> Result<Vec<Vec<Value>>> {
+    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+    use std::fs::File;
+
+    let file = File::open(path)
+        .map_err(|e| Error::Execution(format!("Failed to open Parquet file '{}': {}", path, e)))?;
+
+    let reader = ParquetRecordBatchReaderBuilder::try_new(file)
+        .map_err(|e| Error::Execution(format!("Failed to read Parquet metadata: {}", e)))?;
+
+    let metadata = reader.metadata();
+    let schema = reader.schema();
+    let mut all_rows = Vec::new();
+
+    // For each row group
+    for rg_idx in 0..metadata.num_row_groups() {
+        let rg = metadata.row_group(rg_idx);
+        let num_rows = rg.num_rows();
+        let total_bytes = rg.total_byte_size();
+
+        // For each column in the row group
+        for (col_idx, field) in schema.fields().iter().enumerate() {
+            let col_name = field.name().to_string();
+            let col_type = format!("{:?}", field.data_type());
+
+            all_rows.push(vec![
+                Value::Varchar(path.to_string()),           // file_name
+                Value::BigInt(rg_idx as i64),               // row_group_id
+                Value::BigInt(num_rows),                    // row_group_num_rows
+                Value::BigInt(total_bytes),                 // row_group_bytes
+                Value::BigInt(col_idx as i64),              // column_id
+                Value::Varchar(col_name),                   // column_name
+                Value::Varchar(col_type),                   // column_type
+            ]);
+        }
+    }
+
+    Ok(all_rows)
 }
 
 /// Convert an Arrow array value at a given index to a Value

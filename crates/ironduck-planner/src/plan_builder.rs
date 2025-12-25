@@ -1204,6 +1204,33 @@ fn build_table_ref_plan(table_ref: &BoundTableRef) -> Result<LogicalOperator> {
                         output_type: ironduck_common::LogicalType::Unknown,
                     })
                 }
+                ironduck_binder::FileTableType::JsonObjects => {
+                    Ok(LogicalOperator::TableFunction {
+                        function: super::TableFunctionKind::ReadJsonObjects {
+                            path: path.clone(),
+                        },
+                        column_name: "json".to_string(),
+                        output_type: ironduck_common::LogicalType::Varchar,
+                    })
+                }
+                ironduck_binder::FileTableType::Glob => {
+                    Ok(LogicalOperator::TableFunction {
+                        function: super::TableFunctionKind::Glob {
+                            pattern: path.clone(),
+                        },
+                        column_name: "file".to_string(),
+                        output_type: ironduck_common::LogicalType::Varchar,
+                    })
+                }
+                ironduck_binder::FileTableType::ParquetMetadata => {
+                    Ok(LogicalOperator::TableFunction {
+                        function: super::TableFunctionKind::ParquetMetadata {
+                            path: path.clone(),
+                        },
+                        column_name: "metadata".to_string(),
+                        output_type: ironduck_common::LogicalType::Unknown,
+                    })
+                }
             }
         }
 

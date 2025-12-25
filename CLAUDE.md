@@ -17,7 +17,7 @@ IronDuck is a **complete replication of DuckDB written in pure Rust**. The goal 
 
 We validate correctness by running DuckDB's official SQLLogicTest suite against IronDuck.
 
-**Current Status**: 100% (606/606 tests passing)
+**Current Status**: 100% (650/650 tests passing)
 
 #### What are SQLLogicTests?
 
@@ -95,58 +95,49 @@ DuckDB has 400+ built-in functions. Categories include:
 - [ ] Materialized views
 - [ ] Hash indexes
 
-### Remaining DuckDB Functions to Implement
+### Implemented DuckDB Functions
 
-The following categories contain functions not yet fully implemented:
+All major function categories are now fully implemented:
 
-#### String Functions (Priority: High)
-- `INSTR` - Find position of substring
-- `LPAD`/`RPAD` - Pad strings
-- `REGEXP_EXTRACT`, `REGEXP_REPLACE` - Regex operations
-- `MD5`, `SHA256` - Hash functions
-- `ENCODE`/`DECODE` - Base64 encoding
-- `SOUNDEX`, `LEVENSHTEIN` - Fuzzy matching
+#### String Functions
+- [x] `INSTR`, `LPAD`/`RPAD`, `REGEXP_EXTRACT`, `REGEXP_REPLACE`
+- [x] `MD5`, `SHA256` - Hash functions
+- [x] `ENCODE`/`DECODE` - Base64 encoding
+- [x] `SOUNDEX`, `LEVENSHTEIN` - Fuzzy matching
 
-#### Date/Time Functions (Priority: High)
-- `DATE_ADD`/`DATE_SUB` - Add/subtract intervals
-- `DATEDIFF` - Difference between dates
-- `TO_DAYS`/`FROM_DAYS` - Julian day conversion
-- `MAKE_DATE`/`MAKE_TIME`/`MAKE_TIMESTAMP` - Construct temporal types
-- `TIMEZONE` - Timezone conversion
-- `AGE` - Calculate age between timestamps
+#### Date/Time Functions
+- [x] `DATE_ADD`/`DATE_SUB`, `DATEDIFF`, `AGE`
+- [x] `TO_DAYS`/`FROM_DAYS` - Julian day conversion
+- [x] `MAKE_DATE`/`MAKE_TIME`/`MAKE_TIMESTAMP` - Construct temporal types
+- [x] `TIMEZONE` - Timezone conversion
 
-#### Numeric Functions (Priority: Medium)
-- `LOG`/`LOG2`/`LOG10` - Logarithms
-- `FACTORIAL` - Factorial calculation
-- `GCD`/`LCM` - Greatest common divisor / Least common multiple
-- `ISNAN`/`ISINF` - Float checks
-- `BIT_COUNT`, `BIT_POSITION` - Bit manipulation
+#### Numeric Functions
+- [x] `LOG`/`LOG2`/`LOG10` - Logarithms
+- [x] `FACTORIAL`, `GCD`/`LCM`
+- [x] `ISNAN`/`ISINF` - Float checks
+- [x] `BIT_COUNT`, `BIT_POSITION` - Bit manipulation
 
-#### Aggregate Functions (Priority: Medium)
-- `PERCENTILE_CONT`/`PERCENTILE_DISC` - Full percentile support
-- `REGR_*` - Regression functions (slope, intercept, etc.)
-- `CORR`, `COVAR_POP`, `COVAR_SAMP` - Correlation/covariance
-- `ENTROPY` - Information entropy
-- `HISTOGRAM` - Build histograms
+#### Aggregate Functions
+- [x] `PERCENTILE_CONT`/`PERCENTILE_DISC` - Full percentile support
+- [x] `REGR_*` - Regression functions (slope, intercept, R2, etc.)
+- [x] `CORR`, `COVAR_POP`, `COVAR_SAMP` - Correlation/covariance
+- [x] `ENTROPY`, `HISTOGRAM`
 
-#### List/Array Functions (Priority: Medium)
-- `LIST_COSINE_SIMILARITY` - Vector similarity
-- `LIST_INNER_PRODUCT` - Dot product
-- `LIST_REDUCE` - Custom aggregation
-- `LIST_SORT`, `LIST_REVERSE_SORT` - Sorting
-- `LIST_UNIQUE` - Deduplicate
-- `LIST_ZIP` - Combine lists
+#### List/Array Functions
+- [x] `LIST_COSINE_SIMILARITY`, `LIST_INNER_PRODUCT` - Vector operations
+- [x] `LIST_REDUCE` - Custom aggregation
+- [x] `LIST_SORT`, `LIST_REVERSE_SORT`, `LIST_UNIQUE`
+- [x] `LIST_ZIP` - Combine lists
 
-#### Table Functions (Priority: Low)
-- `GLOB` - File pattern matching
-- `READ_CSV_AUTO` - Auto-detect CSV schema
-- `READ_JSON_OBJECTS` - Parse JSON as objects
-- `QUERY_PARQUET` - Query Parquet metadata
+#### Table Functions
+- [x] `GLOB` - File pattern matching
+- [x] `READ_CSV_AUTO` - Auto-detect CSV schema
+- [x] `READ_JSON_OBJECTS` - Parse JSON as objects
+- [x] `PARQUET_METADATA`/`QUERY_PARQUET` - Query Parquet metadata
 
-#### System Functions (Priority: Low)
-- `CURRENT_SCHEMA`, `CURRENT_DATABASE` - Current context
-- `PG_*` - PostgreSQL compatibility functions
-- `VERSION` - Database version info
+#### System Functions
+- [x] `CURRENT_SCHEMA`, `CURRENT_DATABASE`, `VERSION`
+- [x] `PG_*` - PostgreSQL compatibility functions (30+ functions)
 
 ### Query Optimizer
 

@@ -1054,6 +1054,151 @@ fn evaluate_function(name: &str, args: &[Value]) -> Result<Value> {
                 _ => Ok(Value::List(vec![])),
             }
         }
+        "LIST_REVERSE_SORT" | "ARRAY_REVERSE_SORT" => {
+            // Sort list in descending order
+            match args.first() {
+                Some(Value::List(list)) => {
+                    let mut result = list.clone();
+                    result.sort_by(|a, b| b.partial_cmp(a).unwrap_or(Ordering::Equal));
+                    Ok(Value::List(result))
+                }
+                Some(Value::Null) => Ok(Value::Null),
+                _ => Ok(Value::List(vec![])),
+            }
+        }
+        "LIST_COSINE_SIMILARITY" | "ARRAY_COSINE_SIMILARITY" => {
+            // Calculate cosine similarity between two numeric lists
+            // cosine_similarity(a, b) = dot(a, b) / (||a|| * ||b||)
+            match (args.first(), args.get(1)) {
+                (Some(Value::List(list1)), Some(Value::List(list2))) => {
+                    if list1.len() != list2.len() {
+                        return Ok(Value::Null);
+                    }
+
+                    let mut dot_product = 0.0f64;
+                    let mut norm1 = 0.0f64;
+                    let mut norm2 = 0.0f64;
+
+                    for (v1, v2) in list1.iter().zip(list2.iter()) {
+                        let f1 = v1.as_f64().unwrap_or(0.0);
+                        let f2 = v2.as_f64().unwrap_or(0.0);
+                        dot_product += f1 * f2;
+                        norm1 += f1 * f1;
+                        norm2 += f2 * f2;
+                    }
+
+                    let denominator = (norm1.sqrt() * norm2.sqrt());
+                    if denominator == 0.0 {
+                        Ok(Value::Null)
+                    } else {
+                        Ok(Value::Double(dot_product / denominator))
+                    }
+                }
+                (Some(Value::Null), _) | (_, Some(Value::Null)) => Ok(Value::Null),
+                _ => Ok(Value::Null),
+            }
+        }
+        "LIST_INNER_PRODUCT" | "ARRAY_INNER_PRODUCT" | "LIST_DOT" | "ARRAY_DOT" => {
+            // Calculate inner product (dot product) between two numeric lists
+            match (args.first(), args.get(1)) {
+                (Some(Value::List(list1)), Some(Value::List(list2))) => {
+                    if list1.len() != list2.len() {
+                        return Ok(Value::Null);
+                    }
+
+                    let mut dot_product = 0.0f64;
+                    for (v1, v2) in list1.iter().zip(list2.iter()) {
+                        let f1 = v1.as_f64().unwrap_or(0.0);
+                        let f2 = v2.as_f64().unwrap_or(0.0);
+                        dot_product += f1 * f2;
+                    }
+
+                    Ok(Value::Double(dot_product))
+                }
+                (Some(Value::Null), _) | (_, Some(Value::Null)) => Ok(Value::Null),
+                _ => Ok(Value::Null),
+            }
+        }
+        "LIST_ZIP" | "ARRAY_ZIP" => {
+            // Combine multiple lists into a list of lists (element-wise)
+            // LIST_ZIP([1, 2], ['a', 'b']) -> [[1, 'a'], [2, 'b']]
+            if args.is_empty() {
+                return Ok(Value::List(vec![]));
+            }
+
+            let lists: Vec<&Vec<Value>> = args.iter()
+                .filter_map(|v| match v {
+                    Value::List(l) => Some(l),
+                    _ => None,
+                })
+                .collect();
+
+            if lists.is_empty() {
+                return Ok(Value::Null);
+            }
+
+            let min_len = lists.iter().map(|l| l.len()).min().unwrap_or(0);
+            let mut result = Vec::new();
+
+            for i in 0..min_len {
+                let row: Vec<Value> = lists.iter()
+                    .map(|l| l[i].clone())
+                    .collect();
+                result.push(Value::List(row));
+            }
+
+            Ok(Value::List(result))
+        }
+        "LIST_REDUCE" | "ARRAY_REDUCE" => {
+            // Reduce list to a single value using a binary operation
+            // LIST_REDUCE([1, 2, 3], (a, b) -> a + b) - but since we don't have lambdas,
+            // we'll implement common operations: 'sum', 'product', 'min', 'max', 'concat'
+            match (args.first(), args.get(1)) {
+                (Some(Value::List(list)), Some(Value::Varchar(op))) => {
+                    if list.is_empty() {
+                        return Ok(Value::Null);
+                    }
+
+                    match op.to_uppercase().as_str() {
+                        "SUM" | "+" => {
+                            let sum: f64 = list.iter()
+                                .filter_map(|v| v.as_f64())
+                                .sum();
+                            Ok(Value::Double(sum))
+                        }
+                        "PRODUCT" | "*" => {
+                            let product: f64 = list.iter()
+                                .filter_map(|v| v.as_f64())
+                                .product();
+                            Ok(Value::Double(product))
+                        }
+                        "MIN" => {
+                            Ok(list.iter()
+                                .filter(|v| !v.is_null())
+                                .min_by(|a, b| a.partial_cmp(b).unwrap_or(Ordering::Equal))
+                                .cloned()
+                                .unwrap_or(Value::Null))
+                        }
+                        "MAX" => {
+                            Ok(list.iter()
+                                .filter(|v| !v.is_null())
+                                .max_by(|a, b| a.partial_cmp(b).unwrap_or(Ordering::Equal))
+                                .cloned()
+                                .unwrap_or(Value::Null))
+                        }
+                        "CONCAT" | "||" => {
+                            let result: String = list.iter()
+                                .map(|v| value_to_string(v))
+                                .collect();
+                            Ok(Value::Varchar(result))
+                        }
+                        _ => Ok(Value::Null),
+                    }
+                }
+                (Some(Value::Null), _) => Ok(Value::Null),
+                _ => Ok(Value::Null),
+            }
+        }
         "LIST_SUM" | "ARRAY_SUM" => {
             match args.first() {
                 Some(Value::List(list)) => {
@@ -1824,6 +1969,79 @@ fn evaluate_function(name: &str, args: &[Value]) -> Result<Value> {
             s.hash(&mut hasher);
             Ok(Value::BigInt(hasher.finish() as i64))
         }
+        "SHA256" | "SHA2" => {
+            // Simple SHA-256 implementation for string hashing
+            let s = value_to_string(args.first().unwrap_or(&Value::Null));
+            let bytes = s.as_bytes();
+
+            // SHA-256 constants
+            const K: [u32; 64] = [
+                0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+                0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+                0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+                0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+                0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+                0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+                0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+                0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
+            ];
+
+            let mut h: [u32; 8] = [
+                0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a,
+                0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19,
+            ];
+
+            // Padding
+            let bit_len = (bytes.len() as u64) * 8;
+            let mut padded = bytes.to_vec();
+            padded.push(0x80);
+            while (padded.len() % 64) != 56 {
+                padded.push(0);
+            }
+            padded.extend_from_slice(&bit_len.to_be_bytes());
+
+            // Process each 512-bit chunk
+            for chunk in padded.chunks(64) {
+                let mut w = [0u32; 64];
+                for (i, c) in chunk.chunks(4).enumerate() {
+                    w[i] = u32::from_be_bytes([c[0], c[1], c[2], c[3]]);
+                }
+                for i in 16..64 {
+                    let s0 = w[i-15].rotate_right(7) ^ w[i-15].rotate_right(18) ^ (w[i-15] >> 3);
+                    let s1 = w[i-2].rotate_right(17) ^ w[i-2].rotate_right(19) ^ (w[i-2] >> 10);
+                    w[i] = w[i-16].wrapping_add(s0).wrapping_add(w[i-7]).wrapping_add(s1);
+                }
+
+                let (mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut hh) =
+                    (h[0], h[1], h[2], h[3], h[4], h[5], h[6], h[7]);
+
+                for i in 0..64 {
+                    let s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
+                    let ch = (e & f) ^ ((!e) & g);
+                    let temp1 = hh.wrapping_add(s1).wrapping_add(ch).wrapping_add(K[i]).wrapping_add(w[i]);
+                    let s0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
+                    let maj = (a & b) ^ (a & c) ^ (b & c);
+                    let temp2 = s0.wrapping_add(maj);
+
+                    hh = g; g = f; f = e;
+                    e = d.wrapping_add(temp1);
+                    d = c; c = b; b = a;
+                    a = temp1.wrapping_add(temp2);
+                }
+
+                h[0] = h[0].wrapping_add(a); h[1] = h[1].wrapping_add(b);
+                h[2] = h[2].wrapping_add(c); h[3] = h[3].wrapping_add(d);
+                h[4] = h[4].wrapping_add(e); h[5] = h[5].wrapping_add(f);
+                h[6] = h[6].wrapping_add(g); h[7] = h[7].wrapping_add(hh);
+            }
+
+            // Convert to hex string
+            let hash = format!(
+                "{:08x}{:08x}{:08x}{:08x}{:08x}{:08x}{:08x}{:08x}",
+                h[0], h[1], h[2], h[3], h[4], h[5], h[6], h[7]
+            );
+            Ok(Value::Varchar(hash))
+        }
 
         // Bit manipulation functions
         "BIT_COUNT" => {
@@ -1896,6 +2114,16 @@ fn evaluate_function(name: &str, args: &[Value]) -> Result<Value> {
             let width = args.get(1).and_then(|v| v.as_i64()).unwrap_or(64) as usize;
             let binary = format!("{:0>width$b}", val.abs(), width = width.min(64));
             Ok(Value::Varchar(binary))
+        }
+        "BIT_POSITION" => {
+            // Find the position of the first set bit (1-indexed from right, 0 if no bit set)
+            let val = args.first().and_then(|v| v.as_i64()).unwrap_or(0);
+            if val == 0 {
+                Ok(Value::Integer(0))
+            } else {
+                // Find position of lowest set bit (1-indexed)
+                Ok(Value::Integer((val.trailing_zeros() + 1) as i32))
+            }
         }
 
         // Format function
@@ -2480,6 +2708,101 @@ fn evaluate_function(name: &str, args: &[Value]) -> Result<Value> {
             };
             Ok(Value::Varchar(type_name.to_string()))
         }
+        "PG_COLUMN_SIZE" | "PG_RELATION_SIZE" | "PG_TABLE_SIZE" | "PG_TOTAL_RELATION_SIZE" => {
+            // PostgreSQL compatibility - return approximate size in bytes
+            match args.first() {
+                Some(Value::Varchar(s)) => Ok(Value::BigInt(s.len() as i64)),
+                Some(Value::List(l)) => {
+                    let size: i64 = l.iter().map(|v| {
+                        match v {
+                            Value::Varchar(s) => s.len() as i64,
+                            Value::BigInt(_) | Value::Integer(_) => 8,
+                            Value::Double(_) | Value::Float(_) => 8,
+                            Value::Boolean(_) => 1,
+                            _ => 8,
+                        }
+                    }).sum();
+                    Ok(Value::BigInt(size))
+                }
+                Some(v) => {
+                    // Estimate size based on type
+                    let size = match v {
+                        Value::Null => 0,
+                        Value::Boolean(_) => 1,
+                        Value::TinyInt(_) => 1,
+                        Value::SmallInt(_) => 2,
+                        Value::Integer(_) => 4,
+                        Value::BigInt(_) => 8,
+                        Value::Float(_) => 4,
+                        Value::Double(_) => 8,
+                        Value::Varchar(s) => s.len() as i64,
+                        _ => 8,
+                    };
+                    Ok(Value::BigInt(size))
+                }
+                None => Ok(Value::BigInt(0)),
+            }
+        }
+        "PG_DATABASE_SIZE" => {
+            // Return a placeholder database size
+            Ok(Value::BigInt(0))
+        }
+        "PG_TABLESPACE_SIZE" => {
+            // Return a placeholder tablespace size
+            Ok(Value::BigInt(0))
+        }
+        "PG_INDEXES_SIZE" => {
+            // Return a placeholder indexes size
+            Ok(Value::BigInt(0))
+        }
+        "PG_GET_EXPR" => {
+            // Return expression text - simplified
+            Ok(args.first().cloned().unwrap_or(Value::Null))
+        }
+        "PG_GET_CONSTRAINTDEF" | "PG_GET_INDEXDEF" | "PG_GET_VIEWDEF" | "PG_GET_TRIGGERDEF" => {
+            // Return definition text - placeholder
+            Ok(Value::Varchar("".to_string()))
+        }
+        "PG_RELATION_FILEPATH" => {
+            // Return file path for a relation - placeholder
+            Ok(Value::Varchar("".to_string()))
+        }
+        "PG_BACKEND_PID" => {
+            // Return current process ID
+            Ok(Value::Integer(std::process::id() as i32))
+        }
+        "PG_CURRENT_XACT_ID" | "PG_CURRENT_SNAPSHOT" => {
+            // Transaction ID placeholder
+            Ok(Value::BigInt(1))
+        }
+        "PG_IS_IN_RECOVERY" | "PG_IS_WAL_REPLAY_PAUSED" => {
+            // Recovery status - always false for IronDuck
+            Ok(Value::Boolean(false))
+        }
+        "PG_POSTMASTER_START_TIME" | "PG_CONF_LOAD_TIME" => {
+            // Return current timestamp as placeholder
+            use chrono::Local;
+            Ok(Value::Timestamp(Local::now().naive_local()))
+        }
+        "PG_STAT_GET_NUMSCANS" | "PG_STAT_GET_TUPLES_RETURNED" | "PG_STAT_GET_TUPLES_FETCHED" |
+        "PG_STAT_GET_TUPLES_INSERTED" | "PG_STAT_GET_TUPLES_UPDATED" | "PG_STAT_GET_TUPLES_DELETED" => {
+            // Statistics placeholders
+            Ok(Value::BigInt(0))
+        }
+        "PG_HAS_ROLE" | "PG_HAS_TABLE_PRIVILEGE" | "PG_HAS_COLUMN_PRIVILEGE" |
+        "PG_HAS_DATABASE_PRIVILEGE" | "PG_HAS_SCHEMA_PRIVILEGE" | "PG_HAS_TABLESPACE_PRIVILEGE" => {
+            // Privilege check - always true for IronDuck
+            Ok(Value::Boolean(true))
+        }
+        "PG_CLIENT_ENCODING" => {
+            Ok(Value::Varchar("UTF8".to_string()))
+        }
+        "PG_ENCODING_TO_CHAR" => {
+            Ok(Value::Varchar("UTF8".to_string()))
+        }
+        "PG_CHAR_TO_ENCODING" => {
+            Ok(Value::Integer(6)) // UTF8 encoding
+        }
 
         // Date/Time functions
         "NOW" | "CURRENT_TIMESTAMP" => {
@@ -2826,6 +3149,90 @@ fn evaluate_function(name: &str, args: &[Value]) -> Result<Value> {
 
             match (NaiveDate::from_ymd_opt(year, month, day), NaiveTime::from_hms_opt(hour, minute, second)) {
                 (Some(d), Some(t)) => Ok(Value::Timestamp(NaiveDateTime::new(d, t))),
+                _ => Ok(Value::Null),
+            }
+        }
+        "MAKE_TIME" => {
+            use chrono::NaiveTime;
+            let hour = args.first().and_then(|v| v.as_i64()).unwrap_or(0) as u32;
+            let minute = args.get(1).and_then(|v| v.as_i64()).unwrap_or(0) as u32;
+            let second = args.get(2).and_then(|v| v.as_i64()).unwrap_or(0) as u32;
+
+            match NaiveTime::from_hms_opt(hour, minute, second) {
+                Some(t) => Ok(Value::Time(t)),
+                None => Ok(Value::Null),
+            }
+        }
+        "TO_DAYS" => {
+            // Convert date to number of days since year 0 (Julian day number style)
+            // DuckDB: Returns the number of days since year 0
+            use chrono::Datelike;
+            match args.first() {
+                Some(Value::Date(d)) => {
+                    // Days from year 1 to this date
+                    // Simplified calculation: days from epoch + epoch offset
+                    let epoch = chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
+                    let days_from_epoch = (*d - epoch).num_days();
+                    // Days from year 0 to epoch (approximately 719528)
+                    let epoch_days = 719528i64;
+                    Ok(Value::BigInt(epoch_days + days_from_epoch))
+                }
+                Some(Value::Timestamp(dt)) => {
+                    let epoch = chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
+                    let days_from_epoch = (dt.date() - epoch).num_days();
+                    let epoch_days = 719528i64;
+                    Ok(Value::BigInt(epoch_days + days_from_epoch))
+                }
+                Some(Value::Null) => Ok(Value::Null),
+                _ => Ok(Value::Null),
+            }
+        }
+        "FROM_DAYS" => {
+            // Convert number of days since year 0 to date
+            let days = args.first().and_then(|v| v.as_i64()).unwrap_or(0);
+            // Days from year 0 to epoch
+            let epoch_days = 719528i64;
+            let days_from_epoch = days - epoch_days;
+            let epoch = chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
+            match epoch.checked_add_signed(chrono::Duration::days(days_from_epoch)) {
+                Some(d) => Ok(Value::Date(d)),
+                None => Ok(Value::Null),
+            }
+        }
+        "TIMEZONE" | "AT_TIMEZONE" => {
+            // Convert timestamp to a different timezone
+            // TIMEZONE(timezone, timestamp) or timestamp AT TIME ZONE 'timezone'
+            // For simplicity, we handle common timezone offsets
+            use chrono::{Duration, Timelike};
+            let tz_str = args.first().and_then(|v| v.as_str()).unwrap_or("UTC");
+            let ts = args.get(1).unwrap_or(&Value::Null);
+
+            // Parse timezone offset (e.g., "+05:00", "-08:00", "UTC", "GMT")
+            let offset_hours: i64 = if tz_str.eq_ignore_ascii_case("UTC") || tz_str.eq_ignore_ascii_case("GMT") {
+                0
+            } else if tz_str.starts_with('+') || tz_str.starts_with('-') {
+                // Parse offset like "+05:00" or "-08:00"
+                let sign = if tz_str.starts_with('-') { -1 } else { 1 };
+                let parts: Vec<&str> = tz_str[1..].split(':').collect();
+                let hours = parts.first().and_then(|s| s.parse::<i64>().ok()).unwrap_or(0);
+                let minutes = parts.get(1).and_then(|s| s.parse::<i64>().ok()).unwrap_or(0);
+                sign * (hours * 60 + minutes) / 60
+            } else {
+                // Common timezone abbreviations
+                match tz_str.to_uppercase().as_str() {
+                    "EST" => -5, "EDT" => -4, "CST" => -6, "CDT" => -5,
+                    "MST" => -7, "MDT" => -6, "PST" => -8, "PDT" => -7,
+                    "CET" => 1, "CEST" => 2, "JST" => 9, "IST" => 5,
+                    _ => 0,
+                }
+            };
+
+            match ts {
+                Value::Timestamp(dt) => {
+                    let adjusted = *dt + Duration::hours(offset_hours);
+                    Ok(Value::Timestamp(adjusted))
+                }
+                Value::Null => Ok(Value::Null),
                 _ => Ok(Value::Null),
             }
         }
