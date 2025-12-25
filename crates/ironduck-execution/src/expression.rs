@@ -1832,7 +1832,7 @@ fn evaluate_function(name: &str, args: &[Value]) -> Result<Value> {
             match val {
                 Value::Float(f) => Ok(Value::Float(f.ceil())),
                 Value::Double(f) => Ok(Value::Double(f.ceil())),
-                Value::Integer(_) | Value::BigInt(_) => Ok(val.clone()),
+                Value::TinyInt(_) | Value::SmallInt(_) | Value::Integer(_) | Value::BigInt(_) => Ok(val.clone()),
                 Value::Null => Ok(Value::Null),
                 _ => Err(Error::TypeMismatch {
                     expected: "numeric".to_string(),
@@ -1845,7 +1845,7 @@ fn evaluate_function(name: &str, args: &[Value]) -> Result<Value> {
             match val {
                 Value::Float(f) => Ok(Value::Float(f.floor())),
                 Value::Double(f) => Ok(Value::Double(f.floor())),
-                Value::Integer(_) | Value::BigInt(_) => Ok(val.clone()),
+                Value::TinyInt(_) | Value::SmallInt(_) | Value::Integer(_) | Value::BigInt(_) => Ok(val.clone()),
                 Value::Null => Ok(Value::Null),
                 _ => Err(Error::TypeMismatch {
                     expected: "numeric".to_string(),
@@ -1861,7 +1861,7 @@ fn evaluate_function(name: &str, args: &[Value]) -> Result<Value> {
             match val {
                 Value::Float(f) => Ok(Value::Float((f * factor as f32).round() / factor as f32)),
                 Value::Double(f) => Ok(Value::Double((f * factor).round() / factor)),
-                Value::Integer(_) | Value::BigInt(_) => Ok(val.clone()),
+                Value::TinyInt(_) | Value::SmallInt(_) | Value::Integer(_) | Value::BigInt(_) => Ok(val.clone()),
                 Value::Null => Ok(Value::Null),
                 _ => Err(Error::TypeMismatch {
                     expected: "numeric".to_string(),
