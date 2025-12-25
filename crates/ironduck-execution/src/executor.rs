@@ -3288,9 +3288,11 @@ fn compute_aggregate(
 
         StringAgg => {
             // STRING_AGG(expr, delimiter) or GROUP_CONCAT(expr)
+            // If delimiter is NULL, return NULL
             let delimiter = if args.len() > 1 {
                 match evaluate(&args[1], &[])? {
                     Value::Varchar(s) => s,
+                    Value::Null => return Ok(Value::Null),
                     _ => ",".to_string(),
                 }
             } else {
