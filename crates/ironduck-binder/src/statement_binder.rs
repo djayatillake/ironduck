@@ -472,10 +472,13 @@ fn bind_query(binder: &Binder, query: &sql::Query) -> Result<BoundStatement> {
                 let ctx = ExpressionBinderContext::new(from_clause);
                 for order in &ob.exprs {
                     let expr = bind_expression(binder, &order.expr, &ctx)?;
+                    // DuckDB defaults to NULLS FIRST for ascending, NULLS LAST for descending
+                    let ascending = order.asc.unwrap_or(true);
+                    let nulls_first = order.nulls_first.unwrap_or(ascending);
                     order_by.push(BoundOrderBy {
                         expr,
-                        ascending: order.asc.unwrap_or(true),
-                        nulls_first: order.nulls_first.unwrap_or(false),
+                        ascending,
+                        nulls_first,
                     });
                 }
             }
@@ -882,10 +885,13 @@ fn bind_query_select_with_ctes(
         let ctx = ExpressionBinderContext::new(&result.from);
         for order in &order_by.exprs {
             let expr = bind_expression(binder, &order.expr, &ctx)?;
+            // DuckDB defaults to NULLS FIRST for ascending, NULLS LAST for descending
+            let ascending = order.asc.unwrap_or(true);
+            let nulls_first = order.nulls_first.unwrap_or(ascending);
             result.order_by.push(BoundOrderBy {
                 expr,
-                ascending: order.asc.unwrap_or(true),
-                nulls_first: order.nulls_first.unwrap_or(false),
+                ascending,
+                nulls_first,
             });
         }
     }
@@ -925,10 +931,13 @@ fn bind_query_select_with_outer(
         let ctx = ExpressionBinderContext::with_outer_tables(&result.from, outer_tables);
         for order in &order_by.exprs {
             let expr = bind_expression(binder, &order.expr, &ctx)?;
+            // DuckDB defaults to NULLS FIRST for ascending, NULLS LAST for descending
+            let ascending = order.asc.unwrap_or(true);
+            let nulls_first = order.nulls_first.unwrap_or(ascending);
             result.order_by.push(BoundOrderBy {
                 expr,
-                ascending: order.asc.unwrap_or(true),
-                nulls_first: order.nulls_first.unwrap_or(false),
+                ascending,
+                nulls_first,
             });
         }
     }
