@@ -693,7 +693,11 @@ fn evaluate_function(name: &str, args: &[Value]) -> Result<Value> {
         }
         "UNICODE" => {
             // Return Unicode code point of first character
-            let s = args.first().and_then(|v| v.as_str()).unwrap_or("");
+            let s = match args.first() {
+                Some(Value::Null) => return Ok(Value::Null),
+                Some(v) => v.as_str().unwrap_or(""),
+                None => "",
+            };
             if s.is_empty() {
                 Ok(Value::Null)
             } else {
@@ -702,7 +706,11 @@ fn evaluate_function(name: &str, args: &[Value]) -> Result<Value> {
         }
         "STRIP_ACCENTS" => {
             // Remove accents from characters (simplified version)
-            let s = args.first().and_then(|v| v.as_str()).unwrap_or("");
+            let s = match args.first() {
+                Some(Value::Null) => return Ok(Value::Null),
+                Some(v) => v.as_str().unwrap_or(""),
+                None => "",
+            };
             let result: String = s.chars().map(|c| {
                 match c {
                     'á' | 'à' | 'â' | 'ä' | 'ã' | 'å' => 'a',
