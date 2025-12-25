@@ -538,7 +538,7 @@ fn evaluate_function(name: &str, args: &[Value]) -> Result<Value> {
             };
             Ok(Value::Varchar(s.to_uppercase()))
         }
-        "LENGTH" | "CHAR_LENGTH" => {
+        "LENGTH" | "CHAR_LENGTH" | "CHARACTER_LENGTH" => {
             let s = match args.first() {
                 Some(Value::Null) => return Ok(Value::Null),
                 Some(v) => v.as_str().unwrap_or(""),
