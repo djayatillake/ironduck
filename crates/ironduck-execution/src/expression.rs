@@ -521,29 +521,53 @@ fn evaluate_unary_op(op: UnaryOperator, val: &Value) -> Result<Value> {
 /// Evaluate a function call
 fn evaluate_function(name: &str, args: &[Value]) -> Result<Value> {
     match name.to_uppercase().as_str() {
-        // String functions
+        // String functions - all return NULL if input is NULL
         "LOWER" | "LCASE" => {
-            let s = args.first().and_then(|v| v.as_str()).unwrap_or("");
+            let s = match args.first() {
+                Some(Value::Null) => return Ok(Value::Null),
+                Some(v) => v.as_str().unwrap_or(""),
+                None => "",
+            };
             Ok(Value::Varchar(s.to_lowercase()))
         }
         "UPPER" | "UCASE" => {
-            let s = args.first().and_then(|v| v.as_str()).unwrap_or("");
+            let s = match args.first() {
+                Some(Value::Null) => return Ok(Value::Null),
+                Some(v) => v.as_str().unwrap_or(""),
+                None => "",
+            };
             Ok(Value::Varchar(s.to_uppercase()))
         }
         "LENGTH" | "CHAR_LENGTH" => {
-            let s = args.first().and_then(|v| v.as_str()).unwrap_or("");
+            let s = match args.first() {
+                Some(Value::Null) => return Ok(Value::Null),
+                Some(v) => v.as_str().unwrap_or(""),
+                None => "",
+            };
             Ok(Value::BigInt(s.chars().count() as i64))
         }
         "TRIM" => {
-            let s = args.first().and_then(|v| v.as_str()).unwrap_or("");
+            let s = match args.first() {
+                Some(Value::Null) => return Ok(Value::Null),
+                Some(v) => v.as_str().unwrap_or(""),
+                None => "",
+            };
             Ok(Value::Varchar(s.trim().to_string()))
         }
         "LTRIM" => {
-            let s = args.first().and_then(|v| v.as_str()).unwrap_or("");
+            let s = match args.first() {
+                Some(Value::Null) => return Ok(Value::Null),
+                Some(v) => v.as_str().unwrap_or(""),
+                None => "",
+            };
             Ok(Value::Varchar(s.trim_start().to_string()))
         }
         "RTRIM" => {
-            let s = args.first().and_then(|v| v.as_str()).unwrap_or("");
+            let s = match args.first() {
+                Some(Value::Null) => return Ok(Value::Null),
+                Some(v) => v.as_str().unwrap_or(""),
+                None => "",
+            };
             Ok(Value::Varchar(s.trim_end().to_string()))
         }
         "CONCAT" => {
@@ -565,9 +589,22 @@ fn evaluate_function(name: &str, args: &[Value]) -> Result<Value> {
             Ok(Value::Varchar(parts.join(&separator)))
         }
         "SUBSTRING" | "SUBSTR" => {
-            let s = args.first().and_then(|v| v.as_str()).unwrap_or("");
-            let start = args.get(1).and_then(|v| v.as_i64()).unwrap_or(1) as usize;
-            let len = args.get(2).and_then(|v| v.as_i64());
+            // Return NULL if string is NULL
+            let s = match args.first() {
+                Some(Value::Null) => return Ok(Value::Null),
+                Some(v) => v.as_str().unwrap_or(""),
+                None => "",
+            };
+            let start = match args.get(1) {
+                Some(Value::Null) => return Ok(Value::Null),
+                Some(v) => v.as_i64().unwrap_or(1) as usize,
+                None => 1,
+            };
+            let len = match args.get(2) {
+                Some(Value::Null) => return Ok(Value::Null),
+                Some(v) => v.as_i64(),
+                None => None,
+            };
 
             let start_idx = start.saturating_sub(1); // SQL is 1-indexed
             let chars: Vec<char> = s.chars().collect();
@@ -579,26 +616,61 @@ fn evaluate_function(name: &str, args: &[Value]) -> Result<Value> {
             Ok(Value::Varchar(result))
         }
         "REPLACE" => {
-            let s = args.first().and_then(|v| v.as_str()).unwrap_or("");
-            let from = args.get(1).and_then(|v| v.as_str()).unwrap_or("");
-            let to = args.get(2).and_then(|v| v.as_str()).unwrap_or("");
+            // Return NULL if any argument is NULL
+            let s = match args.first() {
+                Some(Value::Null) => return Ok(Value::Null),
+                Some(v) => v.as_str().unwrap_or(""),
+                None => "",
+            };
+            let from = match args.get(1) {
+                Some(Value::Null) => return Ok(Value::Null),
+                Some(v) => v.as_str().unwrap_or(""),
+                None => "",
+            };
+            let to = match args.get(2) {
+                Some(Value::Null) => return Ok(Value::Null),
+                Some(v) => v.as_str().unwrap_or(""),
+                None => "",
+            };
             Ok(Value::Varchar(s.replace(from, to)))
         }
         "LEFT" => {
-            let s = args.first().and_then(|v| v.as_str()).unwrap_or("");
-            let n = args.get(1).and_then(|v| v.as_i64()).unwrap_or(0) as usize;
+            // Return NULL if any argument is NULL
+            let s = match args.first() {
+                Some(Value::Null) => return Ok(Value::Null),
+                Some(v) => v.as_str().unwrap_or(""),
+                None => "",
+            };
+            let n = match args.get(1) {
+                Some(Value::Null) => return Ok(Value::Null),
+                Some(v) => v.as_i64().unwrap_or(0) as usize,
+                None => 0,
+            };
             Ok(Value::Varchar(s.chars().take(n).collect()))
         }
         "RIGHT" => {
-            let s = args.first().and_then(|v| v.as_str()).unwrap_or("");
-            let n = args.get(1).and_then(|v| v.as_i64()).unwrap_or(0) as usize;
+            // Return NULL if any argument is NULL
+            let s = match args.first() {
+                Some(Value::Null) => return Ok(Value::Null),
+                Some(v) => v.as_str().unwrap_or(""),
+                None => "",
+            };
+            let n = match args.get(1) {
+                Some(Value::Null) => return Ok(Value::Null),
+                Some(v) => v.as_i64().unwrap_or(0) as usize,
+                None => 0,
+            };
             let chars: Vec<char> = s.chars().collect();
             let start = chars.len().saturating_sub(n);
             Ok(Value::Varchar(chars.into_iter().skip(start).collect()))
         }
         "ASCII" | "ORD" => {
-            // Return the ASCII code of the first character
-            let s = args.first().and_then(|v| v.as_str()).unwrap_or("");
+            // Return NULL if argument is NULL
+            let s = match args.first() {
+                Some(Value::Null) => return Ok(Value::Null),
+                Some(v) => v.as_str().unwrap_or(""),
+                None => "",
+            };
             if s.is_empty() {
                 Ok(Value::Null)
             } else {
@@ -670,13 +742,31 @@ fn evaluate_function(name: &str, args: &[Value]) -> Result<Value> {
             Ok(Value::Varchar(bar))
         }
         "REVERSE" => {
-            let s = args.first().and_then(|v| v.as_str()).unwrap_or("");
+            // Return NULL if argument is NULL
+            let s = match args.first() {
+                Some(Value::Null) => return Ok(Value::Null),
+                Some(v) => v.as_str().unwrap_or(""),
+                None => "",
+            };
             Ok(Value::Varchar(s.chars().rev().collect()))
         }
         "TRANSLATE" => {
-            let s = args.first().and_then(|v| v.as_str()).unwrap_or("");
-            let from_chars = args.get(1).and_then(|v| v.as_str()).unwrap_or("");
-            let to_chars = args.get(2).and_then(|v| v.as_str()).unwrap_or("");
+            // Return NULL if any argument is NULL
+            let s = match args.first() {
+                Some(Value::Null) => return Ok(Value::Null),
+                Some(v) => v.as_str().unwrap_or(""),
+                None => "",
+            };
+            let from_chars = match args.get(1) {
+                Some(Value::Null) => return Ok(Value::Null),
+                Some(v) => v.as_str().unwrap_or(""),
+                None => "",
+            };
+            let to_chars = match args.get(2) {
+                Some(Value::Null) => return Ok(Value::Null),
+                Some(v) => v.as_str().unwrap_or(""),
+                None => "",
+            };
             let from: Vec<char> = from_chars.chars().collect();
             let to: Vec<char> = to_chars.chars().collect();
             let result: String = s.chars().filter_map(|c| {
@@ -914,25 +1004,56 @@ fn evaluate_function(name: &str, args: &[Value]) -> Result<Value> {
 
         // Regular expression functions
         "REGEXP_MATCHES" | "REGEXP_LIKE" | "REGEXP" => {
-            let s = args.first().and_then(|v| v.as_str()).unwrap_or("");
-            let pattern = args.get(1).and_then(|v| v.as_str()).unwrap_or("");
+            // Return NULL if either argument is NULL
+            let s = match args.first() {
+                Some(Value::Null) => return Ok(Value::Null),
+                Some(v) => v.as_str().unwrap_or(""),
+                None => "",
+            };
+            let pattern = match args.get(1) {
+                Some(Value::Null) => return Ok(Value::Null),
+                Some(v) => v.as_str().unwrap_or(""),
+                None => "",
+            };
             match regex::Regex::new(pattern) {
                 Ok(re) => Ok(Value::Boolean(re.is_match(s))),
                 Err(_) => Ok(Value::Boolean(false)),
             }
         }
         "REGEXP_REPLACE" => {
-            let s = args.first().and_then(|v| v.as_str()).unwrap_or("");
-            let pattern = args.get(1).and_then(|v| v.as_str()).unwrap_or("");
-            let replacement = args.get(2).and_then(|v| v.as_str()).unwrap_or("");
+            // Return NULL if any argument is NULL
+            let s = match args.first() {
+                Some(Value::Null) => return Ok(Value::Null),
+                Some(v) => v.as_str().unwrap_or(""),
+                None => "",
+            };
+            let pattern = match args.get(1) {
+                Some(Value::Null) => return Ok(Value::Null),
+                Some(v) => v.as_str().unwrap_or(""),
+                None => "",
+            };
+            let replacement = match args.get(2) {
+                Some(Value::Null) => return Ok(Value::Null),
+                Some(v) => v.as_str().unwrap_or(""),
+                None => "",
+            };
             match regex::Regex::new(pattern) {
                 Ok(re) => Ok(Value::Varchar(re.replace_all(s, replacement).to_string())),
                 Err(_) => Ok(Value::Varchar(s.to_string())),
             }
         }
         "REGEXP_EXTRACT" | "REGEXP_SUBSTR" => {
-            let s = args.first().and_then(|v| v.as_str()).unwrap_or("");
-            let pattern = args.get(1).and_then(|v| v.as_str()).unwrap_or("");
+            // Return NULL if string or pattern is NULL
+            let s = match args.first() {
+                Some(Value::Null) => return Ok(Value::Null),
+                Some(v) => v.as_str().unwrap_or(""),
+                None => "",
+            };
+            let pattern = match args.get(1) {
+                Some(Value::Null) => return Ok(Value::Null),
+                Some(v) => v.as_str().unwrap_or(""),
+                None => "",
+            };
             let group_idx = args.get(2).and_then(|v| v.as_i64()).unwrap_or(0) as usize;
             match regex::Regex::new(pattern) {
                 Ok(re) => {
