@@ -828,7 +828,12 @@ fn evaluate_function(name: &str, args: &[Value]) -> Result<Value> {
             Ok(Value::List(parts))
         }
         "INITCAP" => {
-            let s = args.first().and_then(|v| v.as_str()).unwrap_or("");
+            // Return NULL if argument is NULL
+            let s = match args.first() {
+                Some(Value::Null) => return Ok(Value::Null),
+                Some(v) => v.as_str().unwrap_or(""),
+                None => "",
+            };
             let result: String = s.split_whitespace()
                 .map(|word| {
                     let mut chars: Vec<char> = word.chars().collect();
@@ -845,18 +850,45 @@ fn evaluate_function(name: &str, args: &[Value]) -> Result<Value> {
             Ok(Value::Varchar(result))
         }
         "STARTS_WITH" | "PREFIX" => {
-            let s = args.first().and_then(|v| v.as_str()).unwrap_or("");
-            let prefix = args.get(1).and_then(|v| v.as_str()).unwrap_or("");
+            // Return NULL if either argument is NULL
+            let s = match args.first() {
+                Some(Value::Null) => return Ok(Value::Null),
+                Some(v) => v.as_str().unwrap_or(""),
+                None => "",
+            };
+            let prefix = match args.get(1) {
+                Some(Value::Null) => return Ok(Value::Null),
+                Some(v) => v.as_str().unwrap_or(""),
+                None => "",
+            };
             Ok(Value::Boolean(s.starts_with(prefix)))
         }
         "ENDS_WITH" | "SUFFIX" => {
-            let s = args.first().and_then(|v| v.as_str()).unwrap_or("");
-            let suffix = args.get(1).and_then(|v| v.as_str()).unwrap_or("");
+            // Return NULL if either argument is NULL
+            let s = match args.first() {
+                Some(Value::Null) => return Ok(Value::Null),
+                Some(v) => v.as_str().unwrap_or(""),
+                None => "",
+            };
+            let suffix = match args.get(1) {
+                Some(Value::Null) => return Ok(Value::Null),
+                Some(v) => v.as_str().unwrap_or(""),
+                None => "",
+            };
             Ok(Value::Boolean(s.ends_with(suffix)))
         }
         "CONTAINS" => {
-            let s = args.first().and_then(|v| v.as_str()).unwrap_or("");
-            let needle = args.get(1).and_then(|v| v.as_str()).unwrap_or("");
+            // Return NULL if either argument is NULL
+            let s = match args.first() {
+                Some(Value::Null) => return Ok(Value::Null),
+                Some(v) => v.as_str().unwrap_or(""),
+                None => "",
+            };
+            let needle = match args.get(1) {
+                Some(Value::Null) => return Ok(Value::Null),
+                Some(v) => v.as_str().unwrap_or(""),
+                None => "",
+            };
             Ok(Value::Boolean(s.contains(needle)))
         }
         "FORMAT" | "PRINTF" => {
@@ -2905,11 +2937,16 @@ fn evaluate_function(name: &str, args: &[Value]) -> Result<Value> {
             Ok(Value::Date(today))
         }
         "DATE_PART" | "EXTRACT" => {
-            use chrono::{Datelike, Timelike};
-            let part = args.first().and_then(|v| v.as_str()).unwrap_or("").to_uppercase();
+            use chrono::{Datelike, Timelike, NaiveDate, NaiveDateTime};
+            // Return NULL if part is NULL
+            let part = match args.first() {
+                Some(Value::Null) => return Ok(Value::Null),
+                Some(v) => v.as_str().unwrap_or("").to_uppercase(),
+                None => "".to_string(),
+            };
             let ts = args.get(1).unwrap_or(&Value::Null);
 
-            // Extract datetime components
+            // Extract datetime components - also handle VARCHAR by parsing
             let (year, month, day, hour, minute, second, day_of_week, day_of_year) = match ts {
                 Value::Timestamp(dt) => (
                     dt.year() as i64,
@@ -2939,6 +2976,35 @@ fn evaluate_function(name: &str, args: &[Value]) -> Result<Value> {
                     d.weekday().num_days_from_sunday() as i64,
                     d.ordinal() as i64,
                 ),
+                Value::Varchar(s) => {
+                    // Try to parse as date or timestamp
+                    if let Ok(d) = NaiveDate::parse_from_str(s, "%Y-%m-%d") {
+                        (
+                            d.year() as i64,
+                            d.month() as i64,
+                            d.day() as i64,
+                            0, 0, 0,
+                            d.weekday().num_days_from_sunday() as i64,
+                            d.ordinal() as i64,
+                        )
+                    } else if let Ok(dt) = NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S") {
+                        (
+                            dt.year() as i64,
+                            dt.month() as i64,
+                            dt.day() as i64,
+                            dt.hour() as i64,
+                            dt.minute() as i64,
+                            dt.second() as i64,
+                            dt.weekday().num_days_from_sunday() as i64,
+                            dt.ordinal() as i64,
+                        )
+                    } else {
+                        return Err(Error::TypeMismatch {
+                            expected: "timestamp or date".to_string(),
+                            got: format!("Varchar(\"{}\")", s),
+                        });
+                    }
+                }
                 Value::Null => return Ok(Value::Null),
                 _ => return Err(Error::TypeMismatch {
                     expected: "timestamp or date".to_string(),
