@@ -2291,11 +2291,19 @@ fn evaluate_function(name: &str, args: &[Value]) -> Result<Value> {
             Ok(Value::Integer(val.count_ones() as i32))
         }
         "BIT_LENGTH" => {
-            let s = args.first().and_then(|v| v.as_str()).unwrap_or("");
+            let s = match args.first() {
+                Some(Value::Null) => return Ok(Value::Null),
+                Some(v) => v.as_str().unwrap_or(""),
+                None => "",
+            };
             Ok(Value::Integer((s.len() * 8) as i32))
         }
         "OCTET_LENGTH" | "BYTE_LENGTH" => {
-            let s = args.first().and_then(|v| v.as_str()).unwrap_or("");
+            let s = match args.first() {
+                Some(Value::Null) => return Ok(Value::Null),
+                Some(v) => v.as_str().unwrap_or(""),
+                None => "",
+            };
             Ok(Value::Integer(s.len() as i32))
         }
         "BIT_AND" | "BITAND" => {
