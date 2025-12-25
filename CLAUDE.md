@@ -93,7 +93,6 @@ DuckDB has 400+ built-in functions. Categories include:
 - [x] ALTER TABLE (ADD/DROP/RENAME COLUMN, RENAME TABLE)
 - [x] PIVOT/UNPIVOT
 - [ ] Materialized views
-- [ ] Hash indexes
 
 ### Implemented DuckDB Functions
 
@@ -174,7 +173,6 @@ Features not yet implemented:
 
 - **Some INTERVAL syntax**: `INTERVAL 7 MINUTES` (use `INTERVAL '7' MINUTE`)
 - **Materialized views**: Not yet supported
-- **Hash indexes**: Only B-tree indexes are supported
 
 ## Contributing
 
