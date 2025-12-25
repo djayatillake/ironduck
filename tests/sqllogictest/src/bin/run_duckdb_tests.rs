@@ -8,16 +8,6 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::collections::VecDeque;
 
-/// Files/directories that cause stack overflow or hang and should be skipped
-const SKIP_PATTERNS: &[&str] = &[
-    "grouping_sets/cube.test",           // CUBE with many columns causes stack overflow
-    "grouping_sets/rollup.test",         // ROLLUP can also cause issues
-    "grouping_sets/grouping_sets.test",  // Complex grouping sets
-    "tpch/",                              // Requires TPCH extension
-    "tpcds/",                             // Requires TPCDS extension
-    "extensions/",                        // Extension tests
-];
-
 fn main() {
     // Increase stack size for main thread
     let handle = std::thread::Builder::new()
@@ -165,25 +155,13 @@ fn run_directory(dir: &Path) {
     println!("  Skipped: {}", total_skipped);
 }
 
-/// Check if a path should be skipped based on SKIP_PATTERNS
-fn should_skip(path: &Path) -> bool {
-    let path_str = path.to_string_lossy();
-    SKIP_PATTERNS.iter().any(|pattern| path_str.contains(pattern))
-}
-
 /// Collect test files using iterative BFS (avoids stack overflow)
 fn collect_test_files_iter(start_dir: &Path) -> Vec<PathBuf> {
     let mut test_files = Vec::new();
     let mut queue: VecDeque<PathBuf> = VecDeque::new();
-    let mut skipped_count = 0;
     queue.push_back(start_dir.to_path_buf());
 
     while let Some(dir) = queue.pop_front() {
-        // Skip entire directories that match skip patterns
-        if should_skip(&dir) {
-            continue;
-        }
-
         if let Ok(entries) = fs::read_dir(&dir) {
             let mut paths: Vec<_> = entries
                 .filter_map(|e| e.ok())
@@ -193,10 +171,6 @@ fn collect_test_files_iter(start_dir: &Path) -> Vec<PathBuf> {
             paths.sort();
 
             for path in paths {
-                if should_skip(&path) {
-                    skipped_count += 1;
-                    continue;
-                }
                 if path.is_dir() {
                     queue.push_back(path);
                 } else if let Some(ext) = path.extension() {
@@ -206,10 +180,6 @@ fn collect_test_files_iter(start_dir: &Path) -> Vec<PathBuf> {
                 }
             }
         }
-    }
-
-    if skipped_count > 0 {
-        println!("Skipped {} problematic files/directories", skipped_count);
     }
 
     test_files.sort();

@@ -1114,8 +1114,12 @@ fn bind_select_with_ctes(
 
                             let flat_groups: Vec<BoundExpression> = bound_groups.into_iter().flatten().collect();
                             let n = flat_groups.len();
+                            // Limit CUBE to 15 elements to prevent exponential blowup (2^15 = 32768 grouping sets max)
+                            if n > 15 {
+                                return Err(Error::NotImplemented(format!("CUBE with more than 15 elements exceeds maximum grouping sets (got {} elements)", n)));
+                            }
                             // Generate all 2^n combinations
-                            for mask in 0..(1 << n) {
+                            for mask in 0..(1usize << n) {
                                 let mut combo = Vec::new();
                                 for i in 0..n {
                                     if (mask & (1 << i)) != 0 {
@@ -1314,7 +1318,11 @@ fn bind_select_with_outer(
                                 .collect::<Result<Vec<_>>>()?;
                             let flat_groups: Vec<BoundExpression> = bound_groups.into_iter().flatten().collect();
                             let n = flat_groups.len();
-                            for mask in 0..(1 << n) {
+                            // Limit CUBE to 15 elements to prevent exponential blowup
+                            if n > 15 {
+                                return Err(Error::NotImplemented(format!("CUBE with more than 15 elements exceeds maximum grouping sets (got {} elements)", n)));
+                            }
+                            for mask in 0..(1usize << n) {
                                 let mut combo = Vec::new();
                                 for i in 0..n {
                                     if (mask & (1 << i)) != 0 {
