@@ -3482,35 +3482,72 @@ fn evaluate_function(name: &str, args: &[Value]) -> Result<Value> {
             }
         }
         "DATE_ADD" | "DATEADD" => {
-            use chrono::{Duration, Datelike};
+            use chrono::{Duration, Datelike, NaiveTime};
             let date = args.first().unwrap_or(&Value::Null);
-            let interval = args.get(1).and_then(|v| v.as_i64()).unwrap_or(0);
-            let unit = args.get(2).and_then(|v| v.as_str()).unwrap_or("day").to_uppercase();
+            let interval_arg = args.get(1).unwrap_or(&Value::Null);
+
+            // Handle Interval type as second argument
+            let (months, days, micros) = match interval_arg {
+                Value::Interval(iv) => (iv.months as i64, iv.days as i64, iv.micros),
+                Value::Null => return Ok(Value::Null),
+                _ => {
+                    // Legacy: integer + unit string format
+                    let interval = interval_arg.as_i64().unwrap_or(0);
+                    let unit = args.get(2).and_then(|v| v.as_str()).unwrap_or("day").to_uppercase();
+                    match unit.as_str() {
+                        "DAY" | "DAYS" => (0, interval, 0),
+                        "MONTH" | "MONTHS" => (interval, 0, 0),
+                        "YEAR" | "YEARS" => (interval * 12, 0, 0),
+                        "HOUR" | "HOURS" => (0, 0, interval * 3_600_000_000),
+                        "MINUTE" | "MINUTES" => (0, 0, interval * 60_000_000),
+                        "SECOND" | "SECONDS" => (0, 0, interval * 1_000_000),
+                        _ => return Err(Error::NotImplemented(format!("DATE_ADD unit: {}", unit))),
+                    }
+                }
+            };
 
             match date {
                 Value::Date(d) => {
-                    let result = match unit.as_str() {
-                        "DAY" | "DAYS" => *d + Duration::days(interval),
-                        "WEEK" | "WEEKS" => *d + Duration::weeks(interval),
-                        "MONTH" | "MONTHS" => {
-                            let new_month = d.month() as i64 + interval;
-                            let years_delta = (new_month - 1) / 12;
-                            let new_month = ((new_month - 1) % 12 + 1) as u32;
-                            let new_year = d.year() + years_delta as i32;
-                            chrono::NaiveDate::from_ymd_opt(new_year, new_month, d.day().min(28))
-                                .unwrap_or(*d)
-                        }
-                        "YEAR" | "YEARS" => {
-                            chrono::NaiveDate::from_ymd_opt(d.year() + interval as i32, d.month(), d.day())
-                                .unwrap_or(*d)
-                        }
-                        _ => return Err(Error::NotImplemented(format!("DATE_ADD unit: {}", unit))),
+                    // Apply months
+                    let mut result = if months != 0 {
+                        let new_month = d.month() as i64 + months;
+                        let years_delta = if new_month > 0 { (new_month - 1) / 12 } else { (new_month - 12) / 12 };
+                        let new_month = ((new_month - 1).rem_euclid(12) + 1) as u32;
+                        let new_year = d.year() + years_delta as i32;
+                        chrono::NaiveDate::from_ymd_opt(new_year, new_month, d.day().min(28))
+                            .unwrap_or(*d)
+                    } else {
+                        *d
                     };
-                    Ok(Value::Date(result))
+                    // Apply days
+                    result = result + Duration::days(days);
+                    // Return timestamp with time component from micros
+                    let time_micros = micros.rem_euclid(86_400_000_000);
+                    let ts = result.and_time(NaiveTime::from_hms_opt(0, 0, 0).unwrap())
+                        + Duration::microseconds(time_micros);
+                    Ok(Value::Timestamp(ts))
+                }
+                Value::Timestamp(ts) => {
+                    // Apply months
+                    let mut result = if months != 0 {
+                        let d = ts.date();
+                        let new_month = d.month() as i64 + months;
+                        let years_delta = if new_month > 0 { (new_month - 1) / 12 } else { (new_month - 12) / 12 };
+                        let new_month = ((new_month - 1).rem_euclid(12) + 1) as u32;
+                        let new_year = d.year() + years_delta as i32;
+                        let new_date = chrono::NaiveDate::from_ymd_opt(new_year, new_month, d.day().min(28))
+                            .unwrap_or(d);
+                        new_date.and_time(ts.time())
+                    } else {
+                        *ts
+                    };
+                    // Apply days and micros
+                    result = result + Duration::days(days) + Duration::microseconds(micros);
+                    Ok(Value::Timestamp(result))
                 }
                 Value::Null => Ok(Value::Null),
                 _ => Err(Error::TypeMismatch {
-                    expected: "date".to_string(),
+                    expected: "date or timestamp".to_string(),
                     got: format!("{:?}", date),
                 }),
             }
