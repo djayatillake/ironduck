@@ -682,10 +682,23 @@ fn evaluate_function(name: &str, args: &[Value]) -> Result<Value> {
             match args.first() {
                 Some(Value::Null) => Ok(Value::Null),
                 Some(v) => {
-                    let code = v.as_i64().unwrap_or(0) as u32;
-                    match char::from_u32(code) {
+                    let code = v.as_i64().unwrap_or(0);
+                    // Validate codepoint range
+                    if code < 0 {
+                        return Err(Error::InvalidArguments(format!(
+                            "Invalid codepoint value for chr: {}", code
+                        )));
+                    }
+                    if code > 0x10FFFF {
+                        return Err(Error::InvalidArguments(format!(
+                            "Invalid codepoint value for chr: {}", code
+                        )));
+                    }
+                    match char::from_u32(code as u32) {
                         Some(c) => Ok(Value::Varchar(c.to_string())),
-                        None => Ok(Value::Null),
+                        None => Err(Error::InvalidArguments(format!(
+                            "Invalid codepoint value for chr: {}", code
+                        ))),
                     }
                 }
                 None => Ok(Value::Null),
@@ -699,7 +712,8 @@ fn evaluate_function(name: &str, args: &[Value]) -> Result<Value> {
                 None => "",
             };
             if s.is_empty() {
-                Ok(Value::Null)
+                // DuckDB returns -1 for empty string
+                Ok(Value::Integer(-1))
             } else {
                 Ok(Value::Integer(s.chars().next().unwrap() as i32))
             }
@@ -794,8 +808,14 @@ fn evaluate_function(name: &str, args: &[Value]) -> Result<Value> {
                 None => "",
             };
             // Return NULL if count is NULL, empty string if negative or zero
+            // Validate that second argument is numeric (not a string)
             let n = match args.get(1) {
                 Some(Value::Null) => return Ok(Value::Null),
+                Some(Value::Varchar(_)) => {
+                    return Err(ironduck_common::Error::InvalidArguments(
+                        "REPEAT count argument must be an integer, not a string".to_string()
+                    ));
+                }
                 Some(v) => v.as_i64().unwrap_or(0),
                 None => 0,
             };
@@ -826,8 +846,14 @@ fn evaluate_function(name: &str, args: &[Value]) -> Result<Value> {
             if len <= 0 {
                 return Ok(Value::Varchar(String::new()));
             }
-            // Cap length to prevent memory exhaustion
-            let len = std::cmp::min(len as usize, 10_000_000);
+            // Error on huge lengths to prevent memory exhaustion
+            const MAX_PAD_LENGTH: i64 = 10_000_000;
+            if len > MAX_PAD_LENGTH {
+                return Err(ironduck_common::Error::InvalidArguments(format!(
+                    "LPAD length {} exceeds maximum allowed ({})", len, MAX_PAD_LENGTH
+                )));
+            }
+            let len = len as usize;
             let s_chars: Vec<char> = s.chars().collect();
             if s_chars.len() >= len {
                 // Truncate to len characters
@@ -863,8 +889,14 @@ fn evaluate_function(name: &str, args: &[Value]) -> Result<Value> {
             if len <= 0 {
                 return Ok(Value::Varchar(String::new()));
             }
-            // Cap length to prevent memory exhaustion
-            let len = std::cmp::min(len as usize, 10_000_000);
+            // Error on huge lengths to prevent memory exhaustion
+            const MAX_PAD_LENGTH: i64 = 10_000_000;
+            if len > MAX_PAD_LENGTH {
+                return Err(ironduck_common::Error::InvalidArguments(format!(
+                    "RPAD length {} exceeds maximum allowed ({})", len, MAX_PAD_LENGTH
+                )));
+            }
+            let len = len as usize;
             let s_chars: Vec<char> = s.chars().collect();
             if s_chars.len() >= len {
                 // Truncate to len characters
@@ -911,8 +943,30 @@ fn evaluate_function(name: &str, args: &[Value]) -> Result<Value> {
                 Some(v) => v.as_i64().unwrap_or(1),
                 None => 1,
             };
-            let parts: Vec<&str> = s.split(delimiter).collect();
-            Ok(Value::Varchar(parts.get((part.max(1) - 1) as usize).unwrap_or(&"").to_string()))
+            // Index 0 returns empty string
+            if part == 0 {
+                return Ok(Value::Varchar(String::new()));
+            }
+            // Empty delimiter: split each character
+            let parts: Vec<&str> = if delimiter.is_empty() {
+                s.chars().map(|c| {
+                    let start = s.find(c).unwrap();
+                    &s[start..start + c.len_utf8()]
+                }).collect()
+            } else {
+                s.split(delimiter).collect()
+            };
+            // Handle negative indices (count from end)
+            let idx = if part < 0 {
+                let abs_part = (-part) as usize;
+                if abs_part > parts.len() {
+                    return Ok(Value::Varchar(String::new()));
+                }
+                parts.len() - abs_part
+            } else {
+                (part - 1) as usize
+            };
+            Ok(Value::Varchar(parts.get(idx).unwrap_or(&"").to_string()))
         }
         "STRING_SPLIT" | "STR_SPLIT" | "STRING_TO_ARRAY" => {
             // Return NULL if string is NULL
@@ -3181,6 +3235,51 @@ fn evaluate_function(name: &str, args: &[Value]) -> Result<Value> {
                         Value::Timestamp(dt) => dt.iso_week().week() as i64,
                         Value::Date(d) => d.iso_week().week() as i64,
                         _ => 0,
+                    }
+                }
+                "DECADE" => year / 10,
+                "CENTURY" => if year > 0 { (year - 1) / 100 + 1 } else { year / 100 },
+                "MILLENNIUM" => if year > 0 { (year - 1) / 1000 + 1 } else { year / 1000 },
+                "ISODOW" => {
+                    // ISO day of week: Monday=1 through Sunday=7
+                    match ts {
+                        Value::Timestamp(dt) => dt.weekday().number_from_monday() as i64,
+                        Value::Date(d) => d.weekday().number_from_monday() as i64,
+                        _ => day_of_week,
+                    }
+                }
+                "YEARWEEK" => {
+                    // ISO year * 100 + ISO week
+                    match ts {
+                        Value::Timestamp(dt) => dt.iso_week().year() as i64 * 100 + dt.iso_week().week() as i64,
+                        Value::Date(d) => d.iso_week().year() as i64 * 100 + d.iso_week().week() as i64,
+                        _ => 0,
+                    }
+                }
+                "EPOCH" => {
+                    // Seconds since 1970-01-01
+                    match ts {
+                        Value::Timestamp(dt) => dt.and_utc().timestamp(),
+                        Value::Date(d) => {
+                            use chrono::NaiveTime;
+                            let dt = d.and_time(NaiveTime::from_hms_opt(0, 0, 0).unwrap());
+                            dt.and_utc().timestamp()
+                        }
+                        _ => 0,
+                    }
+                }
+                "MILLISECONDS" | "MILLISECOND" => {
+                    // Milliseconds of the current second (0-999) plus full seconds
+                    match ts {
+                        Value::Timestamp(dt) => (second * 1000) + (dt.nanosecond() / 1_000_000) as i64,
+                        _ => second * 1000,
+                    }
+                }
+                "MICROSECONDS" | "MICROSECOND" => {
+                    // Microseconds of the current second plus full seconds
+                    match ts {
+                        Value::Timestamp(dt) => (second * 1_000_000) + (dt.nanosecond() / 1000) as i64,
+                        _ => second * 1_000_000,
                     }
                 }
                 _ => return Err(Error::NotImplemented(format!("DATE_PART field: {}", part))),

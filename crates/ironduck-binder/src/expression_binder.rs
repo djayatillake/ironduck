@@ -428,7 +428,36 @@ pub fn bind_expression(
 
         // EXTRACT(field FROM source)
         sql::Expr::Extract { field, expr, .. } => {
-            let field_str = format!("{:?}", field).to_uppercase();
+            // Convert DateTimeField to simple string for executor
+            let field_str = match field {
+                sql::DateTimeField::Year => "YEAR",
+                sql::DateTimeField::Month => "MONTH",
+                sql::DateTimeField::Day => "DAY",
+                sql::DateTimeField::Hour => "HOUR",
+                sql::DateTimeField::Minute => "MINUTE",
+                sql::DateTimeField::Second => "SECOND",
+                sql::DateTimeField::Week(_) => "WEEK",
+                sql::DateTimeField::Quarter => "QUARTER",
+                sql::DateTimeField::Dow => "DOW",
+                sql::DateTimeField::Doy => "DOY",
+                sql::DateTimeField::Epoch => "EPOCH",
+                sql::DateTimeField::Decade => "DECADE",
+                sql::DateTimeField::Century => "CENTURY",
+                sql::DateTimeField::Millennium => "MILLENNIUM",
+                sql::DateTimeField::Isodow => "ISODOW",
+                sql::DateTimeField::Isoyear => "ISOYEAR",
+                sql::DateTimeField::Microseconds => "MICROSECONDS",
+                sql::DateTimeField::Milliseconds => "MILLISECONDS",
+                sql::DateTimeField::Nanoseconds => "NANOSECONDS",
+                sql::DateTimeField::Timezone => "TIMEZONE",
+                sql::DateTimeField::TimezoneHour => "TIMEZONE_HOUR",
+                sql::DateTimeField::TimezoneMinute => "TIMEZONE_MINUTE",
+                sql::DateTimeField::Custom(ident) => {
+                    // Handle custom identifiers like YEARWEEK
+                    return bind_custom_extract(_binder, &ident.value, expr, ctx);
+                }
+                _ => return Err(Error::NotImplemented(format!("EXTRACT field: {:?}", field))),
+            }.to_string();
             let bound_expr = bind_expression(_binder, expr, ctx)?;
             Ok(BoundExpression::new(
                 BoundExpressionKind::Function {
@@ -777,6 +806,34 @@ fn parse_interval_string(s: &str) -> Result<ironduck_common::value::Interval> {
     Ok(Interval { months, days, micros })
 }
 
+/// Bind custom EXTRACT fields (like YEARWEEK)
+fn bind_custom_extract(
+    binder: &Binder,
+    field_name: &str,
+    expr: &sql::Expr,
+    ctx: &ExpressionBinderContext,
+) -> Result<BoundExpression> {
+    let field_str = field_name.to_uppercase();
+    let bound_expr = bind_expression(binder, expr, ctx)?;
+    Ok(BoundExpression::new(
+        BoundExpressionKind::Function {
+            name: "EXTRACT".to_string(),
+            args: vec![
+                BoundExpression::new(
+                    BoundExpressionKind::Constant(Value::Varchar(field_str)),
+                    LogicalType::Varchar,
+                ),
+                bound_expr,
+            ],
+            is_aggregate: false,
+            distinct: false,
+            order_by: vec![],
+            filter: None,
+        },
+        LogicalType::BigInt,
+    ))
+}
+
 /// Bind a literal value
 fn bind_value(value: &sql::Value) -> Result<BoundExpression> {
     let (val, typ) = match value {
@@ -1097,7 +1154,7 @@ fn bind_function(
                 )));
             }
         }
-        // Two-argument functions
+        // Two-argument aggregate functions
         "COVAR_POP" | "COVAR_SAMP" | "CORR" => {
             if args.len() != 2 {
                 return Err(Error::InvalidArguments(format!(
@@ -1105,6 +1162,83 @@ fn bind_function(
                 )));
             }
         }
+
+        // Single-argument scalar string functions
+        "REVERSE" | "ASCII" | "CHR" | "CHAR" | "LOWER" | "UPPER" | "LENGTH" | "CHAR_LENGTH"
+        | "CHARACTER_LENGTH" | "BIT_LENGTH" | "OCTET_LENGTH" | "UNICODE" | "STRIP_ACCENTS"
+        | "INITCAP" | "SOUNDEX" | "MD5" | "SHA256" | "SHA1" | "BASE64" | "UCASE" | "LCASE" => {
+            if args.is_empty() {
+                return Err(Error::InvalidArguments(format!(
+                    "{}() requires an argument", name
+                )));
+            }
+            if args.len() > 1 {
+                return Err(Error::InvalidArguments(format!(
+                    "{}() takes only 1 argument, got {}", name, args.len()
+                )));
+            }
+        }
+
+        // Two-argument scalar string functions
+        "INSTR" | "STRPOS" | "POSITION" | "CONTAINS" | "PREFIX" | "SUFFIX"
+        | "STARTS_WITH" | "ENDS_WITH" | "REPEAT" | "LEFT" | "RIGHT" => {
+            if args.len() != 2 {
+                return Err(Error::InvalidArguments(format!(
+                    "{}() requires exactly 2 arguments, got {}", name, args.len()
+                )));
+            }
+        }
+
+        // Three-argument scalar string functions
+        "REPLACE" | "TRANSLATE" | "SPLIT_PART" | "SUBSTR" => {
+            if args.len() != 3 {
+                return Err(Error::InvalidArguments(format!(
+                    "{}() requires exactly 3 arguments, got {}", name, args.len()
+                )));
+            }
+        }
+
+        // LPAD/RPAD require 2-3 arguments
+        "LPAD" | "RPAD" => {
+            if args.len() < 2 || args.len() > 3 {
+                return Err(Error::InvalidArguments(format!(
+                    "{}() requires 2 or 3 arguments, got {}", name, args.len()
+                )));
+            }
+        }
+
+        // TRIM functions: 1-2 arguments
+        "TRIM" | "LTRIM" | "RTRIM" => {
+            if args.is_empty() {
+                return Err(Error::InvalidArguments(format!(
+                    "{}() requires at least 1 argument", name
+                )));
+            }
+            if args.len() > 2 {
+                return Err(Error::InvalidArguments(format!(
+                    "{}() takes at most 2 arguments, got {}", name, args.len()
+                )));
+            }
+        }
+
+        // CONCAT requires at least one argument
+        "CONCAT" => {
+            if args.is_empty() {
+                return Err(Error::InvalidArguments(
+                    "CONCAT() requires at least one argument".to_string()
+                ));
+            }
+        }
+
+        // CONCAT_WS requires at least two arguments (separator + at least one value)
+        "CONCAT_WS" => {
+            if args.len() < 2 {
+                return Err(Error::InvalidArguments(
+                    "CONCAT_WS() requires at least 2 arguments".to_string()
+                ));
+            }
+        }
+
         _ => {}
     }
 
