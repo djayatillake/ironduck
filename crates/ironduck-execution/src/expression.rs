@@ -2986,6 +2986,58 @@ fn evaluate_function(name: &str, args: &[Value]) -> Result<Value> {
                 _ => Ok(Value::Null),
             }
         }
+        "URL_ENCODE" => {
+            match args.first() {
+                Some(Value::Null) | None => Ok(Value::Null),
+                Some(v) => {
+                    let s = value_to_string(v);
+                    let mut result = String::new();
+                    for c in s.chars() {
+                        if c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' || c == '~' {
+                            result.push(c);
+                        } else {
+                            for b in c.to_string().bytes() {
+                                result.push_str(&format!("%{:02X}", b));
+                            }
+                        }
+                    }
+                    Ok(Value::Varchar(result))
+                }
+            }
+        }
+        "URL_DECODE" => {
+            match args.first() {
+                Some(Value::Null) | None => Ok(Value::Null),
+                Some(v) => {
+                    let s = value_to_string(v);
+                    let mut result = Vec::new();
+                    let mut chars = s.chars().peekable();
+                    while let Some(c) = chars.next() {
+                        if c == '%' {
+                            let hex: String = chars.by_ref().take(2).collect();
+                            if hex.len() == 2 {
+                                if let Ok(byte) = u8::from_str_radix(&hex, 16) {
+                                    result.push(byte);
+                                    continue;
+                                }
+                            }
+                            // Invalid escape, keep as-is
+                            result.push(b'%');
+                            for b in hex.bytes() {
+                                result.push(b);
+                            }
+                        } else if c == '+' {
+                            result.push(b' ');
+                        } else {
+                            for b in c.to_string().bytes() {
+                                result.push(b);
+                            }
+                        }
+                    }
+                    Ok(Value::Varchar(String::from_utf8_lossy(&result).to_string()))
+                }
+            }
+        }
         "BASE64" | "TO_BASE64" => {
             // Simple base64 encoding
             const BASE64_CHARS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
