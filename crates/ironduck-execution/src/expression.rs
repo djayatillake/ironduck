@@ -2027,12 +2027,34 @@ fn evaluate_function(name: &str, args: &[Value]) -> Result<Value> {
             }
         }
         "MOD" => {
-            let a = args.first().and_then(|v| v.as_i64()).unwrap_or(0);
-            let b = args.get(1).and_then(|v| v.as_i64()).unwrap_or(1);
-            if b == 0 {
-                Ok(Value::Null)
+            let val_a = args.first().unwrap_or(&Value::Null);
+            let val_b = args.get(1).unwrap_or(&Value::Null);
+
+            // Check for NULL
+            if val_a.is_null() || val_b.is_null() {
+                return Ok(Value::Null);
+            }
+
+            // Use floating-point modulo if either value is a float
+            let is_float = matches!(val_a, Value::Float(_) | Value::Double(_) | Value::Decimal { .. })
+                        || matches!(val_b, Value::Float(_) | Value::Double(_) | Value::Decimal { .. });
+
+            if is_float {
+                let a = val_a.as_f64().unwrap_or(0.0);
+                let b = val_b.as_f64().unwrap_or(1.0);
+                if b == 0.0 {
+                    Ok(Value::Null)
+                } else {
+                    Ok(Value::Double(a % b))
+                }
             } else {
-                Ok(Value::BigInt(a % b))
+                let a = val_a.as_i64().unwrap_or(0);
+                let b = val_b.as_i64().unwrap_or(1);
+                if b == 0 {
+                    Ok(Value::Null)
+                } else {
+                    Ok(Value::BigInt(a % b))
+                }
             }
         }
         "PI" => Ok(Value::Double(std::f64::consts::PI)),
