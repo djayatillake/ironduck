@@ -579,6 +579,10 @@ fn evaluate_function(name: &str, args: &[Value]) -> Result<Value> {
             if args.is_empty() {
                 return Ok(Value::Null);
             }
+            // Return NULL if separator is NULL
+            if matches!(args.first(), Some(Value::Null)) {
+                return Ok(Value::Null);
+            }
             let separator = value_to_string(&args[0]);
             // Filter out NULL values and join with separator
             let parts: Vec<String> = args[1..]
@@ -921,8 +925,13 @@ fn evaluate_function(name: &str, args: &[Value]) -> Result<Value> {
                 Some(Value::Null) | None => return Ok(Value::Null),
                 Some(v) => v.as_str().unwrap_or(""),
             };
+            // find() returns byte position, we need character position
             match haystack.find(needle) {
-                Some(pos) => Ok(Value::BigInt((pos + 1) as i64)), // 1-indexed
+                Some(byte_pos) => {
+                    // Count characters up to byte_pos
+                    let char_pos = haystack[..byte_pos].chars().count();
+                    Ok(Value::BigInt((char_pos + 1) as i64)) // 1-indexed
+                }
                 None => Ok(Value::BigInt(0)),
             }
         }
