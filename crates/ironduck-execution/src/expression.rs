@@ -1231,6 +1231,28 @@ fn evaluate_function(name: &str, args: &[Value]) -> Result<Value> {
                 _ => Ok(Value::Boolean(false)),
             }
         }
+        "LIST_HAS_ANY" | "ARRAY_HAS_ANY" => {
+            // Check if list1 has any elements in common with list2
+            match (args.first(), args.get(1)) {
+                (Some(Value::List(list1)), Some(Value::List(list2))) => {
+                    let has_any = list1.iter().any(|v| list2.contains(v));
+                    Ok(Value::Boolean(has_any))
+                }
+                (Some(Value::Null), _) | (_, Some(Value::Null)) => Ok(Value::Null),
+                _ => Ok(Value::Boolean(false)),
+            }
+        }
+        "LIST_HAS_ALL" | "ARRAY_HAS_ALL" => {
+            // Check if list1 contains all elements from list2
+            match (args.first(), args.get(1)) {
+                (Some(Value::List(list1)), Some(Value::List(list2))) => {
+                    let has_all = list2.iter().all(|v| list1.contains(v));
+                    Ok(Value::Boolean(has_all))
+                }
+                (Some(Value::Null), _) | (_, Some(Value::Null)) => Ok(Value::Null),
+                _ => Ok(Value::Boolean(false)),
+            }
+        }
         "ARRAY_EXTRACT" | "LIST_EXTRACT" | "LIST_ELEMENT" => {
             // Get element at index (1-based)
             match (args.first(), args.get(1)) {
