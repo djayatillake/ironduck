@@ -1053,21 +1053,83 @@ fn evaluate_function(name: &str, args: &[Value]) -> Result<Value> {
             Ok(Value::Boolean(s.contains(needle)))
         }
         "FORMAT" | "PRINTF" => {
-            // Simple {} placeholder replacement (DuckDB-style)
+            // Handle C-style format specifiers (%s, %d, %f, etc.) and {} placeholders
             let format_str = args.first().and_then(|v| v.as_str()).unwrap_or("");
-            let mut result = format_str.to_string();
+            let mut result = String::new();
             let mut arg_idx = 1;
-            while let Some(pos) = result.find("{}") {
-                if let Some(arg) = args.get(arg_idx) {
-                    let replacement = match arg {
-                        Value::Null => "NULL".to_string(),
-                        Value::Varchar(s) => s.clone(),
-                        _ => arg.to_string(),
-                    };
-                    result = result[..pos].to_string() + &replacement + &result[pos + 2..];
-                    arg_idx += 1;
+            let mut chars = format_str.chars().peekable();
+
+            while let Some(c) = chars.next() {
+                if c == '%' {
+                    if let Some(&next) = chars.peek() {
+                        match next {
+                            '%' => {
+                                // Escaped %
+                                result.push('%');
+                                chars.next();
+                            }
+                            's' | 'd' | 'i' | 'f' | 'g' | 'e' | 'x' | 'X' | 'o' | 'c' => {
+                                chars.next();
+                                if let Some(arg) = args.get(arg_idx) {
+                                    let replacement = match arg {
+                                        Value::Null => "NULL".to_string(),
+                                        Value::Varchar(s) => s.clone(),
+                                        _ => arg.to_string(),
+                                    };
+                                    result.push_str(&replacement);
+                                    arg_idx += 1;
+                                }
+                            }
+                            _ => {
+                                // Skip width/precision specifiers like %10s, %.2f
+                                let mut spec = String::new();
+                                while let Some(&ch) = chars.peek() {
+                                    if ch.is_ascii_digit() || ch == '.' || ch == '-' || ch == '+' {
+                                        spec.push(ch);
+                                        chars.next();
+                                    } else {
+                                        break;
+                                    }
+                                }
+                                if let Some(&type_char) = chars.peek() {
+                                    if "sdifgexXoc".contains(type_char) {
+                                        chars.next();
+                                        if let Some(arg) = args.get(arg_idx) {
+                                            let replacement = match arg {
+                                                Value::Null => "NULL".to_string(),
+                                                Value::Varchar(s) => s.clone(),
+                                                _ => arg.to_string(),
+                                            };
+                                            result.push_str(&replacement);
+                                            arg_idx += 1;
+                                        }
+                                    } else {
+                                        result.push('%');
+                                        result.push_str(&spec);
+                                    }
+                                } else {
+                                    result.push('%');
+                                    result.push_str(&spec);
+                                }
+                            }
+                        }
+                    } else {
+                        result.push('%');
+                    }
+                } else if c == '{' && chars.peek() == Some(&'}') {
+                    // Handle {} placeholder
+                    chars.next();
+                    if let Some(arg) = args.get(arg_idx) {
+                        let replacement = match arg {
+                            Value::Null => "NULL".to_string(),
+                            Value::Varchar(s) => s.clone(),
+                            _ => arg.to_string(),
+                        };
+                        result.push_str(&replacement);
+                        arg_idx += 1;
+                    }
                 } else {
-                    break;
+                    result.push(c);
                 }
             }
             Ok(Value::Varchar(result))
