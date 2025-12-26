@@ -552,7 +552,22 @@ fn evaluate_function(name: &str, args: &[Value]) -> Result<Value> {
                 Some(v) => v.as_str().unwrap_or(""),
                 None => "",
             };
-            Ok(Value::Varchar(s.trim().to_string()))
+            // Check for second argument (characters to trim)
+            if let Some(chars_arg) = args.get(1) {
+                if matches!(chars_arg, Value::Null) {
+                    return Ok(Value::Null);
+                }
+                let chars_to_trim = chars_arg.as_str().unwrap_or("");
+                if chars_to_trim.is_empty() {
+                    return Ok(Value::Varchar(s.to_string()));
+                }
+                // Trim from both ends any characters in chars_to_trim
+                let ltrimmed: String = s.chars().skip_while(|c| chars_to_trim.contains(*c)).collect();
+                let reversed: String = ltrimmed.chars().rev().skip_while(|c| chars_to_trim.contains(*c)).collect();
+                Ok(Value::Varchar(reversed.chars().rev().collect()))
+            } else {
+                Ok(Value::Varchar(s.trim().to_string()))
+            }
         }
         "LTRIM" => {
             let s = match args.first() {
@@ -560,7 +575,21 @@ fn evaluate_function(name: &str, args: &[Value]) -> Result<Value> {
                 Some(v) => v.as_str().unwrap_or(""),
                 None => "",
             };
-            Ok(Value::Varchar(s.trim_start().to_string()))
+            // Check for second argument (characters to trim)
+            if let Some(chars_arg) = args.get(1) {
+                if matches!(chars_arg, Value::Null) {
+                    return Ok(Value::Null);
+                }
+                let chars_to_trim = chars_arg.as_str().unwrap_or("");
+                if chars_to_trim.is_empty() {
+                    return Ok(Value::Varchar(s.to_string()));
+                }
+                // Trim from start any characters in chars_to_trim
+                let result: String = s.chars().skip_while(|c| chars_to_trim.contains(*c)).collect();
+                Ok(Value::Varchar(result))
+            } else {
+                Ok(Value::Varchar(s.trim_start().to_string()))
+            }
         }
         "RTRIM" => {
             let s = match args.first() {
@@ -568,7 +597,21 @@ fn evaluate_function(name: &str, args: &[Value]) -> Result<Value> {
                 Some(v) => v.as_str().unwrap_or(""),
                 None => "",
             };
-            Ok(Value::Varchar(s.trim_end().to_string()))
+            // Check for second argument (characters to trim)
+            if let Some(chars_arg) = args.get(1) {
+                if matches!(chars_arg, Value::Null) {
+                    return Ok(Value::Null);
+                }
+                let chars_to_trim = chars_arg.as_str().unwrap_or("");
+                if chars_to_trim.is_empty() {
+                    return Ok(Value::Varchar(s.to_string()));
+                }
+                // Trim from end any characters in chars_to_trim
+                let reversed: String = s.chars().rev().skip_while(|c| chars_to_trim.contains(*c)).collect();
+                Ok(Value::Varchar(reversed.chars().rev().collect()))
+            } else {
+                Ok(Value::Varchar(s.trim_end().to_string()))
+            }
         }
         "CONCAT" => {
             let result: String = args.iter().map(value_to_string).collect();
@@ -1052,89 +1095,6 @@ fn evaluate_function(name: &str, args: &[Value]) -> Result<Value> {
             };
             Ok(Value::Boolean(s.contains(needle)))
         }
-        "FORMAT" | "PRINTF" => {
-            // Handle C-style format specifiers (%s, %d, %f, etc.) and {} placeholders
-            let format_str = args.first().and_then(|v| v.as_str()).unwrap_or("");
-            let mut result = String::new();
-            let mut arg_idx = 1;
-            let mut chars = format_str.chars().peekable();
-
-            while let Some(c) = chars.next() {
-                if c == '%' {
-                    if let Some(&next) = chars.peek() {
-                        match next {
-                            '%' => {
-                                // Escaped %
-                                result.push('%');
-                                chars.next();
-                            }
-                            's' | 'd' | 'i' | 'f' | 'g' | 'e' | 'x' | 'X' | 'o' | 'c' => {
-                                chars.next();
-                                if let Some(arg) = args.get(arg_idx) {
-                                    let replacement = match arg {
-                                        Value::Null => "NULL".to_string(),
-                                        Value::Varchar(s) => s.clone(),
-                                        _ => arg.to_string(),
-                                    };
-                                    result.push_str(&replacement);
-                                    arg_idx += 1;
-                                }
-                            }
-                            _ => {
-                                // Skip width/precision specifiers like %10s, %.2f
-                                let mut spec = String::new();
-                                while let Some(&ch) = chars.peek() {
-                                    if ch.is_ascii_digit() || ch == '.' || ch == '-' || ch == '+' {
-                                        spec.push(ch);
-                                        chars.next();
-                                    } else {
-                                        break;
-                                    }
-                                }
-                                if let Some(&type_char) = chars.peek() {
-                                    if "sdifgexXoc".contains(type_char) {
-                                        chars.next();
-                                        if let Some(arg) = args.get(arg_idx) {
-                                            let replacement = match arg {
-                                                Value::Null => "NULL".to_string(),
-                                                Value::Varchar(s) => s.clone(),
-                                                _ => arg.to_string(),
-                                            };
-                                            result.push_str(&replacement);
-                                            arg_idx += 1;
-                                        }
-                                    } else {
-                                        result.push('%');
-                                        result.push_str(&spec);
-                                    }
-                                } else {
-                                    result.push('%');
-                                    result.push_str(&spec);
-                                }
-                            }
-                        }
-                    } else {
-                        result.push('%');
-                    }
-                } else if c == '{' && chars.peek() == Some(&'}') {
-                    // Handle {} placeholder
-                    chars.next();
-                    if let Some(arg) = args.get(arg_idx) {
-                        let replacement = match arg {
-                            Value::Null => "NULL".to_string(),
-                            Value::Varchar(s) => s.clone(),
-                            _ => arg.to_string(),
-                        };
-                        result.push_str(&replacement);
-                        arg_idx += 1;
-                    }
-                } else {
-                    result.push(c);
-                }
-            }
-            Ok(Value::Varchar(result))
-        }
-
         // Regular expression functions
         "REGEXP_MATCHES" | "REGEXP_LIKE" | "REGEXP" => {
             // Return NULL if either argument is NULL
@@ -2412,6 +2372,11 @@ fn evaluate_function(name: &str, args: &[Value]) -> Result<Value> {
 
         // Hash functions
         "HASH" | "MD5" => {
+            // Return NULL for NULL input
+            match args.first() {
+                Some(Value::Null) | None => return Ok(Value::Null),
+                _ => {}
+            }
             use std::hash::{Hash, Hasher};
             use std::collections::hash_map::DefaultHasher;
             let s = value_to_string(args.first().unwrap_or(&Value::Null));
@@ -2420,6 +2385,11 @@ fn evaluate_function(name: &str, args: &[Value]) -> Result<Value> {
             Ok(Value::BigInt(hasher.finish() as i64))
         }
         "SHA256" | "SHA2" => {
+            // Return NULL for NULL input
+            match args.first() {
+                Some(Value::Null) | None => return Ok(Value::Null),
+                _ => {}
+            }
             // Simple SHA-256 implementation for string hashing
             let s = value_to_string(args.first().unwrap_or(&Value::Null));
             let bytes = s.as_bytes();
@@ -2586,7 +2556,11 @@ fn evaluate_function(name: &str, args: &[Value]) -> Result<Value> {
 
         // Format function
         "FORMAT" | "PRINTF" | "SPRINTF" => {
-            // Simple format - just return the first string with replacements
+            // Return NULL for NULL format string
+            match args.first() {
+                Some(Value::Null) | None => return Ok(Value::Null),
+                _ => {}
+            }
             let template = args.first().and_then(|v| v.as_str()).unwrap_or("");
             let mut arg_idx = 1;
 
@@ -2596,36 +2570,90 @@ fn evaluate_function(name: &str, args: &[Value]) -> Result<Value> {
             let mut new_result = String::new();
             while i < chars.len() {
                 if chars[i] == '%' && i + 1 < chars.len() {
-                    // Check for format specifier
                     let mut j = i + 1;
-                    let mut width = 0;
-                    let mut zero_pad = false;
 
-                    // Check for zero padding
-                    if j < chars.len() && chars[j] == '0' {
-                        zero_pad = true;
+                    // Skip flags: -, +, space, #, 0
+                    let mut alt_form = false;
+                    let mut zero_pad = false;
+                    let mut left_align = false;
+                    let mut plus_sign = false;
+                    while j < chars.len() && matches!(chars[j], '-' | '+' | ' ' | '#' | '0') {
+                        if chars[j] == '#' { alt_form = true; }
+                        if chars[j] == '0' { zero_pad = true; }
+                        if chars[j] == '-' { left_align = true; }
+                        if chars[j] == '+' { plus_sign = true; }
                         j += 1;
                     }
 
-                    // Parse width
-                    while j < chars.len() && chars[j].is_ascii_digit() {
-                        width = width * 10 + (chars[j] as usize - '0' as usize);
+                    // Parse width (could be * for dynamic width)
+                    let mut width: usize = 0;
+                    if j < chars.len() && chars[j] == '*' {
+                        // Dynamic width from argument
+                        width = args.get(arg_idx).and_then(|v| v.as_i64()).unwrap_or(0) as usize;
+                        arg_idx += 1;
+                        j += 1;
+                    } else {
+                        while j < chars.len() && chars[j].is_ascii_digit() {
+                            width = width * 10 + (chars[j] as usize - '0' as usize);
+                            j += 1;
+                        }
+                    }
+
+                    // Parse precision
+                    let mut precision: Option<usize> = None;
+                    if j < chars.len() && chars[j] == '.' {
+                        j += 1;
+                        let mut prec = 0;
+                        while j < chars.len() && chars[j].is_ascii_digit() {
+                            prec = prec * 10 + (chars[j] as usize - '0' as usize);
+                            j += 1;
+                        }
+                        precision = Some(prec);
+                    }
+
+                    // Skip size modifiers: hh, h, l, ll
+                    while j < chars.len() && matches!(chars[j], 'h' | 'l') {
                         j += 1;
                     }
 
                     if j < chars.len() {
-                        let arg = args.get(arg_idx).cloned().unwrap_or(Value::Null);
-                        match chars[j] {
+                        let type_char = chars[j];
+                        match type_char {
+                            '%' => {
+                                new_result.push('%');
+                                i = j + 1;
+                                continue;
+                            }
                             's' => {
-                                new_result.push_str(&value_to_string(&arg));
+                                let arg = args.get(arg_idx).cloned().unwrap_or(Value::Null);
+                                let s = match &arg {
+                                    Value::Null => "NULL".to_string(),
+                                    _ => value_to_string(&arg),
+                                };
+                                let formatted = if left_align && width > 0 {
+                                    format!("{:<width$}", s, width = width)
+                                } else if width > 0 {
+                                    format!("{:>width$}", s, width = width)
+                                } else {
+                                    s
+                                };
+                                new_result.push_str(&formatted);
                                 arg_idx += 1;
                                 i = j + 1;
                                 continue;
                             }
                             'd' | 'i' => {
-                                let num = arg.as_i64().unwrap_or(0);
-                                let formatted = if zero_pad && width > 0 {
+                                let arg = args.get(arg_idx).cloned().unwrap_or(Value::Null);
+                                // Handle boolean explicitly
+                                let num = match &arg {
+                                    Value::Boolean(true) => 1i64,
+                                    Value::Boolean(false) => 0i64,
+                                    _ => arg.as_i64().unwrap_or(0),
+                                };
+                                let formatted = if zero_pad && width > 0 && !left_align {
                                     format!("{:0>width$}", num, width = width)
+                                } else if left_align && width > 0 {
+                                    format!("{:<width$}", num, width = width)
                                 } else if width > 0 {
                                     format!("{:>width$}", num, width = width)
                                 } else {
@@ -2636,15 +2664,121 @@ fn evaluate_function(name: &str, args: &[Value]) -> Result<Value> {
                                 i = j + 1;
                                 continue;
                             }
-                            'f' => {
-                                let num = arg.as_f64().unwrap_or(0.0);
-                                new_result.push_str(&format!("{}", num));
+                            'x' => {
+                                let arg = args.get(arg_idx).cloned().unwrap_or(Value::Null);
+                                let num = arg.as_i64().unwrap_or(0);
+                                let formatted = if alt_form {
+                                    format!("{:#x}", num)
+                                } else {
+                                    format!("{:x}", num)
+                                };
+                                new_result.push_str(&formatted);
                                 arg_idx += 1;
                                 i = j + 1;
                                 continue;
                             }
-                            '%' => {
-                                new_result.push('%');
+                            'X' => {
+                                let arg = args.get(arg_idx).cloned().unwrap_or(Value::Null);
+                                let num = arg.as_i64().unwrap_or(0);
+                                let formatted = if alt_form {
+                                    format!("{:#X}", num)
+                                } else {
+                                    format!("{:X}", num)
+                                };
+                                new_result.push_str(&formatted);
+                                arg_idx += 1;
+                                i = j + 1;
+                                continue;
+                            }
+                            'o' => {
+                                let arg = args.get(arg_idx).cloned().unwrap_or(Value::Null);
+                                let num = arg.as_i64().unwrap_or(0);
+                                let formatted = if alt_form {
+                                    // DuckDB uses 0 prefix, not 0o
+                                    format!("0{:o}", num)
+                                } else {
+                                    format!("{:o}", num)
+                                };
+                                new_result.push_str(&formatted);
+                                arg_idx += 1;
+                                i = j + 1;
+                                continue;
+                            }
+                            'c' => {
+                                let arg = args.get(arg_idx).cloned().unwrap_or(Value::Null);
+                                let ch = arg.as_i64().unwrap_or(0) as u8 as char;
+                                new_result.push(ch);
+                                arg_idx += 1;
+                                i = j + 1;
+                                continue;
+                            }
+                            'f' | 'F' => {
+                                let arg = args.get(arg_idx).cloned().unwrap_or(Value::Null);
+                                let num = arg.as_f64().unwrap_or(0.0);
+                                let prec = precision.unwrap_or(6);
+                                let formatted = format!("{:.prec$}", num, prec = prec);
+                                new_result.push_str(&formatted);
+                                arg_idx += 1;
+                                i = j + 1;
+                                continue;
+                            }
+                            'e' => {
+                                let arg = args.get(arg_idx).cloned().unwrap_or(Value::Null);
+                                let num = arg.as_f64().unwrap_or(0.0);
+                                let prec = precision.unwrap_or(6);
+                                let formatted = format!("{:.prec$e}", num, prec = prec);
+                                // DuckDB uses two-digit exponent with + sign
+                                let formatted = if let Some(e_pos) = formatted.find('e') {
+                                    let (base, exp) = formatted.split_at(e_pos);
+                                    let exp_part = &exp[1..]; // skip 'e'
+                                    let (sign, exp_num) = if exp_part.starts_with('-') {
+                                        ("-", &exp_part[1..])
+                                    } else if exp_part.starts_with('+') {
+                                        ("+", &exp_part[1..])
+                                    } else {
+                                        ("+", exp_part)
+                                    };
+                                    // Add + prefix for positive numbers if plus_sign flag is set
+                                    let prefix = if plus_sign && num >= 0.0 { "+" } else { "" };
+                                    format!("{}{}e{}{:02}", prefix, base, sign, exp_num.parse::<i32>().unwrap_or(0))
+                                } else {
+                                    formatted
+                                };
+                                new_result.push_str(&formatted);
+                                arg_idx += 1;
+                                i = j + 1;
+                                continue;
+                            }
+                            'E' => {
+                                let arg = args.get(arg_idx).cloned().unwrap_or(Value::Null);
+                                let num = arg.as_f64().unwrap_or(0.0);
+                                let prec = precision.unwrap_or(6);
+                                let formatted = format!("{:.prec$E}", num, prec = prec);
+                                // DuckDB uses two-digit exponent with + sign
+                                let formatted = if let Some(e_pos) = formatted.find('E') {
+                                    let (base, exp) = formatted.split_at(e_pos);
+                                    let exp_part = &exp[1..]; // skip 'E'
+                                    let (sign, exp_num) = if exp_part.starts_with('-') {
+                                        ("-", &exp_part[1..])
+                                    } else if exp_part.starts_with('+') {
+                                        ("+", &exp_part[1..])
+                                    } else {
+                                        ("+", exp_part)
+                                    };
+                                    format!("{}E{}{:02}", base, sign, exp_num.parse::<i32>().unwrap_or(0))
+                                } else {
+                                    formatted
+                                };
+                                new_result.push_str(&formatted);
+                                arg_idx += 1;
+                                i = j + 1;
+                                continue;
+                            }
+                            'g' | 'G' => {
+                                let arg = args.get(arg_idx).cloned().unwrap_or(Value::Null);
+                                let num = arg.as_f64().unwrap_or(0.0);
+                                new_result.push_str(&format!("{}", num));
+                                arg_idx += 1;
                                 i = j + 1;
                                 continue;
                             }
