@@ -2832,6 +2832,48 @@ fn evaluate_function(name: &str, args: &[Value]) -> Result<Value> {
                 _ => Ok(Value::Null),
             }
         }
+        "TO_BASE" => {
+            // Convert number to string in given base (2-36)
+            let num = match args.first() {
+                Some(Value::Null) | None => return Ok(Value::Null),
+                Some(v) => v.as_i64().unwrap_or(0),
+            };
+            let base = match args.get(1) {
+                Some(Value::Null) | None => return Ok(Value::Null),
+                Some(v) => v.as_i64().unwrap_or(10) as u32,
+            };
+            let min_width = args.get(2).and_then(|v| v.as_i64()).unwrap_or(0) as usize;
+
+            if base < 2 || base > 36 {
+                return Err(Error::Execution(format!("Base must be between 2 and 36, got {}", base)));
+            }
+
+            const DIGITS: &[u8] = b"0123456789abcdefghijklmnopqrstuvwxyz";
+            let negative = num < 0;
+            let mut n = num.unsigned_abs();
+            let mut result = Vec::new();
+
+            if n == 0 {
+                result.push(b'0');
+            } else {
+                while n > 0 {
+                    result.push(DIGITS[(n % base as u64) as usize]);
+                    n /= base as u64;
+                }
+            }
+
+            // Pad with zeros if min_width specified
+            while result.len() < min_width {
+                result.push(b'0');
+            }
+
+            result.reverse();
+            let mut s = String::from_utf8(result).unwrap_or_default();
+            if negative {
+                s.insert(0, '-');
+            }
+            Ok(Value::Varchar(s))
+        }
         "UNHEX" | "FROM_HEX" => {
             match args.first() {
                 Some(Value::Varchar(s)) => {
