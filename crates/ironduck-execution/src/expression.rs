@@ -2554,8 +2554,14 @@ fn evaluate_function(name: &str, args: &[Value]) -> Result<Value> {
 
         // Bit manipulation functions
         "BIT_COUNT" => {
-            let val = args.first().and_then(|v| v.as_i64()).unwrap_or(0);
-            Ok(Value::Integer(val.count_ones() as i32))
+            match args.first() {
+                Some(Value::Null) | None => Ok(Value::Null),
+                Some(Value::HugeInt(val)) => Ok(Value::Integer(val.count_ones() as i32)),
+                Some(v) => {
+                    let val = v.as_i64().unwrap_or(0);
+                    Ok(Value::Integer(val.count_ones() as i32))
+                }
+            }
         }
         "BIT_LENGTH" => {
             let s = match args.first() {
