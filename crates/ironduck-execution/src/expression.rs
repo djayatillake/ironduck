@@ -2171,12 +2171,27 @@ fn evaluate_function(name: &str, args: &[Value]) -> Result<Value> {
             }
         }
         "FACTORIAL" => {
+            // Return NULL for NULL input
+            match args.first() {
+                Some(Value::Null) | None => return Ok(Value::Null),
+                _ => {}
+            }
             let n = args.first().and_then(|v| v.as_i64()).unwrap_or(0);
             if n < 0 {
-                Ok(Value::Null)
+                // DuckDB returns 1 for negative factorials
+                Ok(Value::BigInt(1))
+            } else if n > 33 {
+                // DuckDB errors for factorial >= 34 (overflow in 128-bit integer)
+                Err(Error::Execution(format!(
+                    "Out of range error: cannot compute factorial of {}", n
+                )))
             } else if n > 20 {
-                // Factorial of 21+ overflows i64
-                Ok(Value::Null)
+                // Use HugeInt for n > 20 (factorial(21) overflows i64)
+                let mut result: i128 = 1;
+                for i in 2..=n {
+                    result = result.saturating_mul(i as i128);
+                }
+                Ok(Value::HugeInt(result))
             } else {
                 let result: i64 = (1..=n).product();
                 Ok(Value::BigInt(result))
