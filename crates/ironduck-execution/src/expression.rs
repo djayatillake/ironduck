@@ -2189,7 +2189,12 @@ fn evaluate_function(name: &str, args: &[Value]) -> Result<Value> {
                     }
                     a
                 }
-                Ok(Value::BigInt((a / gcd(a, b)) * b))
+                // Use checked multiplication to handle overflow
+                let g = gcd(a, b);
+                match (a / g).checked_mul(b) {
+                    Some(result) => Ok(Value::BigInt(result)),
+                    None => Ok(Value::HugeInt((a as i128 / g as i128) * b as i128)),
+                }
             }
         }
         "FACTORIAL" => {
