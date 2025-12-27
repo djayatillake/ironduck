@@ -873,10 +873,13 @@ fn evaluate_function(name: &str, args: &[Value]) -> Result<Value> {
             }
         }
         "LPAD" => {
-            // Return NULL if any argument is NULL
+            // Return NULL if any argument is NULL, error if first arg is not string
             let s = match args.first() {
                 Some(Value::Null) => return Ok(Value::Null),
-                Some(v) => v.as_str().unwrap_or(""),
+                Some(Value::Varchar(s)) => s.as_str(),
+                Some(v) => return Err(Error::InvalidArguments(format!(
+                    "LPAD first argument must be a string, got {:?}", v
+                ))),
                 None => "",
             };
             let len = match args.get(1) {
@@ -916,10 +919,13 @@ fn evaluate_function(name: &str, args: &[Value]) -> Result<Value> {
             }
         }
         "RPAD" => {
-            // Return NULL if any argument is NULL
+            // Return NULL if any argument is NULL, error if first arg is not string
             let s = match args.first() {
                 Some(Value::Null) => return Ok(Value::Null),
-                Some(v) => v.as_str().unwrap_or(""),
+                Some(Value::Varchar(s)) => s.as_str(),
+                Some(v) => return Err(Error::InvalidArguments(format!(
+                    "RPAD first argument must be a string, got {:?}", v
+                ))),
                 None => "",
             };
             let len = match args.get(1) {
