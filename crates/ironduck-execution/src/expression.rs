@@ -2478,6 +2478,71 @@ fn evaluate_function(name: &str, args: &[Value]) -> Result<Value> {
                 .collect();
             Ok(Value::Varchar(hash))
         }
+        "SHA1" => {
+            match args.first() {
+                Some(Value::Null) | None => return Ok(Value::Null),
+                _ => {}
+            }
+            let bytes = match args.first() {
+                Some(Value::Blob(b)) => b.clone(),
+                Some(v) => value_to_string(v).into_bytes(),
+                None => return Ok(Value::Null),
+            };
+
+            // SHA-1 implementation
+            fn sha1_transform(state: &mut [u32; 5], block: &[u8]) {
+                let mut w = [0u32; 80];
+                for (i, chunk) in block.chunks(4).enumerate() {
+                    w[i] = u32::from_be_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+                }
+                for i in 16..80 {
+                    w[i] = (w[i-3] ^ w[i-8] ^ w[i-14] ^ w[i-16]).rotate_left(1);
+                }
+
+                let (mut a, mut b, mut c, mut d, mut e) = (state[0], state[1], state[2], state[3], state[4]);
+
+                for i in 0..80 {
+                    let (f, k) = match i {
+                        0..=19 => ((b & c) | ((!b) & d), 0x5A827999u32),
+                        20..=39 => (b ^ c ^ d, 0x6ED9EBA1u32),
+                        40..=59 => ((b & c) | (b & d) | (c & d), 0x8F1BBCDCu32),
+                        _ => (b ^ c ^ d, 0xCA62C1D6u32),
+                    };
+                    let temp = a.rotate_left(5).wrapping_add(f).wrapping_add(e).wrapping_add(k).wrapping_add(w[i]);
+                    e = d;
+                    d = c;
+                    c = b.rotate_left(30);
+                    b = a;
+                    a = temp;
+                }
+
+                state[0] = state[0].wrapping_add(a);
+                state[1] = state[1].wrapping_add(b);
+                state[2] = state[2].wrapping_add(c);
+                state[3] = state[3].wrapping_add(d);
+                state[4] = state[4].wrapping_add(e);
+            }
+
+            let mut state: [u32; 5] = [0x67452301, 0xEFCDAB89, 0x98BADCFE, 0x10325476, 0xC3D2E1F0];
+            let bit_len = (bytes.len() as u64) * 8;
+            let mut padded = bytes.to_vec();
+            padded.push(0x80);
+            while (padded.len() % 64) != 56 {
+                padded.push(0);
+            }
+            padded.extend_from_slice(&bit_len.to_be_bytes());
+
+            for chunk in padded.chunks(64) {
+                sha1_transform(&mut state, chunk);
+            }
+
+            let hash: String = state
+                .iter()
+                .flat_map(|&x| x.to_be_bytes())
+                .map(|b| format!("{:02x}", b))
+                .collect();
+            Ok(Value::Varchar(hash))
+        }
         "SHA256" | "SHA2" => {
             // Return NULL for NULL input
             match args.first() {
