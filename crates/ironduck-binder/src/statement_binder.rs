@@ -472,10 +472,13 @@ fn bind_query(binder: &Binder, query: &sql::Query) -> Result<BoundStatement> {
                 let ctx = ExpressionBinderContext::new(from_clause);
                 for order in &ob.exprs {
                     let expr = bind_expression(binder, &order.expr, &ctx)?;
+                    // DuckDB defaults to NULLS FIRST for ascending, NULLS LAST for descending
+                    let ascending = order.asc.unwrap_or(true);
+                    let nulls_first = order.nulls_first.unwrap_or(ascending);
                     order_by.push(BoundOrderBy {
                         expr,
-                        ascending: order.asc.unwrap_or(true),
-                        nulls_first: order.nulls_first.unwrap_or(false),
+                        ascending,
+                        nulls_first,
                     });
                 }
             }
@@ -882,10 +885,13 @@ fn bind_query_select_with_ctes(
         let ctx = ExpressionBinderContext::new(&result.from);
         for order in &order_by.exprs {
             let expr = bind_expression(binder, &order.expr, &ctx)?;
+            // DuckDB defaults to NULLS FIRST for ascending, NULLS LAST for descending
+            let ascending = order.asc.unwrap_or(true);
+            let nulls_first = order.nulls_first.unwrap_or(ascending);
             result.order_by.push(BoundOrderBy {
                 expr,
-                ascending: order.asc.unwrap_or(true),
-                nulls_first: order.nulls_first.unwrap_or(false),
+                ascending,
+                nulls_first,
             });
         }
     }
@@ -925,10 +931,13 @@ fn bind_query_select_with_outer(
         let ctx = ExpressionBinderContext::with_outer_tables(&result.from, outer_tables);
         for order in &order_by.exprs {
             let expr = bind_expression(binder, &order.expr, &ctx)?;
+            // DuckDB defaults to NULLS FIRST for ascending, NULLS LAST for descending
+            let ascending = order.asc.unwrap_or(true);
+            let nulls_first = order.nulls_first.unwrap_or(ascending);
             result.order_by.push(BoundOrderBy {
                 expr,
-                ascending: order.asc.unwrap_or(true),
-                nulls_first: order.nulls_first.unwrap_or(false),
+                ascending,
+                nulls_first,
             });
         }
     }
@@ -1114,8 +1123,12 @@ fn bind_select_with_ctes(
 
                             let flat_groups: Vec<BoundExpression> = bound_groups.into_iter().flatten().collect();
                             let n = flat_groups.len();
+                            // Limit CUBE to 15 elements to prevent exponential blowup (2^15 = 32768 grouping sets max)
+                            if n > 15 {
+                                return Err(Error::NotImplemented(format!("CUBE with more than 15 elements exceeds maximum grouping sets (got {} elements)", n)));
+                            }
                             // Generate all 2^n combinations
-                            for mask in 0..(1 << n) {
+                            for mask in 0..(1usize << n) {
                                 let mut combo = Vec::new();
                                 for i in 0..n {
                                     if (mask & (1 << i)) != 0 {
@@ -1314,7 +1327,11 @@ fn bind_select_with_outer(
                                 .collect::<Result<Vec<_>>>()?;
                             let flat_groups: Vec<BoundExpression> = bound_groups.into_iter().flatten().collect();
                             let n = flat_groups.len();
-                            for mask in 0..(1 << n) {
+                            // Limit CUBE to 15 elements to prevent exponential blowup
+                            if n > 15 {
+                                return Err(Error::NotImplemented(format!("CUBE with more than 15 elements exceeds maximum grouping sets (got {} elements)", n)));
+                            }
+                            for mask in 0..(1usize << n) {
                                 let mut combo = Vec::new();
                                 for i in 0..n {
                                     if (mask & (1 << i)) != 0 {
@@ -2281,6 +2298,98 @@ fn bind_table_function(
                 alias: table_alias,
                 column_names,
                 column_types,
+            })
+        }
+        "READ_JSON_OBJECTS" => {
+            // read_json_objects(path) - returns each JSON object as a single column
+            let path = args.first()
+                .and_then(|arg| match arg {
+                    sql::FunctionArg::Unnamed(sql::FunctionArgExpr::Expr(sql::Expr::Value(v))) => {
+                        match v {
+                            sql::Value::SingleQuotedString(s) |
+                            sql::Value::DoubleQuotedString(s) => Some(s.clone()),
+                            _ => None,
+                        }
+                    }
+                    _ => None,
+                })
+                .ok_or_else(|| Error::InvalidArguments("read_json_objects() requires a file path as first argument".to_string()))?;
+
+            let table_alias = alias.as_ref().map(|a| a.name.value.clone());
+
+            // Returns a single column 'json' containing the raw JSON objects
+            Ok(BoundTableRef::FileTableFunction {
+                path,
+                file_type: FileTableType::JsonObjects,
+                alias: table_alias,
+                column_names: vec!["json".to_string()],
+                column_types: vec![LogicalType::Varchar],
+            })
+        }
+        "GLOB" => {
+            // glob(pattern) - returns files matching a glob pattern
+            let pattern = args.first()
+                .and_then(|arg| match arg {
+                    sql::FunctionArg::Unnamed(sql::FunctionArgExpr::Expr(sql::Expr::Value(v))) => {
+                        match v {
+                            sql::Value::SingleQuotedString(s) |
+                            sql::Value::DoubleQuotedString(s) => Some(s.clone()),
+                            _ => None,
+                        }
+                    }
+                    _ => None,
+                })
+                .ok_or_else(|| Error::InvalidArguments("glob() requires a pattern as first argument".to_string()))?;
+
+            let table_alias = alias.as_ref().map(|a| a.name.value.clone());
+
+            Ok(BoundTableRef::FileTableFunction {
+                path: pattern,
+                file_type: FileTableType::Glob,
+                alias: table_alias,
+                column_names: vec!["file".to_string()],
+                column_types: vec![LogicalType::Varchar],
+            })
+        }
+        "PARQUET_METADATA" | "QUERY_PARQUET" | "PARQUET_SCHEMA" => {
+            // parquet_metadata(path) - returns metadata about a parquet file
+            let path = args.first()
+                .and_then(|arg| match arg {
+                    sql::FunctionArg::Unnamed(sql::FunctionArgExpr::Expr(sql::Expr::Value(v))) => {
+                        match v {
+                            sql::Value::SingleQuotedString(s) |
+                            sql::Value::DoubleQuotedString(s) => Some(s.clone()),
+                            _ => None,
+                        }
+                    }
+                    _ => None,
+                })
+                .ok_or_else(|| Error::InvalidArguments("parquet_metadata() requires a file path as first argument".to_string()))?;
+
+            let table_alias = alias.as_ref().map(|a| a.name.value.clone());
+
+            Ok(BoundTableRef::FileTableFunction {
+                path,
+                file_type: FileTableType::ParquetMetadata,
+                alias: table_alias,
+                column_names: vec![
+                    "file_name".to_string(),
+                    "row_group_id".to_string(),
+                    "row_group_num_rows".to_string(),
+                    "row_group_bytes".to_string(),
+                    "column_id".to_string(),
+                    "column_name".to_string(),
+                    "column_type".to_string(),
+                ],
+                column_types: vec![
+                    LogicalType::Varchar,
+                    LogicalType::BigInt,
+                    LogicalType::BigInt,
+                    LogicalType::BigInt,
+                    LogicalType::BigInt,
+                    LogicalType::Varchar,
+                    LogicalType::Varchar,
+                ],
             })
         }
         _ => Err(Error::NotImplemented(format!("Table function: {}", func_name))),

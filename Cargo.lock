@@ -1227,6 +1227,7 @@ dependencies = [
  "arrow-csv",
  "chrono",
  "crossbeam",
+ "glob",
  "hashbrown 0.15.5",
  "ironduck-catalog",
  "ironduck-common",

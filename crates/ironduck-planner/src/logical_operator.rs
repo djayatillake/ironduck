@@ -352,6 +352,18 @@ pub enum TableFunctionKind {
         /// Column types inferred from JSON (populated during execution)
         column_types: Vec<LogicalType>,
     },
+    /// read_json_objects(path) - reads JSON objects as single column
+    ReadJsonObjects {
+        path: String,
+    },
+    /// glob(pattern) - returns files matching a glob pattern
+    Glob {
+        pattern: String,
+    },
+    /// parquet_metadata(path) - returns metadata about a parquet file
+    ParquetMetadata {
+        path: String,
+    },
 }
 
 /// Type of set operation

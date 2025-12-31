@@ -312,6 +312,12 @@ pub enum FileTableType {
     Parquet,
     /// JSON file (newline-delimited JSON or JSON array)
     Json,
+    /// JSON objects (each line is a complete JSON object returned as-is)
+    JsonObjects,
+    /// Glob pattern matching (returns file paths)
+    Glob,
+    /// Parquet metadata/schema information
+    ParquetMetadata,
 }
 
 /// Join types

@@ -521,30 +521,97 @@ fn evaluate_unary_op(op: UnaryOperator, val: &Value) -> Result<Value> {
 /// Evaluate a function call
 fn evaluate_function(name: &str, args: &[Value]) -> Result<Value> {
     match name.to_uppercase().as_str() {
-        // String functions
+        // String functions - all return NULL if input is NULL
         "LOWER" | "LCASE" => {
-            let s = args.first().and_then(|v| v.as_str()).unwrap_or("");
+            let s = match args.first() {
+                Some(Value::Null) => return Ok(Value::Null),
+                Some(v) => v.as_str().unwrap_or(""),
+                None => "",
+            };
             Ok(Value::Varchar(s.to_lowercase()))
         }
         "UPPER" | "UCASE" => {
-            let s = args.first().and_then(|v| v.as_str()).unwrap_or("");
+            let s = match args.first() {
+                Some(Value::Null) => return Ok(Value::Null),
+                Some(v) => v.as_str().unwrap_or(""),
+                None => "",
+            };
             Ok(Value::Varchar(s.to_uppercase()))
         }
-        "LENGTH" | "CHAR_LENGTH" => {
-            let s = args.first().and_then(|v| v.as_str()).unwrap_or("");
+        "LENGTH" | "CHAR_LENGTH" | "CHARACTER_LENGTH" => {
+            let s = match args.first() {
+                Some(Value::Null) => return Ok(Value::Null),
+                Some(v) => v.as_str().unwrap_or(""),
+                None => "",
+            };
             Ok(Value::BigInt(s.chars().count() as i64))
         }
         "TRIM" => {
-            let s = args.first().and_then(|v| v.as_str()).unwrap_or("");
-            Ok(Value::Varchar(s.trim().to_string()))
+            let s = match args.first() {
+                Some(Value::Null) => return Ok(Value::Null),
+                Some(v) => v.as_str().unwrap_or(""),
+                None => "",
+            };
+            // Check for second argument (characters to trim)
+            if let Some(chars_arg) = args.get(1) {
+                if matches!(chars_arg, Value::Null) {
+                    return Ok(Value::Null);
+                }
+                let chars_to_trim = chars_arg.as_str().unwrap_or("");
+                if chars_to_trim.is_empty() {
+                    return Ok(Value::Varchar(s.to_string()));
+                }
+                // Trim from both ends any characters in chars_to_trim
+                let ltrimmed: String = s.chars().skip_while(|c| chars_to_trim.contains(*c)).collect();
+                let reversed: String = ltrimmed.chars().rev().skip_while(|c| chars_to_trim.contains(*c)).collect();
+                Ok(Value::Varchar(reversed.chars().rev().collect()))
+            } else {
+                Ok(Value::Varchar(s.trim().to_string()))
+            }
         }
         "LTRIM" => {
-            let s = args.first().and_then(|v| v.as_str()).unwrap_or("");
-            Ok(Value::Varchar(s.trim_start().to_string()))
+            let s = match args.first() {
+                Some(Value::Null) => return Ok(Value::Null),
+                Some(v) => v.as_str().unwrap_or(""),
+                None => "",
+            };
+            // Check for second argument (characters to trim)
+            if let Some(chars_arg) = args.get(1) {
+                if matches!(chars_arg, Value::Null) {
+                    return Ok(Value::Null);
+                }
+                let chars_to_trim = chars_arg.as_str().unwrap_or("");
+                if chars_to_trim.is_empty() {
+                    return Ok(Value::Varchar(s.to_string()));
+                }
+                // Trim from start any characters in chars_to_trim
+                let result: String = s.chars().skip_while(|c| chars_to_trim.contains(*c)).collect();
+                Ok(Value::Varchar(result))
+            } else {
+                Ok(Value::Varchar(s.trim_start().to_string()))
+            }
         }
         "RTRIM" => {
-            let s = args.first().and_then(|v| v.as_str()).unwrap_or("");
-            Ok(Value::Varchar(s.trim_end().to_string()))
+            let s = match args.first() {
+                Some(Value::Null) => return Ok(Value::Null),
+                Some(v) => v.as_str().unwrap_or(""),
+                None => "",
+            };
+            // Check for second argument (characters to trim)
+            if let Some(chars_arg) = args.get(1) {
+                if matches!(chars_arg, Value::Null) {
+                    return Ok(Value::Null);
+                }
+                let chars_to_trim = chars_arg.as_str().unwrap_or("");
+                if chars_to_trim.is_empty() {
+                    return Ok(Value::Varchar(s.to_string()));
+                }
+                // Trim from end any characters in chars_to_trim
+                let reversed: String = s.chars().rev().skip_while(|c| chars_to_trim.contains(*c)).collect();
+                Ok(Value::Varchar(reversed.chars().rev().collect()))
+            } else {
+                Ok(Value::Varchar(s.trim_end().to_string()))
+            }
         }
         "CONCAT" => {
             let result: String = args.iter().map(value_to_string).collect();
@@ -553,6 +620,10 @@ fn evaluate_function(name: &str, args: &[Value]) -> Result<Value> {
         "CONCAT_WS" => {
             // First arg is the separator, rest are values to join
             if args.is_empty() {
+                return Ok(Value::Null);
+            }
+            // Return NULL if separator is NULL
+            if matches!(args.first(), Some(Value::Null)) {
                 return Ok(Value::Null);
             }
             let separator = value_to_string(&args[0]);
@@ -565,9 +636,22 @@ fn evaluate_function(name: &str, args: &[Value]) -> Result<Value> {
             Ok(Value::Varchar(parts.join(&separator)))
         }
         "SUBSTRING" | "SUBSTR" => {
-            let s = args.first().and_then(|v| v.as_str()).unwrap_or("");
-            let start = args.get(1).and_then(|v| v.as_i64()).unwrap_or(1) as usize;
-            let len = args.get(2).and_then(|v| v.as_i64());
+            // Return NULL if string is NULL
+            let s = match args.first() {
+                Some(Value::Null) => return Ok(Value::Null),
+                Some(v) => v.as_str().unwrap_or(""),
+                None => "",
+            };
+            let start = match args.get(1) {
+                Some(Value::Null) => return Ok(Value::Null),
+                Some(v) => v.as_i64().unwrap_or(1) as usize,
+                None => 1,
+            };
+            let len = match args.get(2) {
+                Some(Value::Null) => return Ok(Value::Null),
+                Some(v) => v.as_i64(),
+                None => None,
+            };
 
             let start_idx = start.saturating_sub(1); // SQL is 1-indexed
             let chars: Vec<char> = s.chars().collect();
@@ -579,26 +663,61 @@ fn evaluate_function(name: &str, args: &[Value]) -> Result<Value> {
             Ok(Value::Varchar(result))
         }
         "REPLACE" => {
-            let s = args.first().and_then(|v| v.as_str()).unwrap_or("");
-            let from = args.get(1).and_then(|v| v.as_str()).unwrap_or("");
-            let to = args.get(2).and_then(|v| v.as_str()).unwrap_or("");
+            // Return NULL if any argument is NULL
+            let s = match args.first() {
+                Some(Value::Null) => return Ok(Value::Null),
+                Some(v) => v.as_str().unwrap_or(""),
+                None => "",
+            };
+            let from = match args.get(1) {
+                Some(Value::Null) => return Ok(Value::Null),
+                Some(v) => v.as_str().unwrap_or(""),
+                None => "",
+            };
+            let to = match args.get(2) {
+                Some(Value::Null) => return Ok(Value::Null),
+                Some(v) => v.as_str().unwrap_or(""),
+                None => "",
+            };
             Ok(Value::Varchar(s.replace(from, to)))
         }
         "LEFT" => {
-            let s = args.first().and_then(|v| v.as_str()).unwrap_or("");
-            let n = args.get(1).and_then(|v| v.as_i64()).unwrap_or(0) as usize;
+            // Return NULL if any argument is NULL
+            let s = match args.first() {
+                Some(Value::Null) => return Ok(Value::Null),
+                Some(v) => v.as_str().unwrap_or(""),
+                None => "",
+            };
+            let n = match args.get(1) {
+                Some(Value::Null) => return Ok(Value::Null),
+                Some(v) => v.as_i64().unwrap_or(0) as usize,
+                None => 0,
+            };
             Ok(Value::Varchar(s.chars().take(n).collect()))
         }
         "RIGHT" => {
-            let s = args.first().and_then(|v| v.as_str()).unwrap_or("");
-            let n = args.get(1).and_then(|v| v.as_i64()).unwrap_or(0) as usize;
+            // Return NULL if any argument is NULL
+            let s = match args.first() {
+                Some(Value::Null) => return Ok(Value::Null),
+                Some(v) => v.as_str().unwrap_or(""),
+                None => "",
+            };
+            let n = match args.get(1) {
+                Some(Value::Null) => return Ok(Value::Null),
+                Some(v) => v.as_i64().unwrap_or(0) as usize,
+                None => 0,
+            };
             let chars: Vec<char> = s.chars().collect();
             let start = chars.len().saturating_sub(n);
             Ok(Value::Varchar(chars.into_iter().skip(start).collect()))
         }
         "ASCII" | "ORD" => {
-            // Return the ASCII code of the first character
-            let s = args.first().and_then(|v| v.as_str()).unwrap_or("");
+            // Return NULL if argument is NULL
+            let s = match args.first() {
+                Some(Value::Null) => return Ok(Value::Null),
+                Some(v) => v.as_str().unwrap_or(""),
+                None => "",
+            };
             if s.is_empty() {
                 Ok(Value::Null)
             } else {
@@ -610,10 +729,23 @@ fn evaluate_function(name: &str, args: &[Value]) -> Result<Value> {
             match args.first() {
                 Some(Value::Null) => Ok(Value::Null),
                 Some(v) => {
-                    let code = v.as_i64().unwrap_or(0) as u32;
-                    match char::from_u32(code) {
+                    let code = v.as_i64().unwrap_or(0);
+                    // Validate codepoint range
+                    if code < 0 {
+                        return Err(Error::InvalidArguments(format!(
+                            "Invalid codepoint value for chr: {}", code
+                        )));
+                    }
+                    if code > 0x10FFFF {
+                        return Err(Error::InvalidArguments(format!(
+                            "Invalid codepoint value for chr: {}", code
+                        )));
+                    }
+                    match char::from_u32(code as u32) {
                         Some(c) => Ok(Value::Varchar(c.to_string())),
-                        None => Ok(Value::Null),
+                        None => Err(Error::InvalidArguments(format!(
+                            "Invalid codepoint value for chr: {}", code
+                        ))),
                     }
                 }
                 None => Ok(Value::Null),
@@ -621,16 +753,25 @@ fn evaluate_function(name: &str, args: &[Value]) -> Result<Value> {
         }
         "UNICODE" => {
             // Return Unicode code point of first character
-            let s = args.first().and_then(|v| v.as_str()).unwrap_or("");
+            let s = match args.first() {
+                Some(Value::Null) => return Ok(Value::Null),
+                Some(v) => v.as_str().unwrap_or(""),
+                None => "",
+            };
             if s.is_empty() {
-                Ok(Value::Null)
+                // DuckDB returns -1 for empty string
+                Ok(Value::Integer(-1))
             } else {
                 Ok(Value::Integer(s.chars().next().unwrap() as i32))
             }
         }
         "STRIP_ACCENTS" => {
             // Remove accents from characters (simplified version)
-            let s = args.first().and_then(|v| v.as_str()).unwrap_or("");
+            let s = match args.first() {
+                Some(Value::Null) => return Ok(Value::Null),
+                Some(v) => v.as_str().unwrap_or(""),
+                None => "",
+            };
             let result: String = s.chars().map(|c| {
                 match c {
                     'á' | 'à' | 'â' | 'ä' | 'ã' | 'å' => 'a',
@@ -670,13 +811,31 @@ fn evaluate_function(name: &str, args: &[Value]) -> Result<Value> {
             Ok(Value::Varchar(bar))
         }
         "REVERSE" => {
-            let s = args.first().and_then(|v| v.as_str()).unwrap_or("");
+            // Return NULL if argument is NULL
+            let s = match args.first() {
+                Some(Value::Null) => return Ok(Value::Null),
+                Some(v) => v.as_str().unwrap_or(""),
+                None => "",
+            };
             Ok(Value::Varchar(s.chars().rev().collect()))
         }
         "TRANSLATE" => {
-            let s = args.first().and_then(|v| v.as_str()).unwrap_or("");
-            let from_chars = args.get(1).and_then(|v| v.as_str()).unwrap_or("");
-            let to_chars = args.get(2).and_then(|v| v.as_str()).unwrap_or("");
+            // Return NULL if any argument is NULL
+            let s = match args.first() {
+                Some(Value::Null) => return Ok(Value::Null),
+                Some(v) => v.as_str().unwrap_or(""),
+                None => "",
+            };
+            let from_chars = match args.get(1) {
+                Some(Value::Null) => return Ok(Value::Null),
+                Some(v) => v.as_str().unwrap_or(""),
+                None => "",
+            };
+            let to_chars = match args.get(2) {
+                Some(Value::Null) => return Ok(Value::Null),
+                Some(v) => v.as_str().unwrap_or(""),
+                None => "",
+            };
             let from: Vec<char> = from_chars.chars().collect();
             let to: Vec<char> = to_chars.chars().collect();
             let result: String = s.chars().filter_map(|c| {
@@ -689,57 +848,202 @@ fn evaluate_function(name: &str, args: &[Value]) -> Result<Value> {
             Ok(Value::Varchar(result))
         }
         "REPEAT" => {
-            let s = args.first().and_then(|v| v.as_str()).unwrap_or("");
-            let n = args.get(1).and_then(|v| v.as_i64()).unwrap_or(0) as usize;
-            Ok(Value::Varchar(s.repeat(n)))
+            // Return NULL if string is NULL
+            let s = match args.first() {
+                Some(Value::Null) => return Ok(Value::Null),
+                Some(v) => v.as_str().unwrap_or(""),
+                None => "",
+            };
+            // Return NULL if count is NULL, empty string if negative or zero
+            // Validate that second argument is numeric (not a string)
+            let n = match args.get(1) {
+                Some(Value::Null) => return Ok(Value::Null),
+                Some(Value::Varchar(_)) => {
+                    return Err(ironduck_common::Error::InvalidArguments(
+                        "REPEAT count argument must be an integer, not a string".to_string()
+                    ));
+                }
+                Some(v) => v.as_i64().unwrap_or(0),
+                None => 0,
+            };
+            if n <= 0 {
+                Ok(Value::Varchar(String::new()))
+            } else {
+                Ok(Value::Varchar(s.repeat(n as usize)))
+            }
         }
         "LPAD" => {
-            let s = args.first().and_then(|v| v.as_str()).unwrap_or("");
-            let len = args.get(1).and_then(|v| v.as_i64()).unwrap_or(0) as usize;
-            let pad = args.get(2).and_then(|v| v.as_str()).unwrap_or(" ");
-            if s.len() >= len {
-                Ok(Value::Varchar(s.to_string()))
+            // Return NULL if any argument is NULL, error if first arg is not string
+            let s = match args.first() {
+                Some(Value::Null) => return Ok(Value::Null),
+                Some(Value::Varchar(s)) => s.as_str(),
+                Some(v) => return Err(Error::InvalidArguments(format!(
+                    "LPAD first argument must be a string, got {:?}", v
+                ))),
+                None => "",
+            };
+            let len = match args.get(1) {
+                Some(Value::Null) => return Ok(Value::Null),
+                Some(v) => v.as_i64().unwrap_or(0),
+                None => 0,
+            };
+            let pad = match args.get(2) {
+                Some(Value::Null) => return Ok(Value::Null),
+                Some(v) => v.as_str().unwrap_or(" "),
+                None => " ",
+            };
+            // Negative or zero length returns empty string
+            if len <= 0 {
+                return Ok(Value::Varchar(String::new()));
+            }
+            // Error on huge lengths to prevent memory exhaustion
+            const MAX_PAD_LENGTH: i64 = 10_000_000;
+            if len > MAX_PAD_LENGTH {
+                return Err(ironduck_common::Error::InvalidArguments(format!(
+                    "LPAD length {} exceeds maximum allowed ({})", len, MAX_PAD_LENGTH
+                )));
+            }
+            let len = len as usize;
+            let s_chars: Vec<char> = s.chars().collect();
+            if s_chars.len() >= len {
+                // Truncate to len characters
+                Ok(Value::Varchar(s_chars[..len].iter().collect()))
             } else {
-                let pad_len = len - s.len();
+                // Empty pad string is an error only when we need to pad
+                if pad.is_empty() {
+                    return Err(ironduck_common::Error::Execution("LPAD padding string cannot be empty".to_string()));
+                }
+                let pad_len = len - s_chars.len();
                 let padding: String = pad.chars().cycle().take(pad_len).collect();
                 Ok(Value::Varchar(format!("{}{}", padding, s)))
             }
         }
         "RPAD" => {
-            let s = args.first().and_then(|v| v.as_str()).unwrap_or("");
-            let len = args.get(1).and_then(|v| v.as_i64()).unwrap_or(0) as usize;
-            let pad = args.get(2).and_then(|v| v.as_str()).unwrap_or(" ");
-            if s.len() >= len {
-                Ok(Value::Varchar(s.to_string()))
+            // Return NULL if any argument is NULL, error if first arg is not string
+            let s = match args.first() {
+                Some(Value::Null) => return Ok(Value::Null),
+                Some(Value::Varchar(s)) => s.as_str(),
+                Some(v) => return Err(Error::InvalidArguments(format!(
+                    "RPAD first argument must be a string, got {:?}", v
+                ))),
+                None => "",
+            };
+            let len = match args.get(1) {
+                Some(Value::Null) => return Ok(Value::Null),
+                Some(v) => v.as_i64().unwrap_or(0),
+                None => 0,
+            };
+            let pad = match args.get(2) {
+                Some(Value::Null) => return Ok(Value::Null),
+                Some(v) => v.as_str().unwrap_or(" "),
+                None => " ",
+            };
+            // Negative or zero length returns empty string
+            if len <= 0 {
+                return Ok(Value::Varchar(String::new()));
+            }
+            // Error on huge lengths to prevent memory exhaustion
+            const MAX_PAD_LENGTH: i64 = 10_000_000;
+            if len > MAX_PAD_LENGTH {
+                return Err(ironduck_common::Error::InvalidArguments(format!(
+                    "RPAD length {} exceeds maximum allowed ({})", len, MAX_PAD_LENGTH
+                )));
+            }
+            let len = len as usize;
+            let s_chars: Vec<char> = s.chars().collect();
+            if s_chars.len() >= len {
+                // Truncate to len characters
+                Ok(Value::Varchar(s_chars[..len].iter().collect()))
             } else {
-                let pad_len = len - s.len();
+                // Empty pad string is an error only when we need to pad
+                if pad.is_empty() {
+                    return Err(ironduck_common::Error::Execution("RPAD padding string cannot be empty".to_string()));
+                }
+                let pad_len = len - s_chars.len();
                 let padding: String = pad.chars().cycle().take(pad_len).collect();
                 Ok(Value::Varchar(format!("{}{}", s, padding)))
             }
         }
         "INSTR" | "POSITION" | "STRPOS" => {
-            let haystack = args.first().and_then(|v| v.as_str()).unwrap_or("");
-            let needle = args.get(1).and_then(|v| v.as_str()).unwrap_or("");
+            // Return NULL if either argument is NULL
+            let haystack = match args.first() {
+                Some(Value::Null) | None => return Ok(Value::Null),
+                Some(v) => v.as_str().unwrap_or(""),
+            };
+            let needle = match args.get(1) {
+                Some(Value::Null) | None => return Ok(Value::Null),
+                Some(v) => v.as_str().unwrap_or(""),
+            };
+            // find() returns byte position, we need character position
             match haystack.find(needle) {
-                Some(pos) => Ok(Value::BigInt((pos + 1) as i64)), // 1-indexed
+                Some(byte_pos) => {
+                    // Count characters up to byte_pos
+                    let char_pos = haystack[..byte_pos].chars().count();
+                    Ok(Value::BigInt((char_pos + 1) as i64)) // 1-indexed
+                }
                 None => Ok(Value::BigInt(0)),
             }
         }
         "SPLIT_PART" => {
-            let s = args.first().and_then(|v| v.as_str()).unwrap_or("");
-            let delimiter = args.get(1).and_then(|v| v.as_str()).unwrap_or("");
-            let part = args.get(2).and_then(|v| v.as_i64()).unwrap_or(1) as usize;
-            let parts: Vec<&str> = s.split(delimiter).collect();
-            Ok(Value::Varchar(parts.get(part.saturating_sub(1)).unwrap_or(&"").to_string()))
+            // Return NULL if any argument is NULL
+            let s = match args.first() {
+                Some(Value::Null) => return Ok(Value::Null),
+                Some(v) => v.as_str().unwrap_or(""),
+                None => "",
+            };
+            let delimiter = match args.get(1) {
+                Some(Value::Null) => return Ok(Value::Null),
+                Some(v) => v.as_str().unwrap_or(""),
+                None => "",
+            };
+            let part = match args.get(2) {
+                Some(Value::Null) => return Ok(Value::Null),
+                Some(v) => v.as_i64().unwrap_or(1),
+                None => 1,
+            };
+            // Index 0 returns empty string
+            if part == 0 {
+                return Ok(Value::Varchar(String::new()));
+            }
+            // Empty delimiter: split each character
+            let parts: Vec<&str> = if delimiter.is_empty() {
+                s.chars().map(|c| {
+                    let start = s.find(c).unwrap();
+                    &s[start..start + c.len_utf8()]
+                }).collect()
+            } else {
+                s.split(delimiter).collect()
+            };
+            // Handle negative indices (count from end)
+            let idx = if part < 0 {
+                let abs_part = (-part) as usize;
+                if abs_part > parts.len() {
+                    return Ok(Value::Varchar(String::new()));
+                }
+                parts.len() - abs_part
+            } else {
+                (part - 1) as usize
+            };
+            Ok(Value::Varchar(parts.get(idx).unwrap_or(&"").to_string()))
         }
         "STRING_SPLIT" | "STR_SPLIT" | "STRING_TO_ARRAY" => {
-            let s = args.first().and_then(|v| v.as_str()).unwrap_or("");
+            // Return NULL if string is NULL
+            let s = match args.first() {
+                Some(Value::Null) => return Ok(Value::Null),
+                Some(v) => v.as_str().unwrap_or(""),
+                None => "",
+            };
             let delimiter = args.get(1).and_then(|v| v.as_str()).unwrap_or("");
             let parts: Vec<Value> = s.split(delimiter).map(|p| Value::Varchar(p.to_string())).collect();
             Ok(Value::List(parts))
         }
         "INITCAP" => {
-            let s = args.first().and_then(|v| v.as_str()).unwrap_or("");
+            // Return NULL if argument is NULL
+            let s = match args.first() {
+                Some(Value::Null) => return Ok(Value::Null),
+                Some(v) => v.as_str().unwrap_or(""),
+                None => "",
+            };
             let result: String = s.split_whitespace()
                 .map(|word| {
                     let mut chars: Vec<char> = word.chars().collect();
@@ -756,62 +1060,99 @@ fn evaluate_function(name: &str, args: &[Value]) -> Result<Value> {
             Ok(Value::Varchar(result))
         }
         "STARTS_WITH" | "PREFIX" => {
-            let s = args.first().and_then(|v| v.as_str()).unwrap_or("");
-            let prefix = args.get(1).and_then(|v| v.as_str()).unwrap_or("");
+            // Return NULL if either argument is NULL
+            let s = match args.first() {
+                Some(Value::Null) => return Ok(Value::Null),
+                Some(v) => v.as_str().unwrap_or(""),
+                None => "",
+            };
+            let prefix = match args.get(1) {
+                Some(Value::Null) => return Ok(Value::Null),
+                Some(v) => v.as_str().unwrap_or(""),
+                None => "",
+            };
             Ok(Value::Boolean(s.starts_with(prefix)))
         }
         "ENDS_WITH" | "SUFFIX" => {
-            let s = args.first().and_then(|v| v.as_str()).unwrap_or("");
-            let suffix = args.get(1).and_then(|v| v.as_str()).unwrap_or("");
+            // Return NULL if either argument is NULL
+            let s = match args.first() {
+                Some(Value::Null) => return Ok(Value::Null),
+                Some(v) => v.as_str().unwrap_or(""),
+                None => "",
+            };
+            let suffix = match args.get(1) {
+                Some(Value::Null) => return Ok(Value::Null),
+                Some(v) => v.as_str().unwrap_or(""),
+                None => "",
+            };
             Ok(Value::Boolean(s.ends_with(suffix)))
         }
         "CONTAINS" => {
-            let s = args.first().and_then(|v| v.as_str()).unwrap_or("");
-            let needle = args.get(1).and_then(|v| v.as_str()).unwrap_or("");
+            // Return NULL if either argument is NULL
+            let s = match args.first() {
+                Some(Value::Null) => return Ok(Value::Null),
+                Some(v) => v.as_str().unwrap_or(""),
+                None => "",
+            };
+            let needle = match args.get(1) {
+                Some(Value::Null) => return Ok(Value::Null),
+                Some(v) => v.as_str().unwrap_or(""),
+                None => "",
+            };
             Ok(Value::Boolean(s.contains(needle)))
         }
-        "FORMAT" | "PRINTF" => {
-            // Simple {} placeholder replacement (DuckDB-style)
-            let format_str = args.first().and_then(|v| v.as_str()).unwrap_or("");
-            let mut result = format_str.to_string();
-            let mut arg_idx = 1;
-            while let Some(pos) = result.find("{}") {
-                if let Some(arg) = args.get(arg_idx) {
-                    let replacement = match arg {
-                        Value::Null => "NULL".to_string(),
-                        Value::Varchar(s) => s.clone(),
-                        _ => arg.to_string(),
-                    };
-                    result = result[..pos].to_string() + &replacement + &result[pos + 2..];
-                    arg_idx += 1;
-                } else {
-                    break;
-                }
-            }
-            Ok(Value::Varchar(result))
-        }
-
         // Regular expression functions
         "REGEXP_MATCHES" | "REGEXP_LIKE" | "REGEXP" => {
-            let s = args.first().and_then(|v| v.as_str()).unwrap_or("");
-            let pattern = args.get(1).and_then(|v| v.as_str()).unwrap_or("");
+            // Return NULL if either argument is NULL
+            let s = match args.first() {
+                Some(Value::Null) => return Ok(Value::Null),
+                Some(v) => v.as_str().unwrap_or(""),
+                None => "",
+            };
+            let pattern = match args.get(1) {
+                Some(Value::Null) => return Ok(Value::Null),
+                Some(v) => v.as_str().unwrap_or(""),
+                None => "",
+            };
             match regex::Regex::new(pattern) {
                 Ok(re) => Ok(Value::Boolean(re.is_match(s))),
                 Err(_) => Ok(Value::Boolean(false)),
             }
         }
         "REGEXP_REPLACE" => {
-            let s = args.first().and_then(|v| v.as_str()).unwrap_or("");
-            let pattern = args.get(1).and_then(|v| v.as_str()).unwrap_or("");
-            let replacement = args.get(2).and_then(|v| v.as_str()).unwrap_or("");
+            // Return NULL if any argument is NULL
+            let s = match args.first() {
+                Some(Value::Null) => return Ok(Value::Null),
+                Some(v) => v.as_str().unwrap_or(""),
+                None => "",
+            };
+            let pattern = match args.get(1) {
+                Some(Value::Null) => return Ok(Value::Null),
+                Some(v) => v.as_str().unwrap_or(""),
+                None => "",
+            };
+            let replacement = match args.get(2) {
+                Some(Value::Null) => return Ok(Value::Null),
+                Some(v) => v.as_str().unwrap_or(""),
+                None => "",
+            };
             match regex::Regex::new(pattern) {
                 Ok(re) => Ok(Value::Varchar(re.replace_all(s, replacement).to_string())),
                 Err(_) => Ok(Value::Varchar(s.to_string())),
             }
         }
         "REGEXP_EXTRACT" | "REGEXP_SUBSTR" => {
-            let s = args.first().and_then(|v| v.as_str()).unwrap_or("");
-            let pattern = args.get(1).and_then(|v| v.as_str()).unwrap_or("");
+            // Return NULL if string or pattern is NULL
+            let s = match args.first() {
+                Some(Value::Null) => return Ok(Value::Null),
+                Some(v) => v.as_str().unwrap_or(""),
+                None => "",
+            };
+            let pattern = match args.get(1) {
+                Some(Value::Null) => return Ok(Value::Null),
+                Some(v) => v.as_str().unwrap_or(""),
+                None => "",
+            };
             let group_idx = args.get(2).and_then(|v| v.as_i64()).unwrap_or(0) as usize;
             match regex::Regex::new(pattern) {
                 Ok(re) => {
@@ -826,8 +1167,16 @@ fn evaluate_function(name: &str, args: &[Value]) -> Result<Value> {
             }
         }
         "REGEXP_SPLIT_TO_ARRAY" => {
-            let s = args.first().and_then(|v| v.as_str()).unwrap_or("");
-            let pattern = args.get(1).and_then(|v| v.as_str()).unwrap_or("");
+            let s = match args.first() {
+                Some(Value::Null) => return Ok(Value::Null),
+                Some(v) => v.as_str().unwrap_or(""),
+                None => "",
+            };
+            let pattern = match args.get(1) {
+                Some(Value::Null) => return Ok(Value::Null),
+                Some(v) => v.as_str().unwrap_or(""),
+                None => "",
+            };
             match regex::Regex::new(pattern) {
                 Ok(re) => {
                     let parts: Vec<Value> = re.split(s)
@@ -839,8 +1188,16 @@ fn evaluate_function(name: &str, args: &[Value]) -> Result<Value> {
             }
         }
         "REGEXP_COUNT" => {
-            let s = args.first().and_then(|v| v.as_str()).unwrap_or("");
-            let pattern = args.get(1).and_then(|v| v.as_str()).unwrap_or("");
+            let s = match args.first() {
+                Some(Value::Null) => return Ok(Value::Null),
+                Some(v) => v.as_str().unwrap_or(""),
+                None => "",
+            };
+            let pattern = match args.get(1) {
+                Some(Value::Null) => return Ok(Value::Null),
+                Some(v) => v.as_str().unwrap_or(""),
+                None => "",
+            };
             match regex::Regex::new(pattern) {
                 Ok(re) => Ok(Value::BigInt(re.find_iter(s).count() as i64)),
                 Err(_) => Ok(Value::BigInt(0)),
@@ -899,6 +1256,28 @@ fn evaluate_function(name: &str, args: &[Value]) -> Result<Value> {
                     Ok(Value::Boolean(list.contains(element)))
                 }
                 Some(Value::Null) => Ok(Value::Null),
+                _ => Ok(Value::Boolean(false)),
+            }
+        }
+        "LIST_HAS_ANY" | "ARRAY_HAS_ANY" => {
+            // Check if list1 has any elements in common with list2
+            match (args.first(), args.get(1)) {
+                (Some(Value::List(list1)), Some(Value::List(list2))) => {
+                    let has_any = list1.iter().any(|v| list2.contains(v));
+                    Ok(Value::Boolean(has_any))
+                }
+                (Some(Value::Null), _) | (_, Some(Value::Null)) => Ok(Value::Null),
+                _ => Ok(Value::Boolean(false)),
+            }
+        }
+        "LIST_HAS_ALL" | "ARRAY_HAS_ALL" => {
+            // Check if list1 contains all elements from list2
+            match (args.first(), args.get(1)) {
+                (Some(Value::List(list1)), Some(Value::List(list2))) => {
+                    let has_all = list2.iter().all(|v| list1.contains(v));
+                    Ok(Value::Boolean(has_all))
+                }
+                (Some(Value::Null), _) | (_, Some(Value::Null)) => Ok(Value::Null),
                 _ => Ok(Value::Boolean(false)),
             }
         }
@@ -1052,6 +1431,151 @@ fn evaluate_function(name: &str, args: &[Value]) -> Result<Value> {
                 }
                 Some(Value::Null) => Ok(Value::Null),
                 _ => Ok(Value::List(vec![])),
+            }
+        }
+        "LIST_REVERSE_SORT" | "ARRAY_REVERSE_SORT" => {
+            // Sort list in descending order
+            match args.first() {
+                Some(Value::List(list)) => {
+                    let mut result = list.clone();
+                    result.sort_by(|a, b| b.partial_cmp(a).unwrap_or(Ordering::Equal));
+                    Ok(Value::List(result))
+                }
+                Some(Value::Null) => Ok(Value::Null),
+                _ => Ok(Value::List(vec![])),
+            }
+        }
+        "LIST_COSINE_SIMILARITY" | "ARRAY_COSINE_SIMILARITY" => {
+            // Calculate cosine similarity between two numeric lists
+            // cosine_similarity(a, b) = dot(a, b) / (||a|| * ||b||)
+            match (args.first(), args.get(1)) {
+                (Some(Value::List(list1)), Some(Value::List(list2))) => {
+                    if list1.len() != list2.len() {
+                        return Ok(Value::Null);
+                    }
+
+                    let mut dot_product = 0.0f64;
+                    let mut norm1 = 0.0f64;
+                    let mut norm2 = 0.0f64;
+
+                    for (v1, v2) in list1.iter().zip(list2.iter()) {
+                        let f1 = v1.as_f64().unwrap_or(0.0);
+                        let f2 = v2.as_f64().unwrap_or(0.0);
+                        dot_product += f1 * f2;
+                        norm1 += f1 * f1;
+                        norm2 += f2 * f2;
+                    }
+
+                    let denominator = (norm1.sqrt() * norm2.sqrt());
+                    if denominator == 0.0 {
+                        Ok(Value::Null)
+                    } else {
+                        Ok(Value::Double(dot_product / denominator))
+                    }
+                }
+                (Some(Value::Null), _) | (_, Some(Value::Null)) => Ok(Value::Null),
+                _ => Ok(Value::Null),
+            }
+        }
+        "LIST_INNER_PRODUCT" | "ARRAY_INNER_PRODUCT" | "LIST_DOT" | "ARRAY_DOT" => {
+            // Calculate inner product (dot product) between two numeric lists
+            match (args.first(), args.get(1)) {
+                (Some(Value::List(list1)), Some(Value::List(list2))) => {
+                    if list1.len() != list2.len() {
+                        return Ok(Value::Null);
+                    }
+
+                    let mut dot_product = 0.0f64;
+                    for (v1, v2) in list1.iter().zip(list2.iter()) {
+                        let f1 = v1.as_f64().unwrap_or(0.0);
+                        let f2 = v2.as_f64().unwrap_or(0.0);
+                        dot_product += f1 * f2;
+                    }
+
+                    Ok(Value::Double(dot_product))
+                }
+                (Some(Value::Null), _) | (_, Some(Value::Null)) => Ok(Value::Null),
+                _ => Ok(Value::Null),
+            }
+        }
+        "LIST_ZIP" | "ARRAY_ZIP" => {
+            // Combine multiple lists into a list of lists (element-wise)
+            // LIST_ZIP([1, 2], ['a', 'b']) -> [[1, 'a'], [2, 'b']]
+            if args.is_empty() {
+                return Ok(Value::List(vec![]));
+            }
+
+            let lists: Vec<&Vec<Value>> = args.iter()
+                .filter_map(|v| match v {
+                    Value::List(l) => Some(l),
+                    _ => None,
+                })
+                .collect();
+
+            if lists.is_empty() {
+                return Ok(Value::Null);
+            }
+
+            let min_len = lists.iter().map(|l| l.len()).min().unwrap_or(0);
+            let mut result = Vec::new();
+
+            for i in 0..min_len {
+                let row: Vec<Value> = lists.iter()
+                    .map(|l| l[i].clone())
+                    .collect();
+                result.push(Value::List(row));
+            }
+
+            Ok(Value::List(result))
+        }
+        "LIST_REDUCE" | "ARRAY_REDUCE" => {
+            // Reduce list to a single value using a binary operation
+            // LIST_REDUCE([1, 2, 3], (a, b) -> a + b) - but since we don't have lambdas,
+            // we'll implement common operations: 'sum', 'product', 'min', 'max', 'concat'
+            match (args.first(), args.get(1)) {
+                (Some(Value::List(list)), Some(Value::Varchar(op))) => {
+                    if list.is_empty() {
+                        return Ok(Value::Null);
+                    }
+
+                    match op.to_uppercase().as_str() {
+                        "SUM" | "+" => {
+                            let sum: f64 = list.iter()
+                                .filter_map(|v| v.as_f64())
+                                .sum();
+                            Ok(Value::Double(sum))
+                        }
+                        "PRODUCT" | "*" => {
+                            let product: f64 = list.iter()
+                                .filter_map(|v| v.as_f64())
+                                .product();
+                            Ok(Value::Double(product))
+                        }
+                        "MIN" => {
+                            Ok(list.iter()
+                                .filter(|v| !v.is_null())
+                                .min_by(|a, b| a.partial_cmp(b).unwrap_or(Ordering::Equal))
+                                .cloned()
+                                .unwrap_or(Value::Null))
+                        }
+                        "MAX" => {
+                            Ok(list.iter()
+                                .filter(|v| !v.is_null())
+                                .max_by(|a, b| a.partial_cmp(b).unwrap_or(Ordering::Equal))
+                                .cloned()
+                                .unwrap_or(Value::Null))
+                        }
+                        "CONCAT" | "||" => {
+                            let result: String = list.iter()
+                                .map(|v| value_to_string(v))
+                                .collect();
+                            Ok(Value::Varchar(result))
+                        }
+                        _ => Ok(Value::Null),
+                    }
+                }
+                (Some(Value::Null), _) => Ok(Value::Null),
+                _ => Ok(Value::Null),
             }
         }
         "LIST_SUM" | "ARRAY_SUM" => {
@@ -1445,7 +1969,7 @@ fn evaluate_function(name: &str, args: &[Value]) -> Result<Value> {
             match val {
                 Value::Float(f) => Ok(Value::Float(f.ceil())),
                 Value::Double(f) => Ok(Value::Double(f.ceil())),
-                Value::Integer(_) | Value::BigInt(_) => Ok(val.clone()),
+                Value::TinyInt(_) | Value::SmallInt(_) | Value::Integer(_) | Value::BigInt(_) => Ok(val.clone()),
                 Value::Null => Ok(Value::Null),
                 _ => Err(Error::TypeMismatch {
                     expected: "numeric".to_string(),
@@ -1458,7 +1982,7 @@ fn evaluate_function(name: &str, args: &[Value]) -> Result<Value> {
             match val {
                 Value::Float(f) => Ok(Value::Float(f.floor())),
                 Value::Double(f) => Ok(Value::Double(f.floor())),
-                Value::Integer(_) | Value::BigInt(_) => Ok(val.clone()),
+                Value::TinyInt(_) | Value::SmallInt(_) | Value::Integer(_) | Value::BigInt(_) => Ok(val.clone()),
                 Value::Null => Ok(Value::Null),
                 _ => Err(Error::TypeMismatch {
                     expected: "numeric".to_string(),
@@ -1474,7 +1998,7 @@ fn evaluate_function(name: &str, args: &[Value]) -> Result<Value> {
             match val {
                 Value::Float(f) => Ok(Value::Float((f * factor as f32).round() / factor as f32)),
                 Value::Double(f) => Ok(Value::Double((f * factor).round() / factor)),
-                Value::Integer(_) | Value::BigInt(_) => Ok(val.clone()),
+                Value::TinyInt(_) | Value::SmallInt(_) | Value::Integer(_) | Value::BigInt(_) => Ok(val.clone()),
                 Value::Null => Ok(Value::Null),
                 _ => Err(Error::TypeMismatch {
                     expected: "numeric".to_string(),
@@ -1553,12 +2077,34 @@ fn evaluate_function(name: &str, args: &[Value]) -> Result<Value> {
             }
         }
         "MOD" => {
-            let a = args.first().and_then(|v| v.as_i64()).unwrap_or(0);
-            let b = args.get(1).and_then(|v| v.as_i64()).unwrap_or(1);
-            if b == 0 {
-                Ok(Value::Null)
+            let val_a = args.first().unwrap_or(&Value::Null);
+            let val_b = args.get(1).unwrap_or(&Value::Null);
+
+            // Check for NULL
+            if val_a.is_null() || val_b.is_null() {
+                return Ok(Value::Null);
+            }
+
+            // Use floating-point modulo if either value is a float
+            let is_float = matches!(val_a, Value::Float(_) | Value::Double(_) | Value::Decimal { .. })
+                        || matches!(val_b, Value::Float(_) | Value::Double(_) | Value::Decimal { .. });
+
+            if is_float {
+                let a = val_a.as_f64().unwrap_or(0.0);
+                let b = val_b.as_f64().unwrap_or(1.0);
+                if b == 0.0 {
+                    Ok(Value::Null)
+                } else {
+                    Ok(Value::Double(a % b))
+                }
             } else {
-                Ok(Value::BigInt(a % b))
+                let a = val_a.as_i64().unwrap_or(0);
+                let b = val_b.as_i64().unwrap_or(1);
+                if b == 0 {
+                    Ok(Value::Null)
+                } else {
+                    Ok(Value::BigInt(a % b))
+                }
             }
         }
         "PI" => Ok(Value::Double(std::f64::consts::PI)),
@@ -1649,16 +2195,36 @@ fn evaluate_function(name: &str, args: &[Value]) -> Result<Value> {
                     }
                     a
                 }
-                Ok(Value::BigInt((a / gcd(a, b)) * b))
+                // Use checked multiplication to handle overflow
+                let g = gcd(a, b);
+                match (a / g).checked_mul(b) {
+                    Some(result) => Ok(Value::BigInt(result)),
+                    None => Ok(Value::HugeInt((a as i128 / g as i128) * b as i128)),
+                }
             }
         }
         "FACTORIAL" => {
+            // Return NULL for NULL input
+            match args.first() {
+                Some(Value::Null) | None => return Ok(Value::Null),
+                _ => {}
+            }
             let n = args.first().and_then(|v| v.as_i64()).unwrap_or(0);
             if n < 0 {
-                Ok(Value::Null)
+                // DuckDB returns 1 for negative factorials
+                Ok(Value::BigInt(1))
+            } else if n > 33 {
+                // DuckDB errors for factorial >= 34 (overflow in 128-bit integer)
+                Err(Error::Execution(format!(
+                    "Out of range error: cannot compute factorial of {}", n
+                )))
             } else if n > 20 {
-                // Factorial of 21+ overflows i64
-                Ok(Value::Null)
+                // Use HugeInt for n > 20 (factorial(21) overflows i64)
+                let mut result: i128 = 1;
+                for i in 2..=n {
+                    result = result.saturating_mul(i as i128);
+                }
+                Ok(Value::HugeInt(result))
             } else {
                 let result: i64 = (1..=n).product();
                 Ok(Value::BigInt(result))
@@ -1816,7 +2382,12 @@ fn evaluate_function(name: &str, args: &[Value]) -> Result<Value> {
         }
 
         // Hash functions
-        "HASH" | "MD5" => {
+        "HASH" => {
+            // Return NULL for NULL input
+            match args.first() {
+                Some(Value::Null) | None => return Ok(Value::Null),
+                _ => {}
+            }
             use std::hash::{Hash, Hasher};
             use std::collections::hash_map::DefaultHasher;
             let s = value_to_string(args.first().unwrap_or(&Value::Null));
@@ -1824,18 +2395,264 @@ fn evaluate_function(name: &str, args: &[Value]) -> Result<Value> {
             s.hash(&mut hasher);
             Ok(Value::BigInt(hasher.finish() as i64))
         }
+        "MD5" => {
+            // Return NULL for NULL input
+            match args.first() {
+                Some(Value::Null) | None => return Ok(Value::Null),
+                _ => {}
+            }
+            let bytes = match args.first() {
+                Some(Value::Blob(b)) => b.clone(),
+                Some(v) => value_to_string(v).into_bytes(),
+                None => return Ok(Value::Null),
+            };
+
+            // MD5 implementation
+            fn md5_transform(state: &mut [u32; 4], block: &[u8]) {
+                const S: [u32; 64] = [
+                    7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22,
+                    5, 9, 14, 20, 5, 9, 14, 20, 5, 9, 14, 20, 5, 9, 14, 20,
+                    4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23,
+                    6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21,
+                ];
+                const K: [u32; 64] = [
+                    0xd76aa478, 0xe8c7b756, 0x242070db, 0xc1bdceee,
+                    0xf57c0faf, 0x4787c62a, 0xa8304613, 0xfd469501,
+                    0x698098d8, 0x8b44f7af, 0xffff5bb1, 0x895cd7be,
+                    0x6b901122, 0xfd987193, 0xa679438e, 0x49b40821,
+                    0xf61e2562, 0xc040b340, 0x265e5a51, 0xe9b6c7aa,
+                    0xd62f105d, 0x02441453, 0xd8a1e681, 0xe7d3fbc8,
+                    0x21e1cde6, 0xc33707d6, 0xf4d50d87, 0x455a14ed,
+                    0xa9e3e905, 0xfcefa3f8, 0x676f02d9, 0x8d2a4c8a,
+                    0xfffa3942, 0x8771f681, 0x6d9d6122, 0xfde5380c,
+                    0xa4beea44, 0x4bdecfa9, 0xf6bb4b60, 0xbebfbc70,
+                    0x289b7ec6, 0xeaa127fa, 0xd4ef3085, 0x04881d05,
+                    0xd9d4d039, 0xe6db99e5, 0x1fa27cf8, 0xc4ac5665,
+                    0xf4292244, 0x432aff97, 0xab9423a7, 0xfc93a039,
+                    0x655b59c3, 0x8f0ccc92, 0xffeff47d, 0x85845dd1,
+                    0x6fa87e4f, 0xfe2ce6e0, 0xa3014314, 0x4e0811a1,
+                    0xf7537e82, 0xbd3af235, 0x2ad7d2bb, 0xeb86d391,
+                ];
+
+                let mut m = [0u32; 16];
+                for (i, chunk) in block.chunks(4).enumerate() {
+                    m[i] = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+                }
+
+                let (mut a, mut b, mut c, mut d) = (state[0], state[1], state[2], state[3]);
+
+                for i in 0..64 {
+                    let (f, g) = match i {
+                        0..=15 => ((b & c) | ((!b) & d), i),
+                        16..=31 => ((d & b) | ((!d) & c), (5 * i + 1) % 16),
+                        32..=47 => (b ^ c ^ d, (3 * i + 5) % 16),
+                        _ => (c ^ (b | (!d)), (7 * i) % 16),
+                    };
+                    let temp = d;
+                    d = c;
+                    c = b;
+                    b = b.wrapping_add(
+                        (a.wrapping_add(f).wrapping_add(K[i]).wrapping_add(m[g]))
+                            .rotate_left(S[i]),
+                    );
+                    a = temp;
+                }
+
+                state[0] = state[0].wrapping_add(a);
+                state[1] = state[1].wrapping_add(b);
+                state[2] = state[2].wrapping_add(c);
+                state[3] = state[3].wrapping_add(d);
+            }
+
+            let mut state: [u32; 4] = [0x67452301, 0xefcdab89, 0x98badcfe, 0x10325476];
+            let bit_len = (bytes.len() as u64) * 8;
+            let mut padded = bytes.to_vec();
+            padded.push(0x80);
+            while (padded.len() % 64) != 56 {
+                padded.push(0);
+            }
+            padded.extend_from_slice(&bit_len.to_le_bytes());
+
+            for chunk in padded.chunks(64) {
+                md5_transform(&mut state, chunk);
+            }
+
+            let hash: String = state
+                .iter()
+                .flat_map(|&x| x.to_le_bytes())
+                .map(|b| format!("{:02x}", b))
+                .collect();
+            Ok(Value::Varchar(hash))
+        }
+        "SHA1" => {
+            match args.first() {
+                Some(Value::Null) | None => return Ok(Value::Null),
+                _ => {}
+            }
+            let bytes = match args.first() {
+                Some(Value::Blob(b)) => b.clone(),
+                Some(v) => value_to_string(v).into_bytes(),
+                None => return Ok(Value::Null),
+            };
+
+            // SHA-1 implementation
+            fn sha1_transform(state: &mut [u32; 5], block: &[u8]) {
+                let mut w = [0u32; 80];
+                for (i, chunk) in block.chunks(4).enumerate() {
+                    w[i] = u32::from_be_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+                }
+                for i in 16..80 {
+                    w[i] = (w[i-3] ^ w[i-8] ^ w[i-14] ^ w[i-16]).rotate_left(1);
+                }
+
+                let (mut a, mut b, mut c, mut d, mut e) = (state[0], state[1], state[2], state[3], state[4]);
+
+                for i in 0..80 {
+                    let (f, k) = match i {
+                        0..=19 => ((b & c) | ((!b) & d), 0x5A827999u32),
+                        20..=39 => (b ^ c ^ d, 0x6ED9EBA1u32),
+                        40..=59 => ((b & c) | (b & d) | (c & d), 0x8F1BBCDCu32),
+                        _ => (b ^ c ^ d, 0xCA62C1D6u32),
+                    };
+                    let temp = a.rotate_left(5).wrapping_add(f).wrapping_add(e).wrapping_add(k).wrapping_add(w[i]);
+                    e = d;
+                    d = c;
+                    c = b.rotate_left(30);
+                    b = a;
+                    a = temp;
+                }
+
+                state[0] = state[0].wrapping_add(a);
+                state[1] = state[1].wrapping_add(b);
+                state[2] = state[2].wrapping_add(c);
+                state[3] = state[3].wrapping_add(d);
+                state[4] = state[4].wrapping_add(e);
+            }
+
+            let mut state: [u32; 5] = [0x67452301, 0xEFCDAB89, 0x98BADCFE, 0x10325476, 0xC3D2E1F0];
+            let bit_len = (bytes.len() as u64) * 8;
+            let mut padded = bytes.to_vec();
+            padded.push(0x80);
+            while (padded.len() % 64) != 56 {
+                padded.push(0);
+            }
+            padded.extend_from_slice(&bit_len.to_be_bytes());
+
+            for chunk in padded.chunks(64) {
+                sha1_transform(&mut state, chunk);
+            }
+
+            let hash: String = state
+                .iter()
+                .flat_map(|&x| x.to_be_bytes())
+                .map(|b| format!("{:02x}", b))
+                .collect();
+            Ok(Value::Varchar(hash))
+        }
+        "SHA256" | "SHA2" => {
+            // Return NULL for NULL input
+            match args.first() {
+                Some(Value::Null) | None => return Ok(Value::Null),
+                _ => {}
+            }
+            // Simple SHA-256 implementation for string hashing
+            let s = value_to_string(args.first().unwrap_or(&Value::Null));
+            let bytes = s.as_bytes();
+
+            // SHA-256 constants
+            const K: [u32; 64] = [
+                0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+                0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+                0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+                0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+                0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+                0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+                0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+                0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
+            ];
+
+            let mut h: [u32; 8] = [
+                0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a,
+                0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19,
+            ];
+
+            // Padding
+            let bit_len = (bytes.len() as u64) * 8;
+            let mut padded = bytes.to_vec();
+            padded.push(0x80);
+            while (padded.len() % 64) != 56 {
+                padded.push(0);
+            }
+            padded.extend_from_slice(&bit_len.to_be_bytes());
+
+            // Process each 512-bit chunk
+            for chunk in padded.chunks(64) {
+                let mut w = [0u32; 64];
+                for (i, c) in chunk.chunks(4).enumerate() {
+                    w[i] = u32::from_be_bytes([c[0], c[1], c[2], c[3]]);
+                }
+                for i in 16..64 {
+                    let s0 = w[i-15].rotate_right(7) ^ w[i-15].rotate_right(18) ^ (w[i-15] >> 3);
+                    let s1 = w[i-2].rotate_right(17) ^ w[i-2].rotate_right(19) ^ (w[i-2] >> 10);
+                    w[i] = w[i-16].wrapping_add(s0).wrapping_add(w[i-7]).wrapping_add(s1);
+                }
+
+                let (mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut hh) =
+                    (h[0], h[1], h[2], h[3], h[4], h[5], h[6], h[7]);
+
+                for i in 0..64 {
+                    let s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
+                    let ch = (e & f) ^ ((!e) & g);
+                    let temp1 = hh.wrapping_add(s1).wrapping_add(ch).wrapping_add(K[i]).wrapping_add(w[i]);
+                    let s0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
+                    let maj = (a & b) ^ (a & c) ^ (b & c);
+                    let temp2 = s0.wrapping_add(maj);
+
+                    hh = g; g = f; f = e;
+                    e = d.wrapping_add(temp1);
+                    d = c; c = b; b = a;
+                    a = temp1.wrapping_add(temp2);
+                }
+
+                h[0] = h[0].wrapping_add(a); h[1] = h[1].wrapping_add(b);
+                h[2] = h[2].wrapping_add(c); h[3] = h[3].wrapping_add(d);
+                h[4] = h[4].wrapping_add(e); h[5] = h[5].wrapping_add(f);
+                h[6] = h[6].wrapping_add(g); h[7] = h[7].wrapping_add(hh);
+            }
+
+            // Convert to hex string
+            let hash = format!(
+                "{:08x}{:08x}{:08x}{:08x}{:08x}{:08x}{:08x}{:08x}",
+                h[0], h[1], h[2], h[3], h[4], h[5], h[6], h[7]
+            );
+            Ok(Value::Varchar(hash))
+        }
 
         // Bit manipulation functions
         "BIT_COUNT" => {
-            let val = args.first().and_then(|v| v.as_i64()).unwrap_or(0);
-            Ok(Value::Integer(val.count_ones() as i32))
+            match args.first() {
+                Some(Value::Null) | None => Ok(Value::Null),
+                Some(Value::HugeInt(val)) => Ok(Value::Integer(val.count_ones() as i32)),
+                Some(v) => {
+                    let val = v.as_i64().unwrap_or(0);
+                    Ok(Value::Integer(val.count_ones() as i32))
+                }
+            }
         }
         "BIT_LENGTH" => {
-            let s = args.first().and_then(|v| v.as_str()).unwrap_or("");
+            let s = match args.first() {
+                Some(Value::Null) => return Ok(Value::Null),
+                Some(v) => v.as_str().unwrap_or(""),
+                None => "",
+            };
             Ok(Value::Integer((s.len() * 8) as i32))
         }
         "OCTET_LENGTH" | "BYTE_LENGTH" => {
-            let s = args.first().and_then(|v| v.as_str()).unwrap_or("");
+            let s = match args.first() {
+                Some(Value::Null) => return Ok(Value::Null),
+                Some(v) => v.as_str().unwrap_or(""),
+                None => "",
+            };
             Ok(Value::Integer(s.len() as i32))
         }
         "BIT_AND" | "BITAND" => {
@@ -1897,10 +2714,24 @@ fn evaluate_function(name: &str, args: &[Value]) -> Result<Value> {
             let binary = format!("{:0>width$b}", val.abs(), width = width.min(64));
             Ok(Value::Varchar(binary))
         }
+        "BIT_POSITION" => {
+            // Find the position of the first set bit (1-indexed from right, 0 if no bit set)
+            let val = args.first().and_then(|v| v.as_i64()).unwrap_or(0);
+            if val == 0 {
+                Ok(Value::Integer(0))
+            } else {
+                // Find position of lowest set bit (1-indexed)
+                Ok(Value::Integer((val.trailing_zeros() + 1) as i32))
+            }
+        }
 
         // Format function
         "FORMAT" | "PRINTF" | "SPRINTF" => {
-            // Simple format - just return the first string with replacements
+            // Return NULL for NULL format string
+            match args.first() {
+                Some(Value::Null) | None => return Ok(Value::Null),
+                _ => {}
+            }
             let template = args.first().and_then(|v| v.as_str()).unwrap_or("");
             let mut arg_idx = 1;
 
@@ -1910,36 +2741,90 @@ fn evaluate_function(name: &str, args: &[Value]) -> Result<Value> {
             let mut new_result = String::new();
             while i < chars.len() {
                 if chars[i] == '%' && i + 1 < chars.len() {
-                    // Check for format specifier
                     let mut j = i + 1;
-                    let mut width = 0;
-                    let mut zero_pad = false;
 
-                    // Check for zero padding
-                    if j < chars.len() && chars[j] == '0' {
-                        zero_pad = true;
+                    // Skip flags: -, +, space, #, 0
+                    let mut alt_form = false;
+                    let mut zero_pad = false;
+                    let mut left_align = false;
+                    let mut plus_sign = false;
+                    while j < chars.len() && matches!(chars[j], '-' | '+' | ' ' | '#' | '0') {
+                        if chars[j] == '#' { alt_form = true; }
+                        if chars[j] == '0' { zero_pad = true; }
+                        if chars[j] == '-' { left_align = true; }
+                        if chars[j] == '+' { plus_sign = true; }
                         j += 1;
                     }
 
-                    // Parse width
-                    while j < chars.len() && chars[j].is_ascii_digit() {
-                        width = width * 10 + (chars[j] as usize - '0' as usize);
+                    // Parse width (could be * for dynamic width)
+                    let mut width: usize = 0;
+                    if j < chars.len() && chars[j] == '*' {
+                        // Dynamic width from argument
+                        width = args.get(arg_idx).and_then(|v| v.as_i64()).unwrap_or(0) as usize;
+                        arg_idx += 1;
+                        j += 1;
+                    } else {
+                        while j < chars.len() && chars[j].is_ascii_digit() {
+                            width = width * 10 + (chars[j] as usize - '0' as usize);
+                            j += 1;
+                        }
+                    }
+
+                    // Parse precision
+                    let mut precision: Option<usize> = None;
+                    if j < chars.len() && chars[j] == '.' {
+                        j += 1;
+                        let mut prec = 0;
+                        while j < chars.len() && chars[j].is_ascii_digit() {
+                            prec = prec * 10 + (chars[j] as usize - '0' as usize);
+                            j += 1;
+                        }
+                        precision = Some(prec);
+                    }
+
+                    // Skip size modifiers: hh, h, l, ll
+                    while j < chars.len() && matches!(chars[j], 'h' | 'l') {
                         j += 1;
                     }
 
                     if j < chars.len() {
-                        let arg = args.get(arg_idx).cloned().unwrap_or(Value::Null);
-                        match chars[j] {
+                        let type_char = chars[j];
+                        match type_char {
+                            '%' => {
+                                new_result.push('%');
+                                i = j + 1;
+                                continue;
+                            }
                             's' => {
-                                new_result.push_str(&value_to_string(&arg));
+                                let arg = args.get(arg_idx).cloned().unwrap_or(Value::Null);
+                                let s = match &arg {
+                                    Value::Null => "NULL".to_string(),
+                                    _ => value_to_string(&arg),
+                                };
+                                let formatted = if left_align && width > 0 {
+                                    format!("{:<width$}", s, width = width)
+                                } else if width > 0 {
+                                    format!("{:>width$}", s, width = width)
+                                } else {
+                                    s
+                                };
+                                new_result.push_str(&formatted);
                                 arg_idx += 1;
                                 i = j + 1;
                                 continue;
                             }
                             'd' | 'i' => {
-                                let num = arg.as_i64().unwrap_or(0);
-                                let formatted = if zero_pad && width > 0 {
+                                let arg = args.get(arg_idx).cloned().unwrap_or(Value::Null);
+                                // Handle boolean explicitly
+                                let num = match &arg {
+                                    Value::Boolean(true) => 1i64,
+                                    Value::Boolean(false) => 0i64,
+                                    _ => arg.as_i64().unwrap_or(0),
+                                };
+                                let formatted = if zero_pad && width > 0 && !left_align {
                                     format!("{:0>width$}", num, width = width)
+                                } else if left_align && width > 0 {
+                                    format!("{:<width$}", num, width = width)
                                 } else if width > 0 {
                                     format!("{:>width$}", num, width = width)
                                 } else {
@@ -1950,15 +2835,121 @@ fn evaluate_function(name: &str, args: &[Value]) -> Result<Value> {
                                 i = j + 1;
                                 continue;
                             }
-                            'f' => {
-                                let num = arg.as_f64().unwrap_or(0.0);
-                                new_result.push_str(&format!("{}", num));
+                            'x' => {
+                                let arg = args.get(arg_idx).cloned().unwrap_or(Value::Null);
+                                let num = arg.as_i64().unwrap_or(0);
+                                let formatted = if alt_form {
+                                    format!("{:#x}", num)
+                                } else {
+                                    format!("{:x}", num)
+                                };
+                                new_result.push_str(&formatted);
                                 arg_idx += 1;
                                 i = j + 1;
                                 continue;
                             }
-                            '%' => {
-                                new_result.push('%');
+                            'X' => {
+                                let arg = args.get(arg_idx).cloned().unwrap_or(Value::Null);
+                                let num = arg.as_i64().unwrap_or(0);
+                                let formatted = if alt_form {
+                                    format!("{:#X}", num)
+                                } else {
+                                    format!("{:X}", num)
+                                };
+                                new_result.push_str(&formatted);
+                                arg_idx += 1;
+                                i = j + 1;
+                                continue;
+                            }
+                            'o' => {
+                                let arg = args.get(arg_idx).cloned().unwrap_or(Value::Null);
+                                let num = arg.as_i64().unwrap_or(0);
+                                let formatted = if alt_form {
+                                    // DuckDB uses 0 prefix, not 0o
+                                    format!("0{:o}", num)
+                                } else {
+                                    format!("{:o}", num)
+                                };
+                                new_result.push_str(&formatted);
+                                arg_idx += 1;
+                                i = j + 1;
+                                continue;
+                            }
+                            'c' => {
+                                let arg = args.get(arg_idx).cloned().unwrap_or(Value::Null);
+                                let ch = arg.as_i64().unwrap_or(0) as u8 as char;
+                                new_result.push(ch);
+                                arg_idx += 1;
+                                i = j + 1;
+                                continue;
+                            }
+                            'f' | 'F' => {
+                                let arg = args.get(arg_idx).cloned().unwrap_or(Value::Null);
+                                let num = arg.as_f64().unwrap_or(0.0);
+                                let prec = precision.unwrap_or(6);
+                                let formatted = format!("{:.prec$}", num, prec = prec);
+                                new_result.push_str(&formatted);
+                                arg_idx += 1;
+                                i = j + 1;
+                                continue;
+                            }
+                            'e' => {
+                                let arg = args.get(arg_idx).cloned().unwrap_or(Value::Null);
+                                let num = arg.as_f64().unwrap_or(0.0);
+                                let prec = precision.unwrap_or(6);
+                                let formatted = format!("{:.prec$e}", num, prec = prec);
+                                // DuckDB uses two-digit exponent with + sign
+                                let formatted = if let Some(e_pos) = formatted.find('e') {
+                                    let (base, exp) = formatted.split_at(e_pos);
+                                    let exp_part = &exp[1..]; // skip 'e'
+                                    let (sign, exp_num) = if exp_part.starts_with('-') {
+                                        ("-", &exp_part[1..])
+                                    } else if exp_part.starts_with('+') {
+                                        ("+", &exp_part[1..])
+                                    } else {
+                                        ("+", exp_part)
+                                    };
+                                    // Add + prefix for positive numbers if plus_sign flag is set
+                                    let prefix = if plus_sign && num >= 0.0 { "+" } else { "" };
+                                    format!("{}{}e{}{:02}", prefix, base, sign, exp_num.parse::<i32>().unwrap_or(0))
+                                } else {
+                                    formatted
+                                };
+                                new_result.push_str(&formatted);
+                                arg_idx += 1;
+                                i = j + 1;
+                                continue;
+                            }
+                            'E' => {
+                                let arg = args.get(arg_idx).cloned().unwrap_or(Value::Null);
+                                let num = arg.as_f64().unwrap_or(0.0);
+                                let prec = precision.unwrap_or(6);
+                                let formatted = format!("{:.prec$E}", num, prec = prec);
+                                // DuckDB uses two-digit exponent with + sign
+                                let formatted = if let Some(e_pos) = formatted.find('E') {
+                                    let (base, exp) = formatted.split_at(e_pos);
+                                    let exp_part = &exp[1..]; // skip 'E'
+                                    let (sign, exp_num) = if exp_part.starts_with('-') {
+                                        ("-", &exp_part[1..])
+                                    } else if exp_part.starts_with('+') {
+                                        ("+", &exp_part[1..])
+                                    } else {
+                                        ("+", exp_part)
+                                    };
+                                    format!("{}E{}{:02}", base, sign, exp_num.parse::<i32>().unwrap_or(0))
+                                } else {
+                                    formatted
+                                };
+                                new_result.push_str(&formatted);
+                                arg_idx += 1;
+                                i = j + 1;
+                                continue;
+                            }
+                            'g' | 'G' => {
+                                let arg = args.get(arg_idx).cloned().unwrap_or(Value::Null);
+                                let num = arg.as_f64().unwrap_or(0.0);
+                                new_result.push_str(&format!("{}", num));
+                                arg_idx += 1;
                                 i = j + 1;
                                 continue;
                             }
@@ -2012,6 +3003,48 @@ fn evaluate_function(name: &str, args: &[Value]) -> Result<Value> {
                 _ => Ok(Value::Null),
             }
         }
+        "TO_BASE" => {
+            // Convert number to string in given base (2-36)
+            let num = match args.first() {
+                Some(Value::Null) | None => return Ok(Value::Null),
+                Some(v) => v.as_i64().unwrap_or(0),
+            };
+            let base = match args.get(1) {
+                Some(Value::Null) | None => return Ok(Value::Null),
+                Some(v) => v.as_i64().unwrap_or(10) as u32,
+            };
+            let min_width = args.get(2).and_then(|v| v.as_i64()).unwrap_or(0) as usize;
+
+            if base < 2 || base > 36 {
+                return Err(Error::Execution(format!("Base must be between 2 and 36, got {}", base)));
+            }
+
+            const DIGITS: &[u8] = b"0123456789abcdefghijklmnopqrstuvwxyz";
+            let negative = num < 0;
+            let mut n = num.unsigned_abs();
+            let mut result = Vec::new();
+
+            if n == 0 {
+                result.push(b'0');
+            } else {
+                while n > 0 {
+                    result.push(DIGITS[(n % base as u64) as usize]);
+                    n /= base as u64;
+                }
+            }
+
+            // Pad with zeros if min_width specified
+            while result.len() < min_width {
+                result.push(b'0');
+            }
+
+            result.reverse();
+            let mut s = String::from_utf8(result).unwrap_or_default();
+            if negative {
+                s.insert(0, '-');
+            }
+            Ok(Value::Varchar(s))
+        }
         "UNHEX" | "FROM_HEX" => {
             match args.first() {
                 Some(Value::Varchar(s)) => {
@@ -2033,6 +3066,58 @@ fn evaluate_function(name: &str, args: &[Value]) -> Result<Value> {
                 }
                 Some(Value::Null) => Ok(Value::Null),
                 _ => Ok(Value::Null),
+            }
+        }
+        "URL_ENCODE" => {
+            match args.first() {
+                Some(Value::Null) | None => Ok(Value::Null),
+                Some(v) => {
+                    let s = value_to_string(v);
+                    let mut result = String::new();
+                    for c in s.chars() {
+                        if c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' || c == '~' {
+                            result.push(c);
+                        } else {
+                            for b in c.to_string().bytes() {
+                                result.push_str(&format!("%{:02X}", b));
+                            }
+                        }
+                    }
+                    Ok(Value::Varchar(result))
+                }
+            }
+        }
+        "URL_DECODE" => {
+            match args.first() {
+                Some(Value::Null) | None => Ok(Value::Null),
+                Some(v) => {
+                    let s = value_to_string(v);
+                    let mut result = Vec::new();
+                    let mut chars = s.chars().peekable();
+                    while let Some(c) = chars.next() {
+                        if c == '%' {
+                            let hex: String = chars.by_ref().take(2).collect();
+                            if hex.len() == 2 {
+                                if let Ok(byte) = u8::from_str_radix(&hex, 16) {
+                                    result.push(byte);
+                                    continue;
+                                }
+                            }
+                            // Invalid escape, keep as-is
+                            result.push(b'%');
+                            for b in hex.bytes() {
+                                result.push(b);
+                            }
+                        } else if c == '+' {
+                            result.push(b' ');
+                        } else {
+                            for b in c.to_string().bytes() {
+                                result.push(b);
+                            }
+                        }
+                    }
+                    Ok(Value::Varchar(String::from_utf8_lossy(&result).to_string()))
+                }
             }
         }
         "BASE64" | "TO_BASE64" => {
@@ -2480,6 +3565,101 @@ fn evaluate_function(name: &str, args: &[Value]) -> Result<Value> {
             };
             Ok(Value::Varchar(type_name.to_string()))
         }
+        "PG_COLUMN_SIZE" | "PG_RELATION_SIZE" | "PG_TABLE_SIZE" | "PG_TOTAL_RELATION_SIZE" => {
+            // PostgreSQL compatibility - return approximate size in bytes
+            match args.first() {
+                Some(Value::Varchar(s)) => Ok(Value::BigInt(s.len() as i64)),
+                Some(Value::List(l)) => {
+                    let size: i64 = l.iter().map(|v| {
+                        match v {
+                            Value::Varchar(s) => s.len() as i64,
+                            Value::BigInt(_) | Value::Integer(_) => 8,
+                            Value::Double(_) | Value::Float(_) => 8,
+                            Value::Boolean(_) => 1,
+                            _ => 8,
+                        }
+                    }).sum();
+                    Ok(Value::BigInt(size))
+                }
+                Some(v) => {
+                    // Estimate size based on type
+                    let size = match v {
+                        Value::Null => 0,
+                        Value::Boolean(_) => 1,
+                        Value::TinyInt(_) => 1,
+                        Value::SmallInt(_) => 2,
+                        Value::Integer(_) => 4,
+                        Value::BigInt(_) => 8,
+                        Value::Float(_) => 4,
+                        Value::Double(_) => 8,
+                        Value::Varchar(s) => s.len() as i64,
+                        _ => 8,
+                    };
+                    Ok(Value::BigInt(size))
+                }
+                None => Ok(Value::BigInt(0)),
+            }
+        }
+        "PG_DATABASE_SIZE" => {
+            // Return a placeholder database size
+            Ok(Value::BigInt(0))
+        }
+        "PG_TABLESPACE_SIZE" => {
+            // Return a placeholder tablespace size
+            Ok(Value::BigInt(0))
+        }
+        "PG_INDEXES_SIZE" => {
+            // Return a placeholder indexes size
+            Ok(Value::BigInt(0))
+        }
+        "PG_GET_EXPR" => {
+            // Return expression text - simplified
+            Ok(args.first().cloned().unwrap_or(Value::Null))
+        }
+        "PG_GET_CONSTRAINTDEF" | "PG_GET_INDEXDEF" | "PG_GET_VIEWDEF" | "PG_GET_TRIGGERDEF" => {
+            // Return definition text - placeholder
+            Ok(Value::Varchar("".to_string()))
+        }
+        "PG_RELATION_FILEPATH" => {
+            // Return file path for a relation - placeholder
+            Ok(Value::Varchar("".to_string()))
+        }
+        "PG_BACKEND_PID" => {
+            // Return current process ID
+            Ok(Value::Integer(std::process::id() as i32))
+        }
+        "PG_CURRENT_XACT_ID" | "PG_CURRENT_SNAPSHOT" => {
+            // Transaction ID placeholder
+            Ok(Value::BigInt(1))
+        }
+        "PG_IS_IN_RECOVERY" | "PG_IS_WAL_REPLAY_PAUSED" => {
+            // Recovery status - always false for IronDuck
+            Ok(Value::Boolean(false))
+        }
+        "PG_POSTMASTER_START_TIME" | "PG_CONF_LOAD_TIME" => {
+            // Return current timestamp as placeholder
+            use chrono::Local;
+            Ok(Value::Timestamp(Local::now().naive_local()))
+        }
+        "PG_STAT_GET_NUMSCANS" | "PG_STAT_GET_TUPLES_RETURNED" | "PG_STAT_GET_TUPLES_FETCHED" |
+        "PG_STAT_GET_TUPLES_INSERTED" | "PG_STAT_GET_TUPLES_UPDATED" | "PG_STAT_GET_TUPLES_DELETED" => {
+            // Statistics placeholders
+            Ok(Value::BigInt(0))
+        }
+        "PG_HAS_ROLE" | "PG_HAS_TABLE_PRIVILEGE" | "PG_HAS_COLUMN_PRIVILEGE" |
+        "PG_HAS_DATABASE_PRIVILEGE" | "PG_HAS_SCHEMA_PRIVILEGE" | "PG_HAS_TABLESPACE_PRIVILEGE" => {
+            // Privilege check - always true for IronDuck
+            Ok(Value::Boolean(true))
+        }
+        "PG_CLIENT_ENCODING" => {
+            Ok(Value::Varchar("UTF8".to_string()))
+        }
+        "PG_ENCODING_TO_CHAR" => {
+            Ok(Value::Varchar("UTF8".to_string()))
+        }
+        "PG_CHAR_TO_ENCODING" => {
+            Ok(Value::Integer(6)) // UTF8 encoding
+        }
 
         // Date/Time functions
         "NOW" | "CURRENT_TIMESTAMP" => {
@@ -2493,11 +3673,16 @@ fn evaluate_function(name: &str, args: &[Value]) -> Result<Value> {
             Ok(Value::Date(today))
         }
         "DATE_PART" | "EXTRACT" => {
-            use chrono::{Datelike, Timelike};
-            let part = args.first().and_then(|v| v.as_str()).unwrap_or("").to_uppercase();
+            use chrono::{Datelike, Timelike, NaiveDate, NaiveDateTime};
+            // Return NULL if part is NULL
+            let part = match args.first() {
+                Some(Value::Null) => return Ok(Value::Null),
+                Some(v) => v.as_str().unwrap_or("").to_uppercase(),
+                None => "".to_string(),
+            };
             let ts = args.get(1).unwrap_or(&Value::Null);
 
-            // Extract datetime components
+            // Extract datetime components - also handle VARCHAR by parsing
             let (year, month, day, hour, minute, second, day_of_week, day_of_year) = match ts {
                 Value::Timestamp(dt) => (
                     dt.year() as i64,
@@ -2527,6 +3712,35 @@ fn evaluate_function(name: &str, args: &[Value]) -> Result<Value> {
                     d.weekday().num_days_from_sunday() as i64,
                     d.ordinal() as i64,
                 ),
+                Value::Varchar(s) => {
+                    // Try to parse as date or timestamp
+                    if let Ok(d) = NaiveDate::parse_from_str(s, "%Y-%m-%d") {
+                        (
+                            d.year() as i64,
+                            d.month() as i64,
+                            d.day() as i64,
+                            0, 0, 0,
+                            d.weekday().num_days_from_sunday() as i64,
+                            d.ordinal() as i64,
+                        )
+                    } else if let Ok(dt) = NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S") {
+                        (
+                            dt.year() as i64,
+                            dt.month() as i64,
+                            dt.day() as i64,
+                            dt.hour() as i64,
+                            dt.minute() as i64,
+                            dt.second() as i64,
+                            dt.weekday().num_days_from_sunday() as i64,
+                            dt.ordinal() as i64,
+                        )
+                    } else {
+                        return Err(Error::TypeMismatch {
+                            expected: "timestamp or date".to_string(),
+                            got: format!("Varchar(\"{}\")", s),
+                        });
+                    }
+                }
                 Value::Null => return Ok(Value::Null),
                 _ => return Err(Error::TypeMismatch {
                     expected: "timestamp or date".to_string(),
@@ -2550,6 +3764,51 @@ fn evaluate_function(name: &str, args: &[Value]) -> Result<Value> {
                         Value::Timestamp(dt) => dt.iso_week().week() as i64,
                         Value::Date(d) => d.iso_week().week() as i64,
                         _ => 0,
+                    }
+                }
+                "DECADE" => year / 10,
+                "CENTURY" => if year > 0 { (year - 1) / 100 + 1 } else { year / 100 },
+                "MILLENNIUM" => if year > 0 { (year - 1) / 1000 + 1 } else { year / 1000 },
+                "ISODOW" => {
+                    // ISO day of week: Monday=1 through Sunday=7
+                    match ts {
+                        Value::Timestamp(dt) => dt.weekday().number_from_monday() as i64,
+                        Value::Date(d) => d.weekday().number_from_monday() as i64,
+                        _ => day_of_week,
+                    }
+                }
+                "YEARWEEK" => {
+                    // ISO year * 100 + ISO week
+                    match ts {
+                        Value::Timestamp(dt) => dt.iso_week().year() as i64 * 100 + dt.iso_week().week() as i64,
+                        Value::Date(d) => d.iso_week().year() as i64 * 100 + d.iso_week().week() as i64,
+                        _ => 0,
+                    }
+                }
+                "EPOCH" => {
+                    // Seconds since 1970-01-01
+                    match ts {
+                        Value::Timestamp(dt) => dt.and_utc().timestamp(),
+                        Value::Date(d) => {
+                            use chrono::NaiveTime;
+                            let dt = d.and_time(NaiveTime::from_hms_opt(0, 0, 0).unwrap());
+                            dt.and_utc().timestamp()
+                        }
+                        _ => 0,
+                    }
+                }
+                "MILLISECONDS" | "MILLISECOND" => {
+                    // Milliseconds of the current second (0-999) plus full seconds
+                    match ts {
+                        Value::Timestamp(dt) => (second * 1000) + (dt.nanosecond() / 1_000_000) as i64,
+                        _ => second * 1000,
+                    }
+                }
+                "MICROSECONDS" | "MICROSECOND" => {
+                    // Microseconds of the current second plus full seconds
+                    match ts {
+                        Value::Timestamp(dt) => (second * 1_000_000) + (dt.nanosecond() / 1000) as i64,
+                        _ => second * 1_000_000,
                     }
                 }
                 _ => return Err(Error::NotImplemented(format!("DATE_PART field: {}", part))),
@@ -2721,35 +3980,72 @@ fn evaluate_function(name: &str, args: &[Value]) -> Result<Value> {
             }
         }
         "DATE_ADD" | "DATEADD" => {
-            use chrono::{Duration, Datelike};
+            use chrono::{Duration, Datelike, NaiveTime};
             let date = args.first().unwrap_or(&Value::Null);
-            let interval = args.get(1).and_then(|v| v.as_i64()).unwrap_or(0);
-            let unit = args.get(2).and_then(|v| v.as_str()).unwrap_or("day").to_uppercase();
+            let interval_arg = args.get(1).unwrap_or(&Value::Null);
+
+            // Handle Interval type as second argument
+            let (months, days, micros) = match interval_arg {
+                Value::Interval(iv) => (iv.months as i64, iv.days as i64, iv.micros),
+                Value::Null => return Ok(Value::Null),
+                _ => {
+                    // Legacy: integer + unit string format
+                    let interval = interval_arg.as_i64().unwrap_or(0);
+                    let unit = args.get(2).and_then(|v| v.as_str()).unwrap_or("day").to_uppercase();
+                    match unit.as_str() {
+                        "DAY" | "DAYS" => (0, interval, 0),
+                        "MONTH" | "MONTHS" => (interval, 0, 0),
+                        "YEAR" | "YEARS" => (interval * 12, 0, 0),
+                        "HOUR" | "HOURS" => (0, 0, interval * 3_600_000_000),
+                        "MINUTE" | "MINUTES" => (0, 0, interval * 60_000_000),
+                        "SECOND" | "SECONDS" => (0, 0, interval * 1_000_000),
+                        _ => return Err(Error::NotImplemented(format!("DATE_ADD unit: {}", unit))),
+                    }
+                }
+            };
 
             match date {
                 Value::Date(d) => {
-                    let result = match unit.as_str() {
-                        "DAY" | "DAYS" => *d + Duration::days(interval),
-                        "WEEK" | "WEEKS" => *d + Duration::weeks(interval),
-                        "MONTH" | "MONTHS" => {
-                            let new_month = d.month() as i64 + interval;
-                            let years_delta = (new_month - 1) / 12;
-                            let new_month = ((new_month - 1) % 12 + 1) as u32;
-                            let new_year = d.year() + years_delta as i32;
-                            chrono::NaiveDate::from_ymd_opt(new_year, new_month, d.day().min(28))
-                                .unwrap_or(*d)
-                        }
-                        "YEAR" | "YEARS" => {
-                            chrono::NaiveDate::from_ymd_opt(d.year() + interval as i32, d.month(), d.day())
-                                .unwrap_or(*d)
-                        }
-                        _ => return Err(Error::NotImplemented(format!("DATE_ADD unit: {}", unit))),
+                    // Apply months
+                    let mut result = if months != 0 {
+                        let new_month = d.month() as i64 + months;
+                        let years_delta = if new_month > 0 { (new_month - 1) / 12 } else { (new_month - 12) / 12 };
+                        let new_month = ((new_month - 1).rem_euclid(12) + 1) as u32;
+                        let new_year = d.year() + years_delta as i32;
+                        chrono::NaiveDate::from_ymd_opt(new_year, new_month, d.day().min(28))
+                            .unwrap_or(*d)
+                    } else {
+                        *d
                     };
-                    Ok(Value::Date(result))
+                    // Apply days
+                    result = result + Duration::days(days);
+                    // Return timestamp with time component from micros
+                    let time_micros = micros.rem_euclid(86_400_000_000);
+                    let ts = result.and_time(NaiveTime::from_hms_opt(0, 0, 0).unwrap())
+                        + Duration::microseconds(time_micros);
+                    Ok(Value::Timestamp(ts))
+                }
+                Value::Timestamp(ts) => {
+                    // Apply months
+                    let mut result = if months != 0 {
+                        let d = ts.date();
+                        let new_month = d.month() as i64 + months;
+                        let years_delta = if new_month > 0 { (new_month - 1) / 12 } else { (new_month - 12) / 12 };
+                        let new_month = ((new_month - 1).rem_euclid(12) + 1) as u32;
+                        let new_year = d.year() + years_delta as i32;
+                        let new_date = chrono::NaiveDate::from_ymd_opt(new_year, new_month, d.day().min(28))
+                            .unwrap_or(d);
+                        new_date.and_time(ts.time())
+                    } else {
+                        *ts
+                    };
+                    // Apply days and micros
+                    result = result + Duration::days(days) + Duration::microseconds(micros);
+                    Ok(Value::Timestamp(result))
                 }
                 Value::Null => Ok(Value::Null),
                 _ => Err(Error::TypeMismatch {
-                    expected: "date".to_string(),
+                    expected: "date or timestamp".to_string(),
                     got: format!("{:?}", date),
                 }),
             }
@@ -2826,6 +4122,90 @@ fn evaluate_function(name: &str, args: &[Value]) -> Result<Value> {
 
             match (NaiveDate::from_ymd_opt(year, month, day), NaiveTime::from_hms_opt(hour, minute, second)) {
                 (Some(d), Some(t)) => Ok(Value::Timestamp(NaiveDateTime::new(d, t))),
+                _ => Ok(Value::Null),
+            }
+        }
+        "MAKE_TIME" => {
+            use chrono::NaiveTime;
+            let hour = args.first().and_then(|v| v.as_i64()).unwrap_or(0) as u32;
+            let minute = args.get(1).and_then(|v| v.as_i64()).unwrap_or(0) as u32;
+            let second = args.get(2).and_then(|v| v.as_i64()).unwrap_or(0) as u32;
+
+            match NaiveTime::from_hms_opt(hour, minute, second) {
+                Some(t) => Ok(Value::Time(t)),
+                None => Ok(Value::Null),
+            }
+        }
+        "TO_DAYS" => {
+            // Convert date to number of days since year 0 (Julian day number style)
+            // DuckDB: Returns the number of days since year 0
+            use chrono::Datelike;
+            match args.first() {
+                Some(Value::Date(d)) => {
+                    // Days from year 1 to this date
+                    // Simplified calculation: days from epoch + epoch offset
+                    let epoch = chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
+                    let days_from_epoch = (*d - epoch).num_days();
+                    // Days from year 0 to epoch (approximately 719528)
+                    let epoch_days = 719528i64;
+                    Ok(Value::BigInt(epoch_days + days_from_epoch))
+                }
+                Some(Value::Timestamp(dt)) => {
+                    let epoch = chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
+                    let days_from_epoch = (dt.date() - epoch).num_days();
+                    let epoch_days = 719528i64;
+                    Ok(Value::BigInt(epoch_days + days_from_epoch))
+                }
+                Some(Value::Null) => Ok(Value::Null),
+                _ => Ok(Value::Null),
+            }
+        }
+        "FROM_DAYS" => {
+            // Convert number of days since year 0 to date
+            let days = args.first().and_then(|v| v.as_i64()).unwrap_or(0);
+            // Days from year 0 to epoch
+            let epoch_days = 719528i64;
+            let days_from_epoch = days - epoch_days;
+            let epoch = chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
+            match epoch.checked_add_signed(chrono::Duration::days(days_from_epoch)) {
+                Some(d) => Ok(Value::Date(d)),
+                None => Ok(Value::Null),
+            }
+        }
+        "TIMEZONE" | "AT_TIMEZONE" => {
+            // Convert timestamp to a different timezone
+            // TIMEZONE(timezone, timestamp) or timestamp AT TIME ZONE 'timezone'
+            // For simplicity, we handle common timezone offsets
+            use chrono::{Duration, Timelike};
+            let tz_str = args.first().and_then(|v| v.as_str()).unwrap_or("UTC");
+            let ts = args.get(1).unwrap_or(&Value::Null);
+
+            // Parse timezone offset (e.g., "+05:00", "-08:00", "UTC", "GMT")
+            let offset_hours: i64 = if tz_str.eq_ignore_ascii_case("UTC") || tz_str.eq_ignore_ascii_case("GMT") {
+                0
+            } else if tz_str.starts_with('+') || tz_str.starts_with('-') {
+                // Parse offset like "+05:00" or "-08:00"
+                let sign = if tz_str.starts_with('-') { -1 } else { 1 };
+                let parts: Vec<&str> = tz_str[1..].split(':').collect();
+                let hours = parts.first().and_then(|s| s.parse::<i64>().ok()).unwrap_or(0);
+                let minutes = parts.get(1).and_then(|s| s.parse::<i64>().ok()).unwrap_or(0);
+                sign * (hours * 60 + minutes) / 60
+            } else {
+                // Common timezone abbreviations
+                match tz_str.to_uppercase().as_str() {
+                    "EST" => -5, "EDT" => -4, "CST" => -6, "CDT" => -5,
+                    "MST" => -7, "MDT" => -6, "PST" => -8, "PDT" => -7,
+                    "CET" => 1, "CEST" => 2, "JST" => 9, "IST" => 5,
+                    _ => 0,
+                }
+            };
+
+            match ts {
+                Value::Timestamp(dt) => {
+                    let adjusted = *dt + Duration::hours(offset_hours);
+                    Ok(Value::Timestamp(adjusted))
+                }
+                Value::Null => Ok(Value::Null),
                 _ => Ok(Value::Null),
             }
         }

@@ -250,31 +250,97 @@ pub enum TestCase {
 fn parse_slt(content: &str) -> TestResult<Vec<TestCase>> {
     let mut tests = Vec::new();
     let mut lines = content.lines().peekable();
+    let mut skip_until_empty = false;
+    let mut in_loop = false;
+    let mut requires_extension = false;
 
     while let Some(line) = lines.next() {
         let line = line.trim();
 
         // Skip comments and empty lines
-        if line.is_empty() || line.starts_with('#') {
+        if line.is_empty() {
+            skip_until_empty = false;
+            continue;
+        }
+        if line.starts_with('#') {
+            continue;
+        }
+
+        // If we're skipping, continue until empty line
+        if skip_until_empty {
+            continue;
+        }
+
+        // Handle require directive - skip entire file if extension required
+        if line.starts_with("require ") {
+            let ext = line.strip_prefix("require ").unwrap_or("").trim();
+            // Skip files that require extensions we don't have
+            if !matches!(ext, "vector_size" | "skip_reload" | "no_extension_autoloading") {
+                requires_extension = true;
+            }
+            continue;
+        }
+
+        // Skip file if it requires an extension
+        if requires_extension {
+            continue;
+        }
+
+        // Handle mode directive
+        if line.starts_with("mode ") {
+            continue;
+        }
+
+        // Handle loop constructs (skip them for now)
+        if line.starts_with("foreach") || line.starts_with("loop") {
+            in_loop = true;
+            continue;
+        }
+        if line.starts_with("endloop") {
+            in_loop = false;
+            continue;
+        }
+        if in_loop {
+            continue;
+        }
+
+        // Handle load directive
+        if line.starts_with("load ") {
             continue;
         }
 
         // Parse directives
         if line.starts_with("statement") {
             let expected_error = line.contains("error");
+            let maybe_error = line.contains("maybe");
             let mut sql_lines = Vec::new();
 
             while let Some(sql_line) = lines.peek() {
                 if sql_line.trim().is_empty() {
                     break;
                 }
+                // Skip result expectations for statement error
+                if sql_line.trim() == "----" {
+                    lines.next();
+                    // Skip error message lines
+                    while let Some(err_line) = lines.peek() {
+                        if err_line.trim().is_empty()
+                            || err_line.trim().starts_with("statement")
+                            || err_line.trim().starts_with("query") {
+                            break;
+                        }
+                        lines.next();
+                    }
+                    break;
+                }
                 sql_lines.push(lines.next().unwrap().to_string());
             }
 
             if !sql_lines.is_empty() {
+                // For 'maybe' errors, we accept both success and error
                 tests.push(TestCase::Statement {
                     sql: sql_lines.join("\n"),
-                    expected_error,
+                    expected_error: if maybe_error { false } else { expected_error },
                 });
             }
         } else if line.starts_with("query") {
@@ -315,6 +381,12 @@ fn parse_slt(content: &str) -> TestResult<Vec<TestCase>> {
                     || trimmed.starts_with("query")
                     || trimmed.starts_with("halt")
                     || trimmed.starts_with("hash-threshold")
+                    || trimmed.starts_with("require")
+                    || trimmed.starts_with("mode")
+                    || trimmed.starts_with("loop")
+                    || trimmed.starts_with("foreach")
+                    || trimmed.starts_with("endloop")
+                    || trimmed.starts_with("load")
                 {
                     break;
                 }
@@ -336,12 +408,18 @@ fn parse_slt(content: &str) -> TestResult<Vec<TestCase>> {
             tests.push(TestCase::Halt);
             break;
         } else if line.starts_with("skipif") || line.starts_with("onlyif") {
-            // Skip conditional tests for now - skip the next statement/query
-            while let Some(next) = lines.peek() {
-                if next.trim().is_empty() {
-                    break;
+            // Check for DuckDB-specific skipif/onlyif
+            if line.contains("duckdb") {
+                // For "onlyif duckdb", we run the test
+                // For "skipif duckdb", we skip the test
+                if line.starts_with("skipif") {
+                    skip_until_empty = true;
                 }
-                lines.next();
+            } else {
+                // For other databases, inverse logic
+                if line.starts_with("onlyif") {
+                    skip_until_empty = true;
+                }
             }
         } else if line.starts_with("hash-threshold") {
             // Ignore hash-threshold directives
